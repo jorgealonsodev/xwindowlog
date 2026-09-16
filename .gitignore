@@ -1,0 +1,12 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local editor and tooling state
+.vscode/
+.atl/
+
+# Local database and config produced while dogfooding
+*.db
+*.db-wal
+*.db-shm
