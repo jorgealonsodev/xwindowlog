@@ -277,29 +277,29 @@ explicit ordering constraint.
 
 **Traces:** RF-1 (consumption side), RF-2, RF-3 (partial), design §2 D-8.
 
-- [ ] 5.1 GREEN (pure type definitions — nothing to fail first): define
+- [x] 5.1 GREEN (pure type definitions — nothing to fail first): define
       `SourceEvent`, `WindowInfo`, `Effect`, `NewInterval` exactly per design
       §2 D-8. **No `x11rb`/`zbus`/`nix`/`rusqlite` type may appear anywhere in
       `tracker.rs`** — this is the module boundary the rest of the phase
       depends on.
-- [ ] 5.2 GREEN: define the `WindowSource` trait
+- [x] 5.2 GREEN: define the `WindowSource` trait
       (`next_event(deadline) -> Result<Option<SourceEvent>, SourceError>`) and
       `Tracker::{on_event, next_deadline}` signatures.
-- [ ] 5.3 RED: `unknown` (startup) + first valid active-window event →
+- [x] 5.3 RED: `unknown` (startup) + first valid active-window event →
       `active` (interval-tracking "Every row of the transition table is
       exercised", first row).
-- [ ] 5.4 GREEN: implement the `unknown → active` transition.
-- [ ] 5.5 RED: `active` + active-window change → `active` (new window), with
+- [x] 5.4 GREEN: implement the `unknown → active` transition.
+- [x] 5.5 RED: `active` + active-window change → `active` (new window), with
       the closed interval's `end` and the new interval's `start` equal to the
       event instant (RF-3 "Consecutive transitions share the same boundary
       instant").
-- [ ] 5.6 GREEN: implement the window-change transition returning
+- [x] 5.6 GREEN: implement the window-change transition returning
       `Effect::Transition` with one `at`.
-- [ ] 5.7 RED: `_NET_ACTIVE_WINDOW` becomes unset (desktop focused) is
+- [x] 5.7 RED: `_NET_ACTIVE_WINDOW` becomes unset (desktop focused) is
       recorded with the `"(desktop)"` sentinel, not discarded and not treated
       as absence (window-capture "Desktop focus is legitimate activity").
-- [ ] 5.8 GREEN: implement the desktop-focus branch.
-- [ ] 5.9 REFACTOR: add a doc comment on `Effect::Transition` recording that
+- [x] 5.8 GREEN: implement the desktop-focus branch.
+- [x] 5.9 REFACTOR: add a doc comment on `Effect::Transition` recording that
       its single `at` field makes mismatched close/open timestamps a compile-
       time impossibility, not a discipline (design's stated type-level RF-3
       guarantee) — so the invariant is documented where a future editor would
@@ -360,10 +360,10 @@ phase's closing invariant (proposal §Intent).**
       inspection, side by side with `interval-tracking/spec.md`.
 - [ ] 6.12 REFACTOR (**interim-debt cleanup, added by the orchestrator after
       PR 2**): remove the module-level `#![allow(dead_code, reason = "...")]`
-      from `src/clock.rs`, and from any other module that acquired one while
-      landing ahead of its consumers under design §8's ordering constraint.
-      By the end of this phase `clock.rs` has real consumers in `store.rs`
-      and `tracker.rs`, so the allow is no longer justified. A blanket
+      from `src/clock.rs`. By the end of this phase `clock.rs` has real consumers
+      in `store.rs` and `tracker.rs`, so its allow is no longer justified.
+      Modules whose own consumers land later (`tracker.rs`, wired up in Phase
+      8 and Phase 14) keep theirs until the sweep in task 15.13. A blanket
       module-level `dead_code` allow that outlives its reason silently hides
       genuinely dead code for the rest of the project's life — that is why
       this is a task in the plan and not a note anyone has to remember.
@@ -774,6 +774,18 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
 - [ ] 15.12 REFACTOR: confirm `main.rs` contains only composition (clap,
       flock, config, reactor construction, effect application) with no
       state-machine or storage logic duplicated from `tracker.rs`/`store.rs`.
+- [ ] 15.13 REFACTOR (**final interim-debt sweep, added by the orchestrator
+      after PR 5**): once `main.rs` wires the daemon together, every module
+      has real consumers, so no module-level `#![allow(dead_code)]` is
+      justified any more. Remove every one of them — `tracker.rs` acquired
+      one in Phase 5 for the same reason `clock.rs` did, and others may have
+      since. These allows are honest while a module deliberately lands ahead
+      of its consumers under design §8's ordering, but a blanket allow that
+      outlives its reason hides genuinely dead code for the rest of the
+      project's life. Acceptance: `grep -rn 'allow(dead_code' src/` returns
+      nothing, and `cargo clippy --all-targets -- -D warnings` is still
+      clean. If one item is legitimately unused even now, narrow the allow to
+      that item with its own `reason` — never leave it at module scope.
 
 ---
 

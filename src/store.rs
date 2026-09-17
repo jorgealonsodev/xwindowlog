@@ -85,7 +85,7 @@ impl IntervalState {
 /// storage-shaped data (it names the exact columns `transition`/`open_only`
 /// write), so `store.rs` owning it is a better fit than a forward
 /// declaration would have been.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInterval {
     pub app: String,
     pub title: String,
