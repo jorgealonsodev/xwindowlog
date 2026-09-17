@@ -680,40 +680,104 @@ against the code as it stood, never by reverting a fix afterwards.
 
 **Traces:** RF-4, RF-6, RF-25, RF-32.
 
-- [ ] 11.1 RED (validates assumption A-7): `SYNC`/`IDLETIME` alarm firing the
+- [x] 11.1 RED (validates assumption A-7): `SYNC`/`IDLETIME` alarm firing the
       positive transition at `afk_threshold_seconds` queries
       `ms_since_user_input` exactly once, at alarm-fire instant; the negative
       transition re-arms the alarm; no periodic idle-time query occurs
       between alarms (idle-detection "Event-driven absence detection", all
       three scenarios).
-- [ ] 11.2 GREEN: implement `SyncCreateAlarm`/`Trigger` registration and the
+- [x] 11.2 GREEN: implement `SyncCreateAlarm`/`Trigger` registration and the
       alarm-fire handler surfacing `SourceEvent::UserIdle{idle_for}`/
       `UserActive`.
-- [ ] 11.3 RED: `SYNC` available → used, no degradation warning; `SYNC`
+- [x] 11.3 RED: `SYNC` available → used, no degradation warning; `SYNC`
       unavailable + `MIT-SCREEN-SAVER` available → 30s polling timer, logged
       degradation; neither available → X11 absence detection disabled
       entirely, exactly one startup warning, daemon still starts (RF-25, all
       three scenarios).
-- [ ] 11.4 GREEN: implement the three-step degradation chain, none of the
+- [x] 11.4 GREEN: implement the three-step degradation chain, none of the
       three outcomes blocking startup.
-- [ ] 11.5 RED: X11 connection lost mid-run closes the current interval and
+- [x] 11.5 RED: X11 connection lost mid-run closes the current interval and
       opens exactly one `unknown` interval, retrying from 500ms; three
       consecutive failed retries open no additional `unknown` intervals; a
       successful reconnection resumes capture and resets backoff to 500ms for
       the next outage (RF-6/RF-32, all three scenarios).
-- [ ] 11.6 GREEN: implement the exponential backoff (500ms → 1s → 2s → 4s →
+- [x] 11.6 GREEN: implement the exponential backoff (500ms → 1s → 2s → 4s →
       8s → 16s ceiling, ±20% jitter) and single-`unknown`-per-outage
       bookkeeping.
-- [ ] 11.7 RED (Xvfb E2E): three synthetic windows produce correct intervals
+- [x] 11.7 RED (Xvfb E2E): three synthetic windows produce correct intervals
       within ≤1s tolerance, using an in-house `x11rb` helper binary for
       synthetic windows rather than an external `xdotool` dependency
       (proposal *Dependencies*; PRD §17 "three synthetic windows").
-- [ ] 11.8 GREEN: wire `x11.rs` end to end for the E2E harness; fix whatever
+- [x] 11.8 GREEN: wire `x11.rs` end to end for the E2E harness; fix whatever
       11.7 surfaces.
-- [ ] 11.9 GREEN: implement the E2E readiness-poll helper on
+- [x] 11.9 GREEN: implement the E2E readiness-poll helper on
       `_NET_SUPPORTED`/`_NET_ACTIVE_WINDOW` with a bounded timeout,
       **replacing the PRD's fixed `sleep 1`** (E-3) — used here and reused
       verbatim by Phase 19's CI job.
+
+### Phase 11 corrections (2026-09-17, from a third adversarial pass)
+
+Phase 11 was green — 173 tests, clippy and fmt clean — over a real RF-4 defect
+that loses the idle→active transition, plus two more the suite could not
+observe. Every behavioural correction below was driven by an observed RED
+against the code as it stood, never by reverting a fix afterwards.
+
+- [x] 11.10 RED/GREEN (RF-4): the return transition is lost when the alarm
+      is re-armed at the instant the away edge fires. Observed RED against the
+      real code path, 120 trials of "connect, wait for `UserIdle`, return
+      immediately": **8 returns lost (6.7%)**, each one latching the daemon in
+      AFK; adding the arm-time read of task 11.11 alone still lost 7. A/B over three re-arm formulations, 60 trials each against a real
+      Xvfb: `NegativeTransition` at the threshold lost **12/60**; the same
+      with the counter attribute re-sent to force a server-side refresh lost
+      **13/60**; `NegativeComparison` one millisecond below the threshold lost
+      **0/60**. Every lost trial was one whose away alarm had fired at exactly
+      the threshold value. GREEN: `alarm_trigger_value` + `flip_test_type` arm
+      the return edge as a comparison below the threshold; re-measured at
+      **0/120**. No timer and no poll was added — the module still issues no
+      request at all between transitions, and
+      `the_return_edge_reports_once_and_then_goes_quiet` pins that the
+      level-triggered return edge stays a one-shot (RNF-2) rather than waking
+      the daemon for as long as somebody keeps typing.
+- [x] 11.11 RED/GREEN (RF-4): `on_sync_alarm_notify` now implements the
+      arm-time `sync_query_counter` check the module doc already claimed,
+      shared with `try_sync_idle` as `close_arm_time_gap`. Observed RED: with
+      the user returning before the queued `AlarmNotify` was drained, no
+      `UserActive` ever surfaced within 3s of continuous input. The read
+      deliberately follows the arm rather than preceding it, so input landing
+      in the gap produces a duplicate event instead of a lost one.
+- [x] 11.12 RED/GREEN (RF-4): classify the alarm event from its own
+      `counter_value`, never from the local `armed` field. Observed RED: a
+      notification delivered a second time after the re-arm (an X11 wire proxy
+      duplicates it, which the client cannot tell from the real queued-event
+      race) was reported as `UserActive` with no user input at all.
+- [x] 11.13 GREEN (coverage pin, no RED possible — the degraded steps were
+      already correct): real behavioural coverage for RF-25 steps 2 and 3
+      against genuine extension absence — `Xvfb -extension MIT-SCREEN-SAVER`
+      for the server side, and an in-test X11 wire proxy rewriting
+      `QueryExtension(SYNC)` for the extension the server refuses to disable.
+      The false "only the Generic Event Extension can be toggled" claim is
+      corrected in both module docs, in `select_degradation_diagnostic`, and
+      in the `apply-progress` artifact. Validated by re-running the three
+      `panic!()` mutants that previously survived the whole suite.
+- [x] 11.14 GREEN: `wait_for_raw_event`'s deadline is back to 5s and the
+      "contention" justification is gone; the measured worst case was 504ms.
+- [x] 11.15 GREEN (mutation pin, no RED possible — `Reconnector` was already
+      correct): the post-success backoff reset and the second outage's
+      `OutageOpened` are asserted through `Reconnector` itself.
+- [x] 11.16 RED/GREEN (RF-6): `ReconnectAttempt::Restored` now carries
+      `outage_was_open`, so a first-attempt success tells its caller no
+      `OutageOpened` preceded it and RF-6's one `unknown` interval is still
+      owed. Observed RED against a stub that always answered "an outage was
+      open".
+- [x] 11.17 GREEN (doc): `RawEvent::UserIdle` records that the `SYNC` path
+      takes `ms_since_user_input` from the `AlarmNotify`'s own `counter_value`
+      rather than `XScreenSaverQueryInfo`, and why.
+- [x] 11.18 GREEN (test harness): `spawn_xvfb` skips display numbers that are
+      already answering instead of adopting a foreign X server. Observed
+      failure: a leftover `Xvfb` from an earlier session made
+      `title_change_on_the_tracked_window_surfaces_undebounced` receive
+      `UserIdle { idle_for: 4027s }` — a real reading of a 67-minute-old
+      display — instead of the title change it was waiting for.
 
 ---
 

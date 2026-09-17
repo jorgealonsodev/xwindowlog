@@ -39,6 +39,63 @@
 //! **Corrections applied 2026-09-17 (tasks 10.14-10.18), after a second adversarial pass.**
 //! Four defects Phase 10 was green over; each is explained at the site it corrects.
 //!
+//! **Phase 11 scope (slice 3 of 3, tasks 11.1-11.9).** RF-4's `SYNC`/`IDLETIME` alarm
+//! (`try_sync_idle`, `on_sync_alarm_notify`) surfacing `RawEvent::UserIdle`/`UserActive`;
+//! RF-25's three-step degradation chain — `SYNC` first, `MIT-SCREEN-SAVER` polling second
+//! (`poll_screensaver_idle`, driven externally at `SCREENSAVER_POLL_INTERVAL` exactly like
+//! `poll_input_focus`'s own cadence note), X11 absence detection disabled third, exactly one
+//! startup warning either way (`init_idle_detection`, `select_degradation_diagnostic`); and
+//! RF-6/RF-32's reconnect backoff (`ReconnectBackoff`, `Reconnector`) with the "single
+//! `unknown` interval per outage" bookkeeping.
+//!
+//! **A-7 correctness fix, found empirically (2026-09-17), not assumed.** A SYNC alarm with a
+//! `Transition` test type fires only on the *edge* crossing its trigger value — confirmed
+//! against a real Xvfb, not read from documentation. If `IDLETIME` is already on the far side
+//! of `afk_threshold_seconds` at the instant the alarm is armed (the realistic "daemon starts
+//! while the user is already away" case, and unavoidable in a from-cold-boot Xvfb test
+//! environment where `IDLETIME` free-runs from server start), the edge has already happened
+//! and a plain `PositiveTransition` alarm would never fire on its own — the daemon would wait
+//! forever for a crossing that already occurred. `try_sync_idle` and `on_sync_alarm_notify`
+//! both close this gap through `close_arm_time_gap`: a single `sync_query_counter` read tied
+//! to the arm/re-arm action itself (`crosses_armed_test`), synthesizing the missed transition
+//! immediately when needed. This is a one-shot check at the instant of arming, never a
+//! periodic poll between alarms — the idle-detection "No polling while waiting for idle or
+//! activity" scenario is unaffected.
+//! A second empirical finding: `ChangeAlarm`/`CreateAlarm` both answer `BadMatch` unless
+//! `delta` is supplied alongside `test_type` (even as zero) — every call site here sets it
+//! explicitly. A third: re-arming by destroying and recreating the alarm resource (rather than
+//! `ChangeAlarm` on the same id) produces a spurious immediate `AlarmNotify` against an
+//! undefined baseline; `on_sync_alarm_notify` therefore always uses `ChangeAlarm`.
+//!
+//! **Corrections applied 2026-09-17 (tasks 11.10-11.18), after a third adversarial pass.**
+//! The suite was green over an RF-4 defect that loses the idle->active transition outright.
+//!
+//! 1. The A-7 paragraph above described `on_sync_alarm_notify` as closing the arm-time gap.
+//!    It did not: it re-armed the opposite edge and read nothing. When the user came back
+//!    while the positive `AlarmNotify` was still queued — the ordinary case, since the
+//!    notification and the input race each other — the negative edge was already in the past
+//!    at the moment it was armed, and a `Transition` alarm whose condition is already true
+//!    reports nothing at all. Both arming sites now share `close_arm_time_gap`, which reads
+//!    the counter **after** arming, precisely so that input landing in the gap produces a
+//!    duplicate event rather than a lost one.
+//!
+//!    That was only half of it. The other half is inside the server: an alarm armed at
+//!    exactly the value the counter currently holds is never woken for the crossing that
+//!    follows. The away alarm fires at exactly the threshold, so re-arming the return edge
+//!    at that same value at that instant is the losing case. Measured against the real code
+//!    path, 120 trials of "go away, come straight back": **8 returns lost (6.7%)** as the
+//!    code stood, 7 with the arm-time read added, and **0** once `alarm_trigger_value` moved
+//!    the return edge to a comparison one millisecond below the threshold. With the default
+//!    240s threshold each loss is hours of active time recorded as away.
+//! 2. `on_sync_alarm_notify` classified the transition from its own `armed` field. A queued
+//!    `AlarmNotify` outlives the `ChangeAlarm` that follows it, so one arming's event was
+//!    read under the next one's rules, fabricating a `UserActive` while the user was idle.
+//!    The event's own `counter_value` is now the only classifier.
+//! 3. RF-25's degraded steps had no behavioural coverage, justified by a claim about this
+//!    environment's Xvfb that was simply false; `tests/x11_integration.rs` covers both
+//!    degraded steps against genuine extension absence and its module doc records what the
+//!    server really does and does not allow.
+//!
 //! **Module boundary (task 9.13, design §1 layering).** `tracker.rs` never names an `x11rb`
 //! type and this module never names a `tracker` type. What crosses out of this module is
 //! `RawTitle` (`crate::exclude`, D-7 — sanitization has NOT happened yet) plus this module's own
@@ -61,9 +118,14 @@
 use std::env;
 use std::fmt;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
+use x11rb::protocol::screensaver::ConnectionExt as _;
+use x11rb::protocol::sync::{
+    self, ChangeAlarmAux, ConnectionExt as _, CreateAlarmAux, Int64, TESTTYPE, VALUETYPE,
+};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Window,
 };
@@ -107,6 +169,35 @@ const MAX_TOPLEVEL_WALK: usize = 32;
 /// Both are "no focused window" for RF-24's degraded path.
 const FOCUS_NONE: Window = 0;
 const FOCUS_POINTER_ROOT: Window = 1;
+
+/// RF-4's default `afk_threshold_seconds` — overridden by `connect_with_afk_threshold` once
+/// config.rs (a later phase) wires the real value through.
+const DEFAULT_AFK_THRESHOLD: Duration = Duration::from_secs(240);
+
+/// RF-25 step 2's fixed polling cadence over `MIT-SCREEN-SAVER`. Like
+/// `poll_input_focus`'s own cadence, arming a timer at this interval is the caller's job
+/// (Phase 14's reactor) — this constant is the contract between the two.
+pub const SCREENSAVER_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// RF-32's backoff sequence: 500ms, 1s, 2s, 4s, 8s, then this ceiling forever.
+const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_CEILING: Duration = Duration::from_secs(16);
+
+/// RF-32's jitter bound, in percent either side of the unjittered delay.
+const RECONNECT_JITTER_PERCENT: i64 = 20;
+
+/// RF-25 step 2's exact degradation diagnostic — a `const` so the message tested by
+/// `select_degradation_diagnostic`'s unit tests and the one actually emitted by
+/// `init_idle_detection` cannot drift apart.
+const SCREENSAVER_DEGRADATION_DIAGNOSTIC: &str =
+    "xwindowlog: SYNC/IDLETIME unavailable — degrading absence detection to a 30s \
+     MIT-SCREEN-SAVER poll";
+
+/// RF-25 step 3's exact diagnostic, emitted exactly once at startup when neither extension is
+/// available.
+const IDLE_DETECTION_DISABLED_DIAGNOSTIC: &str =
+    "xwindowlog: neither SYNC/IDLETIME nor MIT-SCREEN-SAVER is available — X11 absence \
+     detection is disabled; relying solely on logind session signals";
 
 /// Errors connecting to or initializing the X11 capture layer.
 #[derive(Debug)]
@@ -195,6 +286,55 @@ pub enum RawEvent {
     /// changed and hand back a fresh, unconditional read, never to decide whether the change
     /// is "stable" long enough to matter.
     TitleChanged(RawTitle),
+    /// RF-4: the idle threshold was crossed upward. `idle_for` is `ms_since_user_input` read
+    /// exactly once, at the instant that mattered — either a real alarm fire
+    /// (`on_sync_alarm_notify`), the 30s screensaver poll (`poll_screensaver_idle`), or the
+    /// one-shot "already past threshold" check tied to arming the alarm (`try_sync_idle`'s
+    /// doc, and the module doc's A-7 note).
+    ///
+    /// **Documented deviation (task 11.17).** The requirement words `ms_since_user_input` as
+    /// coming from `XScreenSaverQueryInfo`. Only the `MIT-SCREEN-SAVER` path actually reads
+    /// it there. On the `SYNC` path the same quantity comes from the `AlarmNotify`'s own
+    /// `counter_value` (or, at arm time, from `sync_query_counter` on `IDLETIME`): the same
+    /// millisecond count of elapsed input-free time, taken from the counter the alarm itself
+    /// is defined over, with no extra round trip and no second extension required. Reading
+    /// `XScreenSaverQueryInfo` instead would answer a *different* question at a *later*
+    /// instant than the one the alarm fired on.
+    UserIdle { idle_for: Duration },
+    /// RF-4's negative transition: input resumed.
+    UserActive,
+    /// RF-6/RF-32: the X11 connection was lost. Not constructed anywhere in this module —
+    /// `poll_for_event`'s `?` propagates the underlying `ReplyError` on connection loss (see
+    /// `is_bad_window`'s doc: "connection loss MUST propagate so the reconnect path can
+    /// run"), and translating that into this variant, exactly once per outage, is
+    /// `Reconnector`'s contract with its caller (its own doc).
+    DisplayLost,
+    /// RF-6/RF-32: reconnection succeeded. Same construction note as `DisplayLost`.
+    DisplayRestored,
+}
+
+/// How this source is currently detecting user absence (RF-4/RF-25's three-step
+/// degradation chain). Not exposed directly — `X11Source::mode`-style introspection wasn't
+/// needed by any caller this phase, so this stays private; add an accessor if one appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleMode {
+    /// RF-4's primary path: an alarm on the `SYNC` extension's `IDLETIME` system counter.
+    /// `armed` names which edge the alarm is currently watching for — flips every time it
+    /// fires (`on_sync_alarm_notify`) or every time the one-shot arm-time check
+    /// (`crosses_armed_test`) finds the condition already true.
+    Sync {
+        alarm: sync::Alarm,
+        counter: sync::Counter,
+        threshold_ms: u32,
+        armed: TESTTYPE,
+    },
+    /// RF-25 step 2: no event stream, so the caller drives `poll_screensaver_idle` on its own
+    /// `SCREENSAVER_POLL_INTERVAL` cadence — the same "this module doesn't own the timer"
+    /// shape as `CaptureMode::InputFocusFallback`/`poll_input_focus`.
+    ScreenSaverPolling { threshold_ms: u32, was_idle: bool },
+    /// RF-25 step 3: neither extension is available. `poll_screensaver_idle` and the `SYNC`
+    /// alarm branch of `poll_for_event` are both no-ops in this mode.
+    Disabled,
 }
 
 /// Atoms this module resolves once per connection (task 9.2, 9.7-9.10).
@@ -251,6 +391,12 @@ pub struct X11Source {
     mode: CaptureMode,
     active_window: Option<Window>,
     drained_untranslated: u64,
+    idle_mode: IdleMode,
+    /// A `RawEvent` synthesized at arm/re-arm time rather than read from the X11 socket (the
+    /// module doc's A-7 note) — drained by `poll_for_event` before it touches the connection
+    /// at all, so it is surfaced exactly once and never blocks the drain-before-poll
+    /// invariant (D-6) it sits in front of.
+    pending_idle_event: Option<RawEvent>,
 }
 
 impl X11Source {
@@ -266,6 +412,18 @@ impl X11Source {
     /// contract, restated here as plain strings since this module predates the tracker
     /// boundary.
     pub fn connect(display: Option<&str>) -> Result<(Self, Vec<String>), X11InitError> {
+        Self::connect_with_afk_threshold(display, DEFAULT_AFK_THRESHOLD)
+    }
+
+    /// Same as `connect`, with RF-4's `afk_threshold_seconds` explicit rather than
+    /// `DEFAULT_AFK_THRESHOLD` — the constructor a future `config.rs` (and this phase's own
+    /// tests, which need a threshold short enough to observe without a multi-minute wait) use
+    /// instead of `connect`. Mirrors `tracker::Tracker::with_title_debounce`'s
+    /// default-plus-override shape.
+    pub fn connect_with_afk_threshold(
+        display: Option<&str>,
+        afk_threshold: Duration,
+    ) -> Result<(Self, Vec<String>), X11InitError> {
         let (conn, screen_num) = x11rb::connect(display)?;
         let root = conn.setup().roots[screen_num].root;
         let atoms = Atoms::intern(&conn)?;
@@ -287,9 +445,15 @@ impl X11Source {
             diagnostics.push(warning);
         }
 
-        // RF-24/RF-29: emit now, at the moment the condition is detected. Failing to write to
-        // stderr must not stop the daemon from capturing, so the result is deliberately
-        // ignored rather than turned into a startup error.
+        let (idle_mode, pending_idle_event, idle_diagnostic) =
+            Self::init_idle_detection(&conn, afk_threshold);
+        if let Some(diagnostic) = idle_diagnostic {
+            diagnostics.push(diagnostic);
+        }
+
+        // RF-24/RF-25/RF-29: emit now, at the moment the condition is detected. Failing to
+        // write to stderr must not stop the daemon from capturing, so the result is
+        // deliberately ignored rather than turned into a startup error.
         let _ = emit_startup_diagnostics(&diagnostics, &mut io::stderr());
 
         let source = X11Source {
@@ -299,6 +463,8 @@ impl X11Source {
             mode,
             active_window: None,
             drained_untranslated: 0,
+            idle_mode,
+            pending_idle_event,
         };
         if source.mode == CaptureMode::Ewmh {
             source.subscribe_root()?;
@@ -321,6 +487,274 @@ impl X11Source {
     /// as a diagnostic counter.
     pub fn drained_untranslated(&self) -> u64 {
         self.drained_untranslated
+    }
+
+    /// RF-25's three-step degradation chain, attempted in order. Every probe is best-effort:
+    /// `try_sync_idle` swallows any failure (extension absent, no `IDLETIME` counter, the
+    /// alarm request itself rejected) and reports unavailability rather than propagating an
+    /// error, because RF-25 requires none of the three outcomes to block startup. The
+    /// diagnostic text itself comes from `select_degradation_diagnostic`, kept separate so
+    /// its selection logic is unit-testable without a real X11 connection.
+    fn init_idle_detection(
+        conn: &RustConnection,
+        afk_threshold: Duration,
+    ) -> (IdleMode, Option<RawEvent>, Option<String>) {
+        let threshold_ms = threshold_millis(afk_threshold);
+        if let Some((mode, pending)) = Self::try_sync_idle(conn, threshold_ms) {
+            return (mode, pending, select_degradation_diagnostic(true, false));
+        }
+        let screensaver_available = Self::screensaver_present(conn);
+        let mode = if screensaver_available {
+            IdleMode::ScreenSaverPolling {
+                threshold_ms,
+                was_idle: false,
+            }
+        } else {
+            IdleMode::Disabled
+        };
+        (
+            mode,
+            None,
+            select_degradation_diagnostic(false, screensaver_available),
+        )
+    }
+
+    /// RF-4/A-7: attempts the `SYNC`/`IDLETIME` path end to end — extension init, locating
+    /// the `IDLETIME` system counter, and creating the `PositiveTransition` alarm. `None` on
+    /// **any** failure at any step, which `init_idle_detection` reads as "step 1
+    /// unavailable, fall through to step 2" (RF-25), never as a daemon failure. `delta` is
+    /// set explicitly (even at zero) on every alarm request in this module — omitting it
+    /// answers `BadMatch` (module doc's second empirical note).
+    fn try_sync_idle(
+        conn: &RustConnection,
+        threshold_ms: u32,
+    ) -> Option<(IdleMode, Option<RawEvent>)> {
+        conn.sync_initialize(3, 1).ok()?.reply().ok()?;
+        let counters = conn.sync_list_system_counters().ok()?.reply().ok()?;
+        let idletime = counters
+            .counters
+            .iter()
+            .find(|counter| counter.name == b"IDLETIME")
+            .map(|counter| counter.counter)?;
+        let alarm = conn.generate_id().ok()?;
+        conn.sync_create_alarm(
+            alarm,
+            &CreateAlarmAux::new()
+                .counter(idletime)
+                .value_type(VALUETYPE::ABSOLUTE)
+                .value(alarm_trigger_value(
+                    threshold_ms,
+                    TESTTYPE::POSITIVE_TRANSITION,
+                ))
+                .test_type(TESTTYPE::POSITIVE_TRANSITION)
+                .delta(Int64 { hi: 0, lo: 0 })
+                .events(1),
+        )
+        .ok()?
+        .check()
+        .ok()?;
+        conn.flush().ok()?;
+
+        let (armed, pending) = Self::close_arm_time_gap(
+            conn,
+            alarm,
+            idletime,
+            threshold_ms,
+            TESTTYPE::POSITIVE_TRANSITION,
+        )
+        .ok()?;
+        Some((
+            IdleMode::Sync {
+                alarm,
+                counter: idletime,
+                threshold_ms,
+                armed,
+            },
+            pending,
+        ))
+    }
+
+    /// Issues one `ChangeAlarm` re-arming `alarm` for `test_type`. Factored out because the
+    /// request has four mandatory pieces — including `delta`, which answers `BadMatch` by
+    /// its absence (module doc's second empirical note) — and three call sites that must not
+    /// drift apart.
+    fn change_alarm_test(
+        conn: &RustConnection,
+        alarm: sync::Alarm,
+        threshold_ms: u32,
+        test_type: TESTTYPE,
+    ) -> Result<(), ReplyError> {
+        conn.sync_change_alarm(
+            alarm,
+            &ChangeAlarmAux::new()
+                .value_type(VALUETYPE::ABSOLUTE)
+                .value(alarm_trigger_value(threshold_ms, test_type))
+                .test_type(test_type)
+                .delta(Int64 { hi: 0, lo: 0 }),
+        )?
+        .check()?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    /// The module doc's A-7 check, shared by the two places an alarm is armed
+    /// (`try_sync_idle` at startup, `on_sync_alarm_notify` on every transition). `test_type`
+    /// is the edge that was **just armed**; the answer is the edge that ends up armed, plus
+    /// the transition to synthesize when the arming missed one.
+    ///
+    /// A `Transition` alarm fires on the crossing and on nothing else: arming it for a
+    /// condition that is already true watches for an edge that has already happened, and
+    /// the server will never report it (`ChangeAlarm` whose trigger is already satisfied
+    /// notifies nothing, confirmed against a real server). One `sync_query_counter` read,
+    /// **after** the arm rather than before it, closes that gap in both directions:
+    ///
+    /// - input that lands before the arm is caught by this read, and the transition is
+    ///   synthesized here;
+    /// - input that lands after the arm produces the real crossing, and the alarm reports it.
+    ///
+    /// The read follows the arm deliberately. Reading first and arming second leaves a window
+    /// in which input arrives after the read but before the arm, and that transition would be
+    /// lost for good, latching the daemon in AFK until the next full idle->return cycle. In
+    /// this order the same window instead produces one duplicate event, and both
+    /// `Tracker::on_user_idle`/`on_user_active` already ignore a transition they are already
+    /// in. A lost transition is hours of mislabelled time; a duplicate one is nothing.
+    ///
+    /// This check alone is not what fixes the lost return, and it was measured rather than
+    /// assumed: with this check in place and the old trigger formulation, 7 of 120 returns
+    /// were still lost, because the loss happens inside the server rather than in this
+    /// window. `alarm_trigger_value` is the half that closes it. Both are kept — this one
+    /// covers the return that arrives before the alarm is armed at all, which no trigger
+    /// formulation can report.
+    ///
+    /// One read per arm, never a timer and never a poll — the idle-detection "No polling
+    /// while waiting for idle or activity" scenario and RNF-2 both hold: between two
+    /// transitions this module issues no request at all.
+    fn close_arm_time_gap(
+        conn: &RustConnection,
+        alarm: sync::Alarm,
+        counter: sync::Counter,
+        threshold_ms: u32,
+        test_type: TESTTYPE,
+    ) -> Result<(TESTTYPE, Option<RawEvent>), ReplyError> {
+        let idle_ms = int64_to_ms(&conn.sync_query_counter(counter)?.reply()?.counter_value);
+        if !crosses_armed_test(idle_ms, threshold_ms, test_type) {
+            return Ok((test_type, None));
+        }
+        let flipped = flip_test_type(test_type);
+        Self::change_alarm_test(conn, alarm, threshold_ms, flipped)?;
+        let synthesized = if test_type == TESTTYPE::POSITIVE_TRANSITION {
+            RawEvent::UserIdle {
+                idle_for: Duration::from_millis(idle_ms),
+            }
+        } else {
+            RawEvent::UserActive
+        };
+        Ok((flipped, Some(synthesized)))
+    }
+
+    /// RF-25 step 2's availability probe: a real `MIT-SCREEN-SAVER` `QueryVersion` round
+    /// trip, best-effort exactly like `try_sync_idle`.
+    fn screensaver_present(conn: &RustConnection) -> bool {
+        conn.screensaver_query_version(1, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some()
+    }
+
+    /// RF-25 step 2: the 30s `MIT-SCREEN-SAVER` poll. A no-op returning `Ok(None)` when this
+    /// source isn't in `IdleMode::ScreenSaverPolling` — exactly like `poll_input_focus`, how
+    /// often this is called is the caller's business (Phase 14 arms a timer at
+    /// `SCREENSAVER_POLL_INTERVAL`), not this module's.
+    pub fn poll_screensaver_idle(&mut self) -> Result<Option<RawEvent>, ReplyError> {
+        let IdleMode::ScreenSaverPolling {
+            threshold_ms,
+            was_idle,
+        } = self.idle_mode
+        else {
+            return Ok(None);
+        };
+        let info = self.conn.screensaver_query_info(self.root)?.reply()?;
+        let idle_now = u64::from(info.ms_since_user_input) >= u64::from(threshold_ms);
+        if idle_now == was_idle {
+            return Ok(None);
+        }
+        self.idle_mode = IdleMode::ScreenSaverPolling {
+            threshold_ms,
+            was_idle: idle_now,
+        };
+        Ok(Some(if idle_now {
+            RawEvent::UserIdle {
+                idle_for: Duration::from_millis(u64::from(info.ms_since_user_input)),
+            }
+        } else {
+            RawEvent::UserActive
+        }))
+    }
+
+    /// RF-4: a `SyncAlarmNotify` for the alarm this source owns. `Ok(None)` for any other
+    /// alarm (or when this source isn't in `IdleMode::Sync` at all) — drained like any other
+    /// untranslated event by the caller. Unlike `try_sync_idle`'s best-effort probing, every
+    /// request here propagates its real error: this runs only after `SYNC` idle detection is
+    /// already established, so a failure here is a genuine fault (most likely connection
+    /// loss), which RF-6/RF-32 need to see, not silently swallow.
+    ///
+    /// Always re-arms via `ChangeAlarm` on the same alarm id, never destroy-then-recreate —
+    /// the module doc's third empirical note explains why the latter produces a spurious
+    /// immediate `AlarmNotify`.
+    fn on_sync_alarm_notify(
+        &mut self,
+        ev: &sync::AlarmNotifyEvent,
+    ) -> Result<Option<RawEvent>, ReplyError> {
+        let (alarm, counter, threshold_ms) = match self.idle_mode {
+            IdleMode::Sync {
+                alarm,
+                counter,
+                threshold_ms,
+                ..
+            } if alarm == ev.alarm => (alarm, counter, threshold_ms),
+            _ => return Ok(None),
+        };
+
+        // Task 11.12: classify this event from ITS OWN counter value, never from the
+        // `armed` field. A queued `AlarmNotify` survives a later `ChangeAlarm` — measured
+        // directly — so an event generated under one arming can be read under the next one,
+        // and the local field then names the wrong edge. Sweeping the startup window over
+        // 500 connections produced exactly that: a `UserIdle` followed immediately by a
+        // `UserActive` nobody generated, recording away-time as active. `counter_value` is
+        // the server's own statement of what the counter held when the alarm fired, and it
+        // cannot drift out from under the event that carries it.
+        let idle_ms = int64_to_ms(&ev.counter_value);
+        let fired_idle = crosses_armed_test(idle_ms, threshold_ms, TESTTYPE::POSITIVE_TRANSITION);
+        // Watch for the opposite edge next. `flip_test_type` is the single place that names
+        // which test each edge uses, so this never has to repeat it.
+        let next_test = if fired_idle {
+            flip_test_type(TESTTYPE::POSITIVE_TRANSITION)
+        } else {
+            TESTTYPE::POSITIVE_TRANSITION
+        };
+
+        Self::change_alarm_test(&self.conn, alarm, threshold_ms, next_test)?;
+        let (armed, synthesized) =
+            Self::close_arm_time_gap(&self.conn, alarm, counter, threshold_ms, next_test)?;
+        self.idle_mode = IdleMode::Sync {
+            alarm,
+            counter,
+            threshold_ms,
+            armed,
+        };
+        // `poll_for_event` drains this slot before it touches the socket and this method
+        // only runs from inside that drain, so the slot is empty here by construction.
+        if synthesized.is_some() {
+            self.pending_idle_event = synthesized;
+        }
+
+        Ok(Some(if fired_idle {
+            RawEvent::UserIdle {
+                idle_for: Duration::from_millis(idle_ms),
+            }
+        } else {
+            RawEvent::UserActive
+        }))
     }
 
     /// RF-24 (mechanism corrected 2026-09-17): verifies that a **live, EWMH-compliant window
@@ -758,7 +1192,22 @@ impl X11Source {
     /// exception — RF-24's degraded path has no events to wait for and must poll
     /// `GetInputFocus`; see `poll_input_focus`.
     pub fn poll_for_event(&mut self) -> Result<Option<RawEvent>, ReplyError> {
+        // A-7 (module doc): a startup or re-arm-time idle transition synthesized without a
+        // real X11 event behind it. Drained before the connection is touched at all — this
+        // is a one-shot value set at most once per arm, never a queue, so returning it here
+        // does not risk leaving a real event undrained the way an early `return` inside the
+        // loop below would (task 10.14's defect class).
+        if let Some(event) = self.pending_idle_event.take() {
+            return Ok(Some(event));
+        }
         while let Some(event) = self.conn.poll_for_event()? {
+            if let Event::SyncAlarmNotify(ref alarm_event) = event {
+                if let Some(raw) = self.on_sync_alarm_notify(alarm_event)? {
+                    return Ok(Some(raw));
+                }
+                // Not this source's alarm (or idle detection isn't in `IdleMode::Sync` at
+                // all) — drained like any other untranslated event, below.
+            }
             if self.is_active_window_notify(&event) {
                 // `Ok(None)` is RF-22's valid transition, NOT "the queue is empty". Returning
                 // it here abandons whatever is queued behind it, and the fd is already drained,
@@ -869,6 +1318,108 @@ pub fn xwayland_warning() -> Option<String> {
         )
     } else {
         None
+    }
+}
+
+/// RF-4/RF-28: `afk_threshold` is operator configuration, not attacker input, but it still
+/// crosses a process boundary into a SYNC wire field only 32 bits wide — `checked_*`, never a
+/// bare cast (rust-systems: no bare arithmetic on a value that came from outside the
+/// process). Durations beyond `u32::MAX` milliseconds (~49 days) saturate rather than wrap.
+fn threshold_millis(afk_threshold: Duration) -> u32 {
+    u32::try_from(afk_threshold.as_millis()).unwrap_or(u32::MAX)
+}
+
+fn threshold_int64(threshold_ms: u32) -> Int64 {
+    Int64 {
+        hi: 0,
+        lo: threshold_ms,
+    }
+}
+
+/// The trigger value to put on the wire for `test_type` (task 11.10).
+///
+/// The away edge is a `PositiveTransition` at the threshold itself. The return edge is a
+/// `NegativeComparison` one millisecond **below** it, and both halves of that are load-bearing:
+///
+/// - **One below.** A trigger armed at exactly the value the counter currently holds is the
+///   case this whole function exists for. The away alarm is armed at `threshold` and the
+///   server fires it the instant `IDLETIME` reaches `threshold` — the notification carries
+///   exactly `threshold`, not a millisecond more, in most fires. Arming the return edge at
+///   that same value, at that instant, is what loses it: measured 12 returns lost in 60
+///   against a real server, and every single lost trial was one whose away alarm had fired
+///   at exactly `threshold`. Arming one below removes the equality entirely.
+/// - **Comparison, not transition.** A transition fires only on the crossing, so a return
+///   that happens before the alarm is armed is gone for good. A comparison is a level: the
+///   server reports it as soon as the counter *is* below the value, including at the moment
+///   of arming. Nothing about the meaning changes — `idle < threshold` and
+///   `idle <= threshold - 1` are the same statement about milliseconds — but the level form
+///   cannot be missed by being armed a moment too late.
+///
+/// Measured against a real Xvfb, 60 trials each, identical shape (away alarm fires, re-arm,
+/// user returns immediately): `NegativeTransition` at `threshold` lost 12; the same with the
+/// counter attribute re-sent to force the server to refresh its cached value lost 13;
+/// `NegativeComparison` at `threshold - 1` lost 0.
+fn alarm_trigger_value(threshold_ms: u32, test_type: TESTTYPE) -> Int64 {
+    if test_type == TESTTYPE::POSITIVE_TRANSITION {
+        threshold_int64(threshold_ms)
+    } else {
+        threshold_int64(threshold_ms.saturating_sub(1))
+    }
+}
+
+/// `Int64` is SYNC's counter-value wire type — external input from the X server, so this is
+/// `checked_*`/defensive, never a bare cast. `IDLETIME` is defined to never be negative; a
+/// negative `hi` is treated as "not idle" rather than panicking or underflowing.
+fn int64_to_ms(value: &Int64) -> u64 {
+    if value.hi < 0 {
+        return 0;
+    }
+    (u64::from(value.hi as u32) << 32) | u64::from(value.lo)
+}
+
+/// Pure decision the module doc's A-7 note is built on: given a freshly-read idle duration
+/// and the test that was just armed, is that test's condition **already** satisfied? All I/O
+/// (reading the value, changing the alarm) stays in the caller — this is what makes the
+/// decision itself unit-testable without a real X11 connection.
+///
+/// Stated against the threshold in both directions, deliberately, even though the return
+/// edge is armed one millisecond below it (`alarm_trigger_value`): `idle_ms < threshold_ms`
+/// and `idle_ms <= threshold_ms - 1` are the same condition over whole milliseconds, so this
+/// is the same test the server is applying, not an approximation of it.
+fn crosses_armed_test(idle_ms: u64, threshold_ms: u32, armed: TESTTYPE) -> bool {
+    if armed == TESTTYPE::POSITIVE_TRANSITION {
+        idle_ms >= u64::from(threshold_ms)
+    } else {
+        idle_ms < u64::from(threshold_ms)
+    }
+}
+
+/// The only two test types this module ever arms (module doc, RF-4): the away edge is a
+/// `PositiveTransition`, the return edge a `NegativeComparison`, and each re-arms as the
+/// other. See `alarm_trigger_value` for why the return edge is a comparison one millisecond
+/// below the threshold rather than the symmetric `NegativeTransition` at it.
+fn flip_test_type(test_type: TESTTYPE) -> TESTTYPE {
+    if test_type == TESTTYPE::POSITIVE_TRANSITION {
+        TESTTYPE::NEGATIVE_COMPARISON
+    } else {
+        TESTTYPE::POSITIVE_TRANSITION
+    }
+}
+
+/// RF-25's degradation-chain diagnostic selection, pulled out of `init_idle_detection` as a
+/// pure function of "was SYNC available" / "was MIT-SCREEN-SAVER available" so its three
+/// outcomes are unit-testable without a connection at all. The selection this feeds is
+/// covered behaviourally too, against genuine extension absence — `-extension
+/// MIT-SCREEN-SAVER` for step 3 and an X11 wire proxy for `SYNC`, which the server refuses
+/// to disable (`tests/x11_integration.rs`, task 11.13). `sync_ok` makes `screensaver_ok`
+/// irrelevant, matching `init_idle_detection`'s short-circuit.
+fn select_degradation_diagnostic(sync_ok: bool, screensaver_ok: bool) -> Option<String> {
+    if sync_ok {
+        None
+    } else if screensaver_ok {
+        Some(SCREENSAVER_DEGRADATION_DIAGNOSTIC.to_string())
+    } else {
+        Some(IDLE_DETECTION_DISABLED_DIAGNOSTIC.to_string())
     }
 }
 
@@ -994,6 +1545,150 @@ fn parse_wm_class(raw: &[u8]) -> Option<String> {
         None
     } else {
         Some(class)
+    }
+}
+
+/// RF-32's exponential-backoff **policy** — pure and clock-free. Sequence: 500ms, 1s, 2s,
+/// 4s, 8s, then a 16s ceiling forever, with independent ±20% jitter applied to each returned
+/// delay so many simultaneously-failing daemons don't retry in lockstep. `entropy` is
+/// injected rather than read internally, so a test can pin an exact jittered value — see
+/// `os_entropy` for the production source.
+#[derive(Debug, Default)]
+pub struct ReconnectBackoff {
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    pub fn new() -> Self {
+        ReconnectBackoff { attempt: 0 }
+    }
+
+    /// The unjittered delay before the next attempt, doubling from `RECONNECT_BASE_DELAY`
+    /// and clamped at `RECONNECT_CEILING`. `checked_shl` and a saturating fallback throughout
+    /// — `attempt` grows without an upper bound over a long outage (RF-32: "retrying
+    /// indefinitely for the life of the daemon") and must never overflow or panic.
+    fn unjittered_delay(&self) -> Duration {
+        let base_ms = RECONNECT_BASE_DELAY.as_millis() as u64;
+        let scaled = base_ms.checked_shl(self.attempt).unwrap_or(u64::MAX);
+        Duration::from_millis(scaled).min(RECONNECT_CEILING)
+    }
+
+    /// Advances to the next attempt and returns its jittered delay.
+    pub fn next_delay(&mut self, entropy: u64) -> Duration {
+        let delay = jitter(self.unjittered_delay(), entropy);
+        self.attempt = self.attempt.saturating_add(1);
+        delay
+    }
+
+    /// RF-32: "a future outage again starts its retry delay at 500ms" — called once
+    /// reconnection succeeds (`Reconnector::attempt`).
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+/// ±`RECONNECT_JITTER_PERCENT`. `entropy % 41` maps onto `-20..=20` inclusive on both ends,
+/// matching the requirement's exact bound. `entropy` is caller-supplied external input by
+/// this module's own convention, so every step here is `checked_*`, never a bare arithmetic
+/// op on it (rust-systems: no bare arithmetic on values from outside the process).
+fn jitter(base: Duration, entropy: u64) -> Duration {
+    let percent = (entropy % 41) as i64 - RECONNECT_JITTER_PERCENT;
+    let base_ms = base.as_millis() as i64;
+    let delta = base_ms
+        .checked_mul(percent)
+        .and_then(|scaled| scaled.checked_div(100))
+        .unwrap_or(0);
+    let jittered_ms = base_ms.checked_add(delta).unwrap_or(base_ms).max(0);
+    Duration::from_millis(jittered_ms as u64)
+}
+
+/// Production entropy for `ReconnectBackoff::next_delay`. Process/thread-seeded, not
+/// cryptographic — RF-32's jitter only needs to avoid a reconnect thundering herd, not
+/// resist an adversary. `RandomState::new()` draws fresh OS-seeded keys on every call
+/// (verified empirically: five successive calls in the same process produced five distinct
+/// hash outputs with no input written), so no extra dependency or `Instant` mixing is
+/// needed.
+pub fn os_entropy() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// RF-6/RF-32's outage driver: owns the "single `unknown` interval per outage" bookkeeping
+/// that `tracker::Tracker::on_display_lost` cannot enforce on its own — it is an "any" row
+/// that transitions to `unknown` every time it is called (see its doc), so which
+/// `SourceEvent` the caller sends, and how often, is a property of the loop shape driving
+/// it, not something the tracker can guard by itself. Driving this on a timer instead of
+/// blocking, and turning its outcomes into real `SourceEvent`s, is `reactor.rs`'s job (Phase
+/// 14); this type is the retry *policy*, fully testable without one.
+pub struct Reconnector {
+    display: Option<String>,
+    afk_threshold: Duration,
+    backoff: ReconnectBackoff,
+    outage_open: bool,
+}
+
+/// The result of one `Reconnector::attempt`.
+pub enum ReconnectAttempt {
+    /// The first failure of a new outage. The caller MUST translate this into exactly one
+    /// `SourceEvent::DisplayLost` (RF-6/RF-32) — never again until `Restored` is observed.
+    OutageOpened { retry_after: Duration },
+    /// A subsequent failed attempt during an outage already reported via `OutageOpened`. No
+    /// additional event — this is the "no additional `unknown` intervals for failed
+    /// retries" half of RF-6/RF-32.
+    StillDown { retry_after: Duration },
+    /// Reconnection succeeded. The caller MUST translate this into exactly one
+    /// `SourceEvent::DisplayRestored`. Backoff is already reset by the time this is
+    /// returned, so the *next* outage starts its delay at `RECONNECT_BASE_DELAY` again.
+    ///
+    /// `outage_was_open` is `false` when this is the very first attempt of an outage and it
+    /// succeeded immediately, so no `OutageOpened` preceded it (task 11.16). The caller was
+    /// therefore never told to close the current interval and open the outage's one
+    /// `unknown` interval, and RF-6 still owes both: on `false` it must emit
+    /// `SourceEvent::DisplayLost` before `DisplayRestored`, so a same-instant recovery is
+    /// recorded as the short `unknown` gap it really was rather than disappearing.
+    /// `source` is boxed so this enum's other, tiny variants don't all pay `X11Source`'s
+    /// size (clippy's `large_enum_variant`).
+    Restored {
+        source: Box<X11Source>,
+        diagnostics: Vec<String>,
+        outage_was_open: bool,
+    },
+}
+
+impl Reconnector {
+    pub fn new(display: Option<&str>, afk_threshold: Duration) -> Self {
+        Reconnector {
+            display: display.map(str::to_string),
+            afk_threshold,
+            backoff: ReconnectBackoff::new(),
+            outage_open: false,
+        }
+    }
+
+    /// One attempt. `entropy` feeds `ReconnectBackoff::next_delay` — see its doc.
+    pub fn attempt(&mut self, entropy: u64) -> ReconnectAttempt {
+        match X11Source::connect_with_afk_threshold(self.display.as_deref(), self.afk_threshold) {
+            Ok((source, diagnostics)) => {
+                self.backoff.reset();
+                let outage_was_open = std::mem::replace(&mut self.outage_open, false);
+                ReconnectAttempt::Restored {
+                    source: Box::new(source),
+                    diagnostics,
+                    outage_was_open,
+                }
+            }
+            Err(_) => {
+                let retry_after = self.backoff.next_delay(entropy);
+                if self.outage_open {
+                    ReconnectAttempt::StillDown { retry_after }
+                } else {
+                    self.outage_open = true;
+                    ReconnectAttempt::OutageOpened { retry_after }
+                }
+            }
+        }
     }
 }
 
@@ -1248,5 +1943,177 @@ mod tests {
         let comm = read_process_comm(std::process::id()).expect("own process must be readable");
         assert!(!comm.is_empty());
         assert!(!comm.chars().any(char::is_control));
+    }
+
+    // Phase 11 (tasks 11.1-11.6) — pure functions, no X11 connection needed.
+
+    #[test]
+    fn crosses_armed_test_positive_transition_fires_at_and_above_threshold() {
+        assert!(!crosses_armed_test(299, 300, TESTTYPE::POSITIVE_TRANSITION));
+        assert!(crosses_armed_test(300, 300, TESTTYPE::POSITIVE_TRANSITION));
+        assert!(crosses_armed_test(301, 300, TESTTYPE::POSITIVE_TRANSITION));
+    }
+
+    #[test]
+    fn crosses_armed_test_return_edge_fires_strictly_below_threshold() {
+        assert!(!crosses_armed_test(300, 300, TESTTYPE::NEGATIVE_COMPARISON));
+        assert!(crosses_armed_test(299, 300, TESTTYPE::NEGATIVE_COMPARISON));
+    }
+
+    #[test]
+    fn flip_test_type_alternates_the_away_and_return_edges() {
+        assert_eq!(
+            flip_test_type(TESTTYPE::POSITIVE_TRANSITION),
+            TESTTYPE::NEGATIVE_COMPARISON
+        );
+        assert_eq!(
+            flip_test_type(TESTTYPE::NEGATIVE_COMPARISON),
+            TESTTYPE::POSITIVE_TRANSITION
+        );
+    }
+
+    /// Task 11.10: the return edge is armed one millisecond below the threshold, and the
+    /// away edge at it. Arming both at the same value is what lost 12 returns in 60 against
+    /// a real server, every one of them on a trial whose away alarm had fired at exactly the
+    /// threshold; see `alarm_trigger_value`'s doc for the measurement.
+    #[test]
+    fn alarm_trigger_value_puts_the_return_edge_one_millisecond_below_the_threshold() {
+        assert_eq!(
+            int64_to_ms(&alarm_trigger_value(300, TESTTYPE::POSITIVE_TRANSITION)),
+            300
+        );
+        assert_eq!(
+            int64_to_ms(&alarm_trigger_value(300, TESTTYPE::NEGATIVE_COMPARISON)),
+            299
+        );
+    }
+
+    /// A zero threshold has no millisecond below it. `saturating_sub` keeps that a value of
+    /// zero rather than `u32::MAX` wrapping into an alarm that fires on everything.
+    #[test]
+    fn alarm_trigger_value_saturates_at_zero_rather_than_wrapping() {
+        assert_eq!(
+            int64_to_ms(&alarm_trigger_value(0, TESTTYPE::NEGATIVE_COMPARISON)),
+            0
+        );
+    }
+
+    #[test]
+    fn int64_to_ms_combines_hi_and_lo() {
+        assert_eq!(int64_to_ms(&Int64 { hi: 0, lo: 4242 }), 4242);
+        assert_eq!(int64_to_ms(&Int64 { hi: 1, lo: 0 }), 1u64 << 32);
+    }
+
+    /// A negative `hi` cannot be a real `IDLETIME` value — defensive, not reachable in
+    /// practice, but must degrade to "not idle" rather than panic (rust-systems: external
+    /// values never get bare arithmetic).
+    #[test]
+    fn int64_to_ms_negative_hi_is_treated_as_zero_not_a_panic() {
+        assert_eq!(int64_to_ms(&Int64 { hi: -1, lo: 500 }), 0);
+    }
+
+    #[test]
+    fn threshold_millis_converts_seconds_to_milliseconds() {
+        assert_eq!(threshold_millis(Duration::from_secs(240)), 240_000);
+    }
+
+    #[test]
+    fn threshold_millis_saturates_rather_than_overflows_for_absurd_durations() {
+        assert_eq!(threshold_millis(Duration::from_secs(u64::MAX)), u32::MAX);
+    }
+
+    #[test]
+    fn select_degradation_diagnostic_sync_available_means_no_diagnostic() {
+        assert_eq!(select_degradation_diagnostic(true, false), None);
+        assert_eq!(select_degradation_diagnostic(true, true), None);
+    }
+
+    #[test]
+    fn select_degradation_diagnostic_screensaver_only_names_the_degradation() {
+        let diagnostic = select_degradation_diagnostic(false, true).expect("must warn");
+        assert!(diagnostic.contains("MIT-SCREEN-SAVER"));
+        assert_eq!(diagnostic, SCREENSAVER_DEGRADATION_DIAGNOSTIC);
+    }
+
+    #[test]
+    fn select_degradation_diagnostic_neither_available_names_logind_only() {
+        let diagnostic = select_degradation_diagnostic(false, false).expect("must warn");
+        assert!(diagnostic.contains("logind"));
+        assert_eq!(diagnostic, IDLE_DETECTION_DISABLED_DIAGNOSTIC);
+    }
+
+    /// RF-32's exact sequence: 500ms, 1s, 2s, 4s, 8s, then the 16s ceiling forever.
+    /// `entropy = 20` maps to `20 % 41 - 20 = 0` percent jitter (see `jitter`'s doc), so this
+    /// pins the unjittered sequence exactly rather than only its bounds.
+    #[test]
+    fn reconnect_backoff_sequence_matches_rf32_exactly_with_zero_jitter() {
+        let mut backoff = ReconnectBackoff::new();
+        let expected = [500u64, 1000, 2000, 4000, 8000, 16000, 16000, 16000];
+        for expected_ms in expected {
+            assert_eq!(backoff.next_delay(20).as_millis() as u64, expected_ms);
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_reset_returns_to_the_base_delay() {
+        let mut backoff = ReconnectBackoff::new();
+        for _ in 0..4 {
+            backoff.next_delay(20);
+        }
+        backoff.reset();
+        assert_eq!(backoff.next_delay(20).as_millis(), 500);
+    }
+
+    #[test]
+    fn jitter_stays_within_plus_minus_20_percent_across_the_entropy_domain() {
+        let base = Duration::from_millis(1000);
+        for entropy in 0..123u64 {
+            let jittered = jitter(base, entropy).as_millis() as i64;
+            assert!(
+                (800..=1200).contains(&jittered),
+                "entropy {entropy} produced {jittered}ms, outside ±20% of 1000ms"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_zero_percent_entropy_leaves_the_delay_unchanged() {
+        // entropy = 20 -> (20 % 41) - 20 = 0 percent.
+        assert_eq!(jitter(Duration::from_millis(1000), 20).as_millis(), 1000);
+    }
+
+    #[test]
+    fn os_entropy_varies_across_calls() {
+        // Not a statistical proof, just a smoke test that this isn't a hardcoded constant.
+        let samples: std::collections::HashSet<u64> = (0..8).map(|_| os_entropy()).collect();
+        assert!(
+            samples.len() > 1,
+            "os_entropy() returned the same value every time"
+        );
+    }
+
+    /// **RED (task 11.5): single-unknown-per-outage bookkeeping.** A `Reconnector` pointed at
+    /// a display nothing is listening on must report the FIRST failure as `OutageOpened` and
+    /// every subsequent failure as `StillDown` — never a second `OutageOpened` for the same
+    /// outage.
+    #[test]
+    fn reconnector_reports_outage_opened_once_then_still_down() {
+        // Port :9199 is far outside this suite's Xvfb range (`DISPLAY_BASE = 213` in
+        // tests/x11_integration.rs) and nothing else in this environment listens there.
+        let mut reconnector = Reconnector::new(Some(":9199"), Duration::from_secs(240));
+        match reconnector.attempt(20) {
+            ReconnectAttempt::OutageOpened { .. } => {}
+            ReconnectAttempt::StillDown { .. } => panic!("first failure must be OutageOpened"),
+            ReconnectAttempt::Restored { .. } => panic!("nothing is listening on :9199"),
+        }
+        for _ in 0..3 {
+            match reconnector.attempt(20) {
+                ReconnectAttempt::StillDown { .. } => {}
+                ReconnectAttempt::OutageOpened { .. } => {
+                    panic!("must not re-report an outage already open")
+                }
+                ReconnectAttempt::Restored { .. } => panic!("nothing is listening on :9199"),
+            }
+        }
     }
 }

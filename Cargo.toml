@@ -73,3 +73,11 @@ trybuild = "1"
 # tasks.md 6.8/6.9). Invariants over generated sequences, not examples
 # (rust-systems skill).
 proptest = "1"
+
+# Phase 11 (tasks.md 11.1-11.9): `tests/x11_integration.rs` uses XTEST's
+# `fake_input` to inject synthetic key events against Xvfb, resetting the
+# SYNC `IDLETIME` counter deterministically for RF-4's idle-detection E2E
+# tests. Dev-only: Cargo unions this feature into the `x11rb` resolved for
+# `cargo test`, but a production build (`[dependencies]` alone) never links
+# XTEST's bindings.
+x11rb = { version = "0.13", features = ["xtest"] }

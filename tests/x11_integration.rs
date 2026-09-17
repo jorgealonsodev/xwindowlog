@@ -1,6 +1,28 @@
 //! Phase 9-11 `x11.rs` E2E tests: a real Xvfb, real `x11rb` wire protocol, no mocked
 //! connection. Focused command for this slice (tasks.md Phase 9 row):
-//! `cargo test --test x11_integration -- ewmh`.
+//! `cargo test --test x11_integration -- ewmh`. Phase 11's own focused command:
+//! `cargo test --test x11_integration -- idle synthetic reconnect`.
+//!
+//! **Phase 11's extension-absence harness (task 11.13 — this note previously claimed the
+//! opposite, and the claim was false).** RF-25's degradation chain has three steps, and both
+//! degraded steps are now covered behaviourally, against genuine extension absence:
+//!
+//! - `MIT-SCREEN-SAVER` **can** be removed from this Xvfb at runtime. `Xvfb -extension
+//!   MIT-SCREEN-SAVER` starts a server whose extension list omits it (verified with
+//!   `xdpyinfo`), which is what `spawn_xvfb_with_args` uses.
+//! - `SYNC` genuinely cannot: the server answers `[mi] Extension "SYNC" can not be disabled`
+//!   and keeps it. `spawn_xproxy` below therefore puts a transparent X11 proxy between the
+//!   client and the real server and rewrites the `QueryExtension(SYNC)` reply's `present`
+//!   byte to 0 — a client, `x11rb` included, cannot tell that apart from an extension the
+//!   server was never built with.
+//!
+//! The earlier note claimed "only the Generic Event Extension supports runtime `+/-extension`
+//! toggling" and used it to justify leaving steps 2 and 3 with no behavioural coverage at
+//! all. That justification was wrong on the facts (`Xvfb -help` documents `+extension name` /
+//! `-extension name` generally, and `MIT-SCREEN-SAVER` really does disappear), and the
+//! missing coverage was real: a `panic!()` inserted at the top of `poll_screensaver_idle`,
+//! at the top of `screensaver_present`, or on `init_idle_detection`'s step-2/3 branch all
+//! survived the whole suite.
 //!
 //! **Deviation from tasks.md's stated runtime harness, documented rather than silent
 //! (see `src/x11.rs`'s module doc for the full rationale).** The Suggested Work Units
@@ -15,19 +37,30 @@
 //! with `openbox` specifically. Each test spawns its own Xvfb on a unique display number
 //! so tests remain parallel-safe (no shared root-window state races).
 
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::protocol::screensaver::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as _, CreateWindowAux, InputFocus, PropMode, Window, WindowClass,
+    KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
+use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use xwindowlog::clock::{Clock, SystemClock};
 use xwindowlog::exclude::Excluder;
-use xwindowlog::x11::{CaptureMode, RawEvent, X11Source};
+use xwindowlog::tracker::{Effect, SourceEvent, Tracker, WindowInfo};
+use xwindowlog::x11::{CaptureMode, RawEvent, ReconnectAttempt, Reconnector, X11Source};
 
 /// Guarantees unique, non-colliding display numbers across concurrently running tests in
 /// this binary (`cargo test` runs `#[test]` functions on multiple threads by default).
@@ -65,11 +98,44 @@ impl Drop for XvfbGuard {
 /// fixed sleep, which would be both slower than necessary and flaky under load. The connection
 /// that proves readiness is retained by the returned guard; see `XvfbGuard::_keepalive`.
 fn spawn_xvfb() -> XvfbGuard {
-    let display_num = DISPLAY_BASE + NEXT_DISPLAY_OFFSET.fetch_add(1, Ordering::SeqCst);
-    let display = format!(":{display_num}");
+    spawn_xvfb_on(format!(":{}", free_display_number()))
+}
+
+/// The next display number nothing is already answering on (task 11.18).
+///
+/// The readiness poll below cannot tell "the server I just started" from "a server that was
+/// already there", so without this check a test silently adopts a foreign X server that
+/// happens to hold the number. That is not hypothetical: an `Xvfb` left behind by an earlier
+/// session made `title_change_on_the_tracked_window_surfaces_undebounced` receive
+/// `UserIdle { idle_for: 4027s }` — a real reading of a display that had been idle for 67
+/// minutes — instead of the title change it was waiting for. Skipping occupied numbers also
+/// stops `spawn_xproxy` from unlinking a live server's socket to bind its own.
+fn free_display_number() -> u32 {
+    loop {
+        let display_num = DISPLAY_BASE + NEXT_DISPLAY_OFFSET.fetch_add(1, Ordering::SeqCst);
+        if x11rb::connect(Some(&format!(":{display_num}"))).is_err() {
+            return display_num;
+        }
+    }
+}
+
+/// The display-number-explicit half of `spawn_xvfb`, split out so Phase 11's reconnect E2E
+/// test (`reconnector_recovers_when_a_real_xvfb_restarts_on_the_same_display`) can spawn a
+/// SECOND Xvfb on the exact same display a first one just died on, rather than the always-
+/// fresh display `spawn_xvfb` hands out for parallel-safety.
+fn spawn_xvfb_on(display: String) -> XvfbGuard {
+    spawn_xvfb_with_args(display, &[])
+}
+
+/// The extra-server-arguments half of `spawn_xvfb_on`, split out for task 11.13: RF-25's
+/// degradation chain needs a server that genuinely lacks `MIT-SCREEN-SAVER`, and
+/// `-extension MIT-SCREEN-SAVER` genuinely removes it (verified: `xdpyinfo` then lists 22
+/// extensions with `MIT-SCREEN-SAVER` absent and `SYNC` still present).
+fn spawn_xvfb_with_args(display: String, extra: &[&str]) -> XvfbGuard {
     let child = Command::new("Xvfb")
         .arg(&display)
         .args(["-screen", "0", "320x240x24", "-nolisten", "tcp"])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -91,6 +157,38 @@ fn spawn_xvfb() -> XvfbGuard {
         child,
         display,
         _keepalive: keepalive,
+    }
+}
+
+/// Task 11.9: the E2E readiness-poll helper on `_NET_SUPPORTED`/`_NET_ACTIVE_WINDOW`,
+/// **bounded, no fixed `sleep`** (design.md E-3) — written to be reused verbatim wherever a
+/// real window manager's EWMH declaration must be awaited (Phase 19's CI job, per tasks.md).
+/// `FakeWm::declare_ewmh_supported` sets this state synchronously (its own `.check()` calls
+/// already round-trip before returning), so every test below that uses it observes readiness
+/// on this function's very first poll — this still exercises the real bounded-poll code path
+/// against a real Xvfb connection, not only its timeout arithmetic.
+fn wait_for_ewmh_ready(display: &str, timeout: Duration) -> bool {
+    let (conn, screen_num) = x11rb::connect(Some(display)).expect("readiness probe connect");
+    let root = conn.setup().roots[screen_num].root;
+    let net_supported = intern(&conn, b"_NET_SUPPORTED");
+    let net_active_window = intern(&conn, b"_NET_ACTIVE_WINDOW");
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let reply = conn
+            .get_property(false, root, net_supported, AtomEnum::ATOM, 0, 512)
+            .expect("_NET_SUPPORTED request")
+            .reply()
+            .expect("_NET_SUPPORTED reply");
+        if let Some(mut supported) = reply.value32() {
+            if supported.any(|atom| atom == net_active_window) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -306,6 +404,34 @@ impl FakeWm {
             .expect("set_input_focus request")
             .check()
             .expect("set_input_focus reply");
+        self.conn.flush().expect("flush");
+    }
+
+    /// RF-4's idle-detection tests: injects one synthetic key press+release via the `XTEST`
+    /// extension, which resets the `SYNC` `IDLETIME` system counter to (near) zero exactly
+    /// as real keyboard input would — confirmed empirically against a live Xvfb before
+    /// writing any of `src/x11.rs`'s idle-detection code (module doc's empirical notes).
+    /// `XTEST` requests don't target a specific window, so this works from any connection —
+    /// `FakeWm`'s is reused here only because it already owns one.
+    fn generate_activity(&self) {
+        self.conn
+            .xtest_fake_input(KEY_PRESS_EVENT, 38, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
+            .expect("xtest_fake_input(press) request")
+            .check()
+            .expect("xtest_fake_input(press) reply");
+        self.conn
+            .xtest_fake_input(
+                KEY_RELEASE_EVENT,
+                38,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )
+            .expect("xtest_fake_input(release) request")
+            .check()
+            .expect("xtest_fake_input(release) reply");
         self.conn.flush().expect("flush");
     }
 
@@ -1321,6 +1447,11 @@ fn wm_class_absent_pid_exited_falls_back_to_sentinel() {
 /// (Phase 14) will eventually drive via `poll(2)`; here it is a short bounded loop since this
 /// test has no separate reactor thread of its own.
 fn wait_for_raw_event(source: &mut X11Source) -> RawEvent {
+    // 5s (task 11.14). It was briefly raised to 10s and blamed on contention; instrumenting
+    // every call in this file across ten full-suite runs put the slowest real wait at 504ms,
+    // so contention was never the cause and the raise only doubled the time to fail. A
+    // timeout here means an event was genuinely lost, which is a defect to fix in
+    // `src/x11.rs` (see task 11.10), never a bound to widen.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(event) = source.poll_for_event().expect("poll_for_event") {
@@ -1448,4 +1579,988 @@ fn a_title_capped_by_the_read_bound_still_carries_the_ellipsis() {
         evaluated.title.as_str().ends_with('…'),
         "a title the read bound truncated must be marked as truncated"
     );
+}
+
+// Phase 11 (tasks 11.1-11.9): SYNC/IDLETIME absence detection, the RF-25 degradation chain,
+// RF-6/RF-32 reconnection, and the three-synthetic-window E2E harness.
+
+/// `RawEvent` -> `SourceEvent`, exactly the conversion `reactor.rs` (Phase 14) will own in
+/// production (D-7: the only sanctioned way to obtain a `SafeTitle` outside `exclude.rs` is
+/// `Excluder::evaluate`). Local to this test file because no reactor exists yet to own it —
+/// the same reasoning `tracked_window` and the CRITICAL/WARNING tests above already rely on.
+fn to_source_event(excluder: &Excluder, raw: RawEvent) -> SourceEvent {
+    match raw {
+        RawEvent::ActiveWindow(info) => SourceEvent::ActiveWindow(info.map(|info| {
+            let evaluated = excluder.evaluate(&info.app_id, info.title);
+            WindowInfo {
+                app_id: evaluated.app_id,
+                title: evaluated.title,
+                pid: info.pid,
+            }
+        })),
+        RawEvent::TitleChanged(title) => {
+            SourceEvent::TitleChanged(excluder.evaluate("", title).title)
+        }
+        RawEvent::ActiveWindowDestroyed => SourceEvent::ActiveWindowDestroyed,
+        RawEvent::UserIdle { idle_for } => SourceEvent::UserIdle { idle_for },
+        RawEvent::UserActive => SourceEvent::UserActive,
+        RawEvent::DisplayLost => SourceEvent::DisplayLost,
+        RawEvent::DisplayRestored => SourceEvent::DisplayRestored,
+    }
+}
+
+/// **RED (task 11.3): step 1 available -> no degradation diagnostic.** This environment's
+/// Xvfb always exposes `SYNC` (confirmed empirically; see this file's module doc), so this
+/// is the one degradation-chain outcome provable end to end here.
+#[test]
+fn sync_idle_used_when_available_no_degradation_diagnostic() {
+    let xvfb = spawn_xvfb();
+    let (_source, diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    for diagnostic in &diagnostics {
+        assert!(
+            !diagnostic.contains("SYNC") && !diagnostic.contains("SCREEN-SAVER"),
+            "SYNC is available in this environment; no degradation diagnostic was expected, \
+             got {diagnostic:?}"
+        );
+    }
+}
+
+/// **RED (task 11.1): the alarm fires a positive transition at the threshold, and
+/// `idle_for` is read exactly once, at that instant.** `generate_activity` resets `IDLETIME`
+/// to (near) zero immediately before connecting, so the 500ms threshold is crossed for real
+/// by real elapsed time, not by an already-past-threshold startup (that scenario is its own
+/// test below).
+#[test]
+fn sync_idle_alarm_fires_user_idle_with_correct_idle_for() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(500))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::UserIdle { idle_for } => {
+            assert!(
+                (400..=2000).contains(&idle_for.as_millis()),
+                "expected idle_for close to the 500ms threshold, got {idle_for:?}"
+            );
+        }
+        other => panic!("expected UserIdle, got {other:?}"),
+    }
+}
+
+/// **RED (task 11.1): the negative transition re-arms the alarm to detect the return of
+/// activity.**
+#[test]
+fn sync_idle_user_returns_after_idle_produces_user_active() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(300))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::UserIdle { .. } => {}
+        other => panic!("expected UserIdle first, got {other:?}"),
+    }
+
+    wm.generate_activity();
+    match wait_for_raw_event(&mut source) {
+        RawEvent::UserActive => {}
+        other => panic!("expected UserActive after activity resumed, got {other:?}"),
+    }
+}
+
+/// **RED (module doc's A-7 empirical note): a `Transition` alarm only fires on the edge, so
+/// a user already idle past the threshold at connect time must be detected immediately, not
+/// left waiting for a crossing that already happened.** Reproduces the exact defect found
+/// while implementing this task: without the one-shot arm-time check, this scenario hangs
+/// until the test's own timeout.
+#[test]
+fn sync_idle_already_past_threshold_at_connect_synthesizes_immediately() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+    std::thread::sleep(Duration::from_millis(350));
+
+    let start = Instant::now();
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(200))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    let event = source
+        .poll_for_event()
+        .expect("poll_for_event")
+        .expect("the already-past-threshold idle state must be synthesized immediately");
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "the synthesized event must not wait for a real alarm that will never fire, took {:?}",
+        start.elapsed()
+    );
+    match event {
+        RawEvent::UserIdle { idle_for } => {
+            assert!(
+                idle_for.as_millis() >= 200,
+                "idle_for {idle_for:?} must be >= threshold"
+            );
+        }
+        other => panic!("expected an immediately-synthesized UserIdle, got {other:?}"),
+    }
+}
+
+/// Proves the real wire-level `MIT-SCREEN-SAVER` `QueryInfo` round trip against Xvfb — the
+/// I/O primitive `X11Source::poll_screensaver_idle` depends on. `IdleMode::ScreenSaverPolling`
+/// itself can't be forced through `X11Source`'s public API without `SYNC` genuinely absent,
+/// which this Xvfb cannot simulate (this file's module doc) — this test proves the request
+/// this module would issue in that mode actually works, independent of mode selection.
+#[test]
+fn screensaver_query_info_round_trip_returns_a_plausible_value() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let info = wm
+        .conn
+        .screensaver_query_info(wm.root)
+        .expect("screensaver_query_info request")
+        .reply()
+        .expect("screensaver_query_info reply");
+    assert!(
+        info.ms_since_user_input < 2000,
+        "expected a small idle value right after generating activity, got {}ms",
+        info.ms_since_user_input
+    );
+}
+
+/// Task 11.9: the readiness-poll helper observes `FakeWm`'s EWMH declaration and returns
+/// quickly (state was set synchronously before this call, via `declare_ewmh_supported`'s own
+/// `.check()` round trips) rather than consuming its whole bounded timeout.
+#[test]
+fn ewmh_readiness_poll_returns_quickly_once_declared() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+
+    let start = Instant::now();
+    assert!(wait_for_ewmh_ready(&xvfb.display, Duration::from_secs(5)));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "EWMH state was already declared; the poll should not have waited, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// **RED (tasks 11.7/11.8): three synthetic windows, driven end to end through `X11Source` +
+/// a real `Tracker`, produce intervals whose total duration matches real elapsed wall time
+/// within the PRD's own ≤1s tolerance.** `FakeWm::create_window` is this phase's in-house
+/// `x11rb` synthetic-window mechanism (no `xdotool`), extending the same deviation already
+/// documented for Phase 9/10 (module doc). `WallTs` is whole-second-granular by design (D-9),
+/// which is exactly why the PRD's own tolerance is ≤1s rather than sub-second: real per-window
+/// dwell times below are chosen comfortably above that granularity.
+#[test]
+fn three_synthetic_windows_produce_correct_intervals_within_one_second_tolerance() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    assert!(wait_for_ewmh_ready(&xvfb.display, Duration::from_secs(2)));
+
+    let w1 = wm.create_window();
+    wm.set_wm_class(w1, "app1", "App1");
+    wm.set_title(w1, "Window One");
+    let w2 = wm.create_window();
+    wm.set_wm_class(w2, "app2", "App2");
+    wm.set_title(w2, "Window Two");
+    let w3 = wm.create_window();
+    wm.set_wm_class(w3, "app3", "App3");
+    wm.set_title(w3, "Window Three");
+
+    wm.set_active_window(w1);
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+
+    let clock = SystemClock;
+    let mut tracker = Tracker::new();
+    let excluder = Excluder::from_toml_str("").expect("empty config compiles");
+    let mut opens: Vec<(String, xwindowlog::clock::WallTs)> = Vec::new();
+
+    let apply = |tracker: &mut Tracker, event, opens: &mut Vec<(String, _)>| {
+        let now = clock.now_wall();
+        for effect in tracker.on_event(event, now, clock.now_mono()) {
+            match effect {
+                Effect::OpenOnly { at, open } | Effect::Transition { at, open } => {
+                    opens.push((open.app, at));
+                }
+                _ => {}
+            }
+        }
+        now
+    };
+
+    // Pre-existing state (w1 was set before `connect`) produces no `PropertyNotify` — the
+    // same explicit-establish pattern `tracked_window` uses above.
+    let raw = source
+        .on_active_window_changed()
+        .expect("on_active_window_changed")
+        .expect("w1 must be reported");
+    apply(&mut tracker, to_source_event(&excluder, raw), &mut opens);
+
+    let per_window = Duration::from_millis(2000);
+    std::thread::sleep(per_window);
+
+    wm.set_active_window(w2);
+    let raw = wait_for_raw_event(&mut source);
+    apply(&mut tracker, to_source_event(&excluder, raw), &mut opens);
+
+    std::thread::sleep(per_window);
+
+    wm.set_active_window(w3);
+    let raw = wait_for_raw_event(&mut source);
+    apply(&mut tracker, to_source_event(&excluder, raw), &mut opens);
+
+    std::thread::sleep(per_window);
+
+    // RF-33-shaped close so w3's interval has an observable `end` too.
+    let end = apply(&mut tracker, SourceEvent::Shutdown, &mut opens);
+
+    assert_eq!(
+        opens
+            .iter()
+            .map(|(app, _)| app.as_str())
+            .collect::<Vec<_>>(),
+        vec!["App1", "App2", "App3"],
+        "expected three distinct intervals in switch order"
+    );
+
+    let start = opens.first().expect("at least one interval").1;
+    let total_secs = end.as_unix_secs() - start.as_unix_secs();
+    assert!(
+        (5..=7).contains(&total_secs),
+        "expected roughly 6s of total elapsed wall time across the three ~2s switches \
+         (±1s tolerance), got {total_secs}s"
+    );
+}
+
+/// **RED (tasks 11.5/11.6, real E2E): a real X11 connection loss, three consecutive real
+/// failed reconnection attempts (the idle-detection spec's own "Repeated reconnection
+/// failures" scenario, applied to `Reconnector`), then a real Xvfb restart on the same
+/// display is recovered.** Reports the outage exactly once (`OutageOpened`, then `StillDown`
+/// for the three failed retries — never a second `OutageOpened`) and exactly one `Restored`
+/// once the replacement server is reachable.
+#[test]
+fn reconnector_recovers_when_a_real_xvfb_restarts_on_the_same_display() {
+    let xvfb = spawn_xvfb();
+    let display = xvfb.display.clone();
+    drop(xvfb); // kills the first Xvfb — a real connection loss, not a simulated one.
+
+    let mut reconnector = Reconnector::new(Some(&display), Duration::from_secs(240));
+
+    let first = reconnector.attempt(20);
+    assert!(
+        matches!(first, ReconnectAttempt::OutageOpened { .. }),
+        "the first failed attempt must open the outage"
+    );
+
+    // Three consecutive real failures against a display nothing is listening on yet —
+    // nothing must re-report `OutageOpened`. `attempt` is retried immediately rather than
+    // slept on its reported `retry_after`: the exact backoff *values* are already pinned by
+    // `x11::tests::reconnect_backoff_sequence_matches_rf32_exactly_with_zero_jitter`; this
+    // test proves the real reconnection mechanism, not the timing.
+    for _ in 0..3 {
+        match reconnector.attempt(20) {
+            ReconnectAttempt::StillDown { .. } => {}
+            ReconnectAttempt::OutageOpened { .. } => {
+                panic!("the outage was already open; must not report a second OutageOpened")
+            }
+            ReconnectAttempt::Restored { .. } => {
+                panic!("nothing is listening on {display} yet")
+            }
+        }
+    }
+
+    // The replacement Xvfb comes up on the same display; `spawn_xvfb_on` blocks internally
+    // until it accepts connections (its own readiness poll), so the very next attempt must
+    // succeed.
+    let _replacement = spawn_xvfb_on(display.clone());
+    match reconnector.attempt(20) {
+        ReconnectAttempt::Restored { .. } => {}
+        ReconnectAttempt::StillDown { .. } => {
+            panic!("the replacement Xvfb is ready; this attempt must succeed")
+        }
+        ReconnectAttempt::OutageOpened { .. } => {
+            panic!("the outage was already open; must not report a second OutageOpened")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 11.13 / 11.12: a transparent X11 wire proxy
+// ---------------------------------------------------------------------------
+
+/// The core-protocol opcode for `QueryExtension` — the only request this proxy inspects.
+const QUERY_EXTENSION_OPCODE: u8 = 98;
+
+/// `XSyncAlarmNotify` is SYNC's *second* event (`XSyncCounterNotify` is the first), so its
+/// wire event number is `first_event + 1` — `x11rb`'s `sync::ALARM_NOTIFY_EVENT`.
+const SYNC_ALARM_NOTIFY_OFFSET: u8 = 1;
+
+/// X11 pads every variable-length field out to a 4-byte boundary.
+fn pad4(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+/// What one proxied connection has learned so far. Shared between the two directions.
+#[derive(Default)]
+struct ProxyState {
+    /// Sequence numbers of `QueryExtension` requests whose reply must be rewritten to
+    /// "absent".
+    hidden_sequences: HashSet<u16>,
+    /// Sequence number of the client's `QueryExtension("SYNC")`, so the matching reply can
+    /// be read for the extension's `first_event` base.
+    sync_query_sequence: Option<u16>,
+    sync_first_event: Option<u8>,
+    duplicated_alarm_notify: bool,
+}
+
+/// A transparent X11 proxy in front of a real Xvfb, listening on a display number of its
+/// own. See this file's module doc for why it exists: `SYNC` cannot be removed from this
+/// Xvfb, so RF-25's degradation chain can only be given real behavioural coverage by
+/// answering the client's `QueryExtension` the way a server without the extension would.
+///
+/// It is a byte-level relay, not a parser: every request and every reply is forwarded
+/// verbatim except the specific `QueryExtension` reply byte being rewritten, so the client
+/// is talking to the real server over the real wire protocol throughout.
+struct XProxy {
+    display: String,
+    socket_path: String,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for XProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+/// Starts a proxy in front of `target_display`, reporting every extension named in `hide` as
+/// absent. When `duplicate_alarm_notify` is set, the first `XSyncAlarmNotify` the server
+/// sends is delivered to the client **twice** — task 11.12's deterministic stand-in for an
+/// alarm event that was already queued when the source re-armed the alarm, which is exactly
+/// what a real server does under the create->query window and which the client cannot tell
+/// apart from a duplicate.
+fn spawn_xproxy(target_display: &str, hide: &[&str], duplicate_alarm_notify: bool) -> XProxy {
+    let listen_num = free_display_number();
+    let socket_path = format!("/tmp/.X11-unix/X{listen_num}");
+    let _ = std::fs::remove_file(&socket_path);
+    let target_path = format!("/tmp/.X11-unix/X{}", target_display.trim_start_matches(':'));
+    let hidden: Vec<Vec<u8>> = hide.iter().map(|name| name.as_bytes().to_vec()).collect();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let path_listener = UnixListener::bind(&socket_path).expect("bind the proxy X socket");
+    // `x11rb` tries Linux's abstract namespace before the filesystem path
+    // (`rust_connection::stream`: "Try abstract unix socket first"), so the proxy has to own
+    // both names or the client connects straight past it to the real server.
+    let abstract_address =
+        SocketAddr::from_abstract_name(socket_path.as_bytes()).expect("abstract socket address");
+    let abstract_listener =
+        UnixListener::bind_addr(&abstract_address).expect("bind the abstract proxy X socket");
+
+    for listener in [path_listener, abstract_listener] {
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking accept so the guard can stop this thread");
+        let hidden = hidden.clone();
+        let target_path = target_path.clone();
+        let shutdown = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let hidden = hidden.clone();
+                        let target_path = target_path.clone();
+                        thread::spawn(move || {
+                            proxy_one_connection(
+                                client,
+                                &target_path,
+                                hidden,
+                                duplicate_alarm_notify,
+                            );
+                        });
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    XProxy {
+        display: format!(":{listen_num}"),
+        socket_path,
+        shutdown,
+    }
+}
+
+fn proxy_one_connection(
+    client: UnixStream,
+    target_path: &str,
+    hidden: Vec<Vec<u8>>,
+    duplicate_alarm_notify: bool,
+) {
+    let Ok(server) = UnixStream::connect(target_path) else {
+        return;
+    };
+    let state = Arc::new(Mutex::new(ProxyState::default()));
+    let client_read = client.try_clone().expect("clone the client socket");
+    let server_write = server.try_clone().expect("clone the server socket");
+    let upstream_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let _ = client_to_server(client_read, server_write, hidden, upstream_state);
+    });
+    let _ = server_to_client(server, client, duplicate_alarm_notify, state);
+}
+
+/// Client -> server. Counts request sequence numbers exactly as the server does (the first
+/// request after the setup is sequence 1) and remembers which of them are `QueryExtension`
+/// calls whose reply has to be rewritten.
+fn client_to_server(
+    mut client: UnixStream,
+    mut server: UnixStream,
+    hidden: Vec<Vec<u8>>,
+    state: Arc<Mutex<ProxyState>>,
+) -> std::io::Result<()> {
+    // Connection setup request: a 12-byte header, then the padded authorization protocol
+    // name and data.
+    let mut header = [0u8; 12];
+    client.read_exact(&mut header)?;
+    let name_len = usize::from(u16::from_le_bytes([header[6], header[7]]));
+    let data_len = usize::from(u16::from_le_bytes([header[8], header[9]]));
+    let mut authorization = vec![0u8; pad4(name_len) + pad4(data_len)];
+    client.read_exact(&mut authorization)?;
+    server.write_all(&header)?;
+    server.write_all(&authorization)?;
+    server.flush()?;
+
+    let mut sequence: u16 = 0;
+    loop {
+        let mut head = [0u8; 4];
+        client.read_exact(&mut head)?;
+        let length = usize::from(u16::from_le_bytes([head[2], head[3]]));
+        let mut request = head.to_vec();
+        let body_len = if length == 0 {
+            // BIG-REQUESTS: the real length is the next four bytes, in 4-byte units, and it
+            // counts the 8-byte header this form uses.
+            let mut extended = [0u8; 4];
+            client.read_exact(&mut extended)?;
+            request.extend_from_slice(&extended);
+            (u32::from_le_bytes(extended) as usize)
+                .saturating_mul(4)
+                .saturating_sub(8)
+        } else {
+            length.saturating_mul(4).saturating_sub(4)
+        };
+        let mut body = vec![0u8; body_len];
+        client.read_exact(&mut body)?;
+        sequence = sequence.wrapping_add(1);
+
+        if head[0] == QUERY_EXTENSION_OPCODE && body.len() >= 4 {
+            let name_len = usize::from(u16::from_le_bytes([body[0], body[1]]));
+            if body.len() >= 4 + name_len {
+                let name = &body[4..4 + name_len];
+                let mut state = state.lock().expect("proxy state");
+                if hidden.iter().any(|extension| extension == name) {
+                    state.hidden_sequences.insert(sequence);
+                }
+                if name == b"SYNC" {
+                    state.sync_query_sequence = Some(sequence);
+                }
+            }
+        }
+
+        request.extend_from_slice(&body);
+        server.write_all(&request)?;
+        server.flush()?;
+    }
+}
+
+/// Server -> client. Rewrites the `present` byte of the `QueryExtension` replies the
+/// upstream direction flagged, learns SYNC's `first_event` from its own reply, and
+/// optionally delivers the first alarm notification twice.
+fn server_to_client(
+    mut server: UnixStream,
+    mut client: UnixStream,
+    duplicate_alarm_notify: bool,
+    state: Arc<Mutex<ProxyState>>,
+) -> std::io::Result<()> {
+    // Connection setup reply: 8 bytes, then `additional_data_len` 4-byte units.
+    let mut header = [0u8; 8];
+    server.read_exact(&mut header)?;
+    let extra = usize::from(u16::from_le_bytes([header[6], header[7]])).saturating_mul(4);
+    let mut rest = vec![0u8; extra];
+    server.read_exact(&mut rest)?;
+    client.write_all(&header)?;
+    client.write_all(&rest)?;
+    client.flush()?;
+
+    loop {
+        let mut message = vec![0u8; 32];
+        server.read_exact(&mut message)?;
+        let kind = message[0];
+        // A reply (type 1) and a GenericEvent (type 35) are the two messages that carry a
+        // variable-length tail beyond the fixed 32 bytes.
+        if kind == 1 || (kind & 0x7f) == 35 {
+            let tail_len = (u32::from_le_bytes([message[4], message[5], message[6], message[7]])
+                as usize)
+                .saturating_mul(4);
+            let mut tail = vec![0u8; tail_len];
+            server.read_exact(&mut tail)?;
+            message.extend_from_slice(&tail);
+        }
+
+        let mut duplicate = false;
+        {
+            let mut state = state.lock().expect("proxy state");
+            if kind == 1 {
+                let sequence = u16::from_le_bytes([message[2], message[3]]);
+                if state.hidden_sequences.contains(&sequence) {
+                    // `QueryExtension`'s reply: byte 8 is `present`, byte 10 `first_event`.
+                    message[8] = 0;
+                } else if state.sync_query_sequence == Some(sequence) {
+                    state.sync_first_event = Some(message[10]);
+                }
+            } else if duplicate_alarm_notify && !state.duplicated_alarm_notify {
+                if let Some(first_event) = state.sync_first_event {
+                    if kind & 0x7f == first_event.saturating_add(SYNC_ALARM_NOTIFY_OFFSET) {
+                        state.duplicated_alarm_notify = true;
+                        duplicate = true;
+                    }
+                }
+            }
+        }
+
+        client.write_all(&message)?;
+        if duplicate {
+            client.write_all(&message)?;
+        }
+        client.flush()?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 corrections (tasks 11.10-11.16)
+// ---------------------------------------------------------------------------
+
+/// **RED (tasks 11.10/11.11): the user comes back before the daemon has drained the alarm
+/// that reported them idle.** The positive `AlarmNotify` is already queued on the client
+/// socket when the input arrives, so by the time the source re-arms for the negative edge
+/// `IDLETIME` is already below the threshold — the crossing is in the past and the server
+/// will never report it (`ChangeAlarm` whose trigger is already satisfied notifies nothing
+/// for a `Transition` test). Without a read tied to the arm action, `UserActive` never
+/// arrives and the daemon stays latched in AFK while the user is typing.
+///
+/// This is the deterministic form of the ~2% loss measured against the real code path
+/// (task 11.10): 1 of 60 trials of "connect, wait for `UserIdle`, return immediately" lost
+/// the transition entirely, with `IDLETIME` confirming at the moment of failure that the
+/// input really had reset the counter.
+#[test]
+fn a_return_that_races_the_queued_idle_alarm_still_produces_user_active() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(300))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    // Let the alarm fire and its notification queue up on the socket, then return BEFORE
+    // that notification is drained.
+    std::thread::sleep(Duration::from_millis(600));
+    wm.generate_activity();
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::UserIdle { .. } => {}
+        other => panic!("expected the queued UserIdle first, got {other:?}"),
+    }
+
+    // The return already happened. Keep the user active so no later crossing can rescue
+    // the daemon: the only correct source of `UserActive` here is the check tied to the
+    // re-arm itself.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match source.poll_for_event().expect("poll_for_event") {
+            Some(RawEvent::UserActive) => break,
+            Some(other) => panic!("expected UserActive, got {other:?}"),
+            None => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the user returned while the idle alarm was still queued; UserActive was never \
+             surfaced, so the daemon is latched in AFK with the user typing"
+        );
+        wm.generate_activity();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// **RED (task 11.12): an alarm notification generated under one arming must not be read as
+/// the opposite transition once the alarm has been re-armed.** A queued `AlarmNotify`
+/// survives a later `ChangeAlarm`, so the local "which edge am I waiting for" field is not a
+/// safe classifier — the event's own `counter_value` is. The proxy delivers the first
+/// notification twice, which is indistinguishable at the client from the real
+/// create->query window that produced one spurious `UserActive` in 500 startups.
+#[test]
+fn a_duplicated_alarm_notification_never_fabricates_user_active() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    let proxy = spawn_xproxy(&xvfb.display, &[], true);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&proxy.display), Duration::from_millis(300))
+            .expect("X11Source::connect_with_afk_threshold through the proxy");
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::UserIdle { .. } => {}
+        other => panic!("expected UserIdle from the real positive transition, got {other:?}"),
+    }
+
+    // The duplicate is already on the socket, delivered after the source re-armed for the
+    // negative edge. Nobody has touched the keyboard since, so no UserActive may appear.
+    let event = wait_for_raw_event(&mut source);
+    match event {
+        RawEvent::UserIdle { idle_for } => assert!(
+            idle_for.as_millis() >= 300,
+            "the duplicate carries the idle value it was generated with, got {idle_for:?}"
+        ),
+        RawEvent::UserActive => panic!(
+            "the duplicated alarm notification was classified from the local `armed` field \
+             instead of its own counter_value, fabricating a UserActive while the user is \
+             still idle"
+        ),
+        other => panic!("expected the duplicate to be read as UserIdle, got {other:?}"),
+    }
+}
+
+/// **Task 11.13, RF-25 step 2: `SYNC` genuinely absent, `MIT-SCREEN-SAVER` present.** The
+/// proxy answers `QueryExtension(SYNC)` exactly as a server without the extension does, so
+/// this exercises the real selection branch, the real 30s-cadence poll's body, and the real
+/// `XScreenSaverQueryInfo` wire call — not only `select_degradation_diagnostic`'s strings.
+#[test]
+fn sync_absent_degrades_to_a_real_screensaver_poll() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    let proxy = spawn_xproxy(&xvfb.display, &["SYNC"], false);
+
+    let (mut source, diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&proxy.display), Duration::from_millis(700))
+            .expect("startup must not be blocked by SYNC being unavailable");
+
+    let degradations: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("MIT-SCREEN-SAVER"))
+        .collect();
+    assert_eq!(
+        degradations.len(),
+        1,
+        "exactly one degradation diagnostic was expected, got {diagnostics:?}"
+    );
+    assert!(
+        degradations[0].contains("SYNC/IDLETIME unavailable"),
+        "the diagnostic must name what degraded, got {:?}",
+        degradations[0]
+    );
+
+    // Freshly active: the poll must report nothing at all.
+    wm.generate_activity();
+    assert!(
+        source
+            .poll_screensaver_idle()
+            .expect("poll_screensaver_idle")
+            .is_none(),
+        "the user is active; the poll must report no transition"
+    );
+
+    // Past the threshold: one UserIdle carrying a real ms_since_user_input reading.
+    std::thread::sleep(Duration::from_millis(900));
+    match source
+        .poll_screensaver_idle()
+        .expect("poll_screensaver_idle")
+    {
+        Some(RawEvent::UserIdle { idle_for }) => assert!(
+            idle_for.as_millis() >= 700,
+            "idle_for {idle_for:?} must be at least the threshold"
+        ),
+        other => panic!("expected UserIdle past the threshold, got {other:?}"),
+    }
+
+    // Still idle: the transition already happened, so the next poll reports nothing.
+    assert!(
+        source
+            .poll_screensaver_idle()
+            .expect("poll_screensaver_idle")
+            .is_none(),
+        "still idle; UserIdle must not re-fire on every poll"
+    );
+
+    // And the return is reported exactly once.
+    wm.generate_activity();
+    match source
+        .poll_screensaver_idle()
+        .expect("poll_screensaver_idle")
+    {
+        Some(RawEvent::UserActive) => {}
+        other => panic!("expected UserActive once input resumed, got {other:?}"),
+    }
+    assert!(
+        source
+            .poll_screensaver_idle()
+            .expect("poll_screensaver_idle")
+            .is_none(),
+        "still active; UserActive must not re-fire on every poll"
+    );
+}
+
+/// **Task 11.13, RF-25 step 3: neither extension available.** `MIT-SCREEN-SAVER` is removed
+/// from the server itself (`-extension MIT-SCREEN-SAVER`, which this Xvfb does honour) and
+/// `SYNC` is hidden by the proxy, so both probes fail for real. The daemon must still start,
+/// emit exactly one warning naming `logind` as what is left, and leave the idle path inert.
+#[test]
+fn neither_idle_extension_available_disables_absence_detection_without_blocking_startup() {
+    let display_num = free_display_number();
+    let xvfb = spawn_xvfb_with_args(
+        format!(":{display_num}"),
+        &["-extension", "MIT-SCREEN-SAVER"],
+    );
+    let proxy = spawn_xproxy(&xvfb.display, &["SYNC"], false);
+
+    let started = Instant::now();
+    let (mut source, diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&proxy.display), Duration::from_millis(300))
+            .expect("neither extension may block startup (RF-25 step 3)");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "startup must not block waiting for absence detection, took {:?}",
+        started.elapsed()
+    );
+
+    let warnings: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("absence detection is disabled"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one startup warning was expected, got {diagnostics:?}"
+    );
+    assert!(
+        warnings[0].contains("logind"),
+        "the warning must say what absence detection falls back to, got {:?}",
+        warnings[0]
+    );
+
+    // Inert, not broken: the polling entry point is a no-op and nothing is ever reported.
+    assert!(source
+        .poll_screensaver_idle()
+        .expect("poll_screensaver_idle must stay a no-op, never an error")
+        .is_none());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        source
+            .poll_screensaver_idle()
+            .expect("poll_screensaver_idle")
+            .is_none(),
+        "with absence detection disabled, no idle transition may ever be reported"
+    );
+}
+
+/// **Task 11.15 (mutation pin): `Reconnector`'s own bookkeeping, asserted through
+/// `Reconnector`.** Deleting `self.backoff.reset()` or `self.outage_open = false` from the
+/// success branch left the whole suite green; the second is RF-6's exact inversion, where
+/// every outage after the first reports `StillDown` and opens no `unknown` interval at all.
+/// `entropy = 20` lands on 0% jitter (`20 % 41 - 20`), so the delays are exact.
+#[test]
+fn reconnector_resets_backoff_and_reopens_the_outage_on_the_second_outage() {
+    let xvfb = spawn_xvfb();
+    let display = xvfb.display.clone();
+    drop(xvfb);
+
+    let mut reconnector = Reconnector::new(Some(&display), Duration::from_secs(240));
+
+    match reconnector.attempt(20) {
+        ReconnectAttempt::OutageOpened { retry_after } => {
+            assert_eq!(retry_after, Duration::from_millis(500))
+        }
+        _ => panic!("the first failed attempt must open the outage at the base delay"),
+    }
+    match reconnector.attempt(20) {
+        ReconnectAttempt::StillDown { retry_after } => {
+            assert_eq!(
+                retry_after,
+                Duration::from_secs(1),
+                "the backoff must have advanced within this outage"
+            )
+        }
+        _ => panic!("the outage is already open; a second failure is StillDown"),
+    }
+
+    let first_server = spawn_xvfb_on(display.clone());
+    match reconnector.attempt(20) {
+        ReconnectAttempt::Restored {
+            outage_was_open, ..
+        } => assert!(
+            outage_was_open,
+            "this recovery closes an outage the caller was already told about"
+        ),
+        _ => panic!("the replacement Xvfb is ready; this attempt must succeed"),
+    }
+    drop(first_server);
+
+    // A second, independent outage. RF-32: it starts over at the base delay, and RF-6: it
+    // opens its own `unknown` interval rather than reporting StillDown forever.
+    match reconnector.attempt(20) {
+        ReconnectAttempt::OutageOpened { retry_after } => assert_eq!(
+            retry_after,
+            Duration::from_millis(500),
+            "a successful reconnection resets the backoff for the next outage"
+        ),
+        ReconnectAttempt::StillDown { .. } => panic!(
+            "the previous outage was closed by a successful reconnection; this new outage \
+             must open its own, or RF-6 never opens a second `unknown` interval"
+        ),
+        ReconnectAttempt::Restored { .. } => panic!("the server was killed; this must fail"),
+    }
+}
+
+/// **RED (task 11.16, RF-6): a reconnection that succeeds on the very first attempt.** The
+/// caller was never told an outage opened, so it still owes RF-6 its "close the current
+/// interval and open exactly one `unknown` interval" — which it can only know from the
+/// outcome itself.
+#[test]
+fn a_first_attempt_that_succeeds_reports_that_no_outage_was_opened() {
+    let xvfb = spawn_xvfb();
+    let mut reconnector = Reconnector::new(Some(&xvfb.display), Duration::from_secs(240));
+
+    match reconnector.attempt(20) {
+        ReconnectAttempt::Restored {
+            outage_was_open, ..
+        } => assert!(
+            !outage_was_open,
+            "no OutageOpened preceded this success, so the caller still owes RF-6 the one \
+             `unknown` interval for this outage"
+        ),
+        _ => panic!("the display is up; the first attempt must succeed"),
+    }
+}
+
+/// Waits for `UserIdle` or `UserActive`, tolerating a repeat of the state the source is
+/// already in. A duplicate is legitimate — the arm-time check and a real alarm fire can both
+/// report the same transition when input lands between them, and `Tracker` ignores a
+/// transition it is already in — whereas the *wrong* transition, or none at all, is the
+/// defect this helper's callers are pinning.
+fn wait_for_idle_or_active(source: &mut X11Source, want_idle: bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match source.poll_for_event().expect("poll_for_event") {
+            Some(RawEvent::UserIdle { .. }) if want_idle => return,
+            Some(RawEvent::UserActive) if !want_idle => return,
+            Some(RawEvent::UserIdle { .. }) | Some(RawEvent::UserActive) => {}
+            Some(other) => {
+                panic!("unexpected event while waiting for an idle transition: {other:?}")
+            }
+            None => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waiting for {} timed out: the transition was never reported",
+            if want_idle { "UserIdle" } else { "UserActive" }
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// **RED (task 11.10): fifteen tight away-and-back cycles, where the user returns the
+/// instant the daemon learns they were away.**
+///
+/// That is the shape that loses the return: the away alarm fires at exactly the threshold,
+/// the return edge gets armed against that same value, and the crossing that follows is
+/// never reported. Measured against the real code path, one cycle per trial, 120 trials
+/// each: **8 returns lost before the fix (6.7%), 0 after it**. Against a raw `x11rb` probe
+/// with a tighter re-arm the pre-fix rate was 12 in 60, and every lost trial was one whose
+/// away alarm had fired at exactly the threshold.
+///
+/// **This pin is statistical, and weakly so: re-applying the pre-fix trigger formulation
+/// failed it in 2 runs out of 6.** Fifteen cycles are a cheap net, not a proof. The
+/// deterministic pin for the same root cause is
+/// `a_return_that_races_the_queued_idle_alarm_still_produces_user_active` above, which the
+/// pre-fix code failed every time; this one exists because that test cannot reach the
+/// exactly-at-the-threshold arming the server loses.
+#[test]
+fn fifteen_tight_away_and_back_cycles_never_lose_the_return() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(150))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    for cycle in 0..15 {
+        wait_for_idle_or_active(&mut source, true);
+        // The user comes back the moment the daemon reports them away — no pause at all,
+        // which is exactly when the re-arm and the input race each other.
+        wm.generate_activity();
+        let started = Instant::now();
+        wait_for_idle_or_active(&mut source, false);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cycle {cycle}: the return took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// **Task 11.10 (RNF-2, idle-detection "No polling while waiting for idle or activity"): the
+/// return edge is level-triggered, and must still report exactly once.**
+///
+/// `alarm_trigger_value` arms the return edge as a `NegativeComparison`, which is true for as
+/// long as the user is active rather than only at the instant they come back. If that
+/// re-triggered while the condition held, the daemon would wake continuously for as long as
+/// somebody is typing — the exact opposite of what RF-4 exists to do, and invisible to every
+/// other test here, which stop polling as soon as they get the event they wanted. A SYNC
+/// alarm with `delta = 0` goes inactive when it triggers; this pins that it really does.
+#[test]
+fn the_return_edge_reports_once_and_then_goes_quiet() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.generate_activity();
+
+    let (mut source, _diagnostics) =
+        X11Source::connect_with_afk_threshold(Some(&xvfb.display), Duration::from_millis(300))
+            .expect("X11Source::connect_with_afk_threshold");
+
+    wait_for_idle_or_active(&mut source, true);
+    wm.generate_activity();
+    wait_for_idle_or_active(&mut source, false);
+
+    // The user keeps typing: the return condition stays true the whole time, and the away
+    // alarm cannot fire because the counter never climbs to the threshold. Nothing at all
+    // may be reported.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        wm.generate_activity();
+        if let Some(event) = source.poll_for_event().expect("poll_for_event") {
+            panic!(
+                "the return edge re-triggered while the user was still active: {event:?} — \
+                 the daemon would wake for as long as somebody keeps typing"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
