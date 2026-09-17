@@ -6,13 +6,6 @@
 //! `close_only`/`open_only` behind the `IntervalStore` trait (design §5),
 //! the RF-66 clipping query, and `prune`/`forget` (design §4 File Changes,
 //! tasks.md Phase 4).
-#![allow(
-    dead_code,
-    reason = "store.rs lands ahead of its consumers per design §8: main.rs \
-              only wires Store::open() and the IntervalStore methods in at \
-              composition time (Phase 15), and tracker.rs (Phase 5) is the \
-              first caller of transition/close_only/open_only"
-)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

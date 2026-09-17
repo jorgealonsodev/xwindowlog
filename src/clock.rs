@@ -69,15 +69,6 @@ pub fn close_at(start: WallTs, requested_end: WallTs) -> Close {
 /// Only ever called on an already-clamped pair (`close_at`'s output).
 /// `checked_sub` guards the `i64::MIN`/`i64::MAX` case; the `filter` guards a
 /// caller that bypassed `close_at`. Never negative, never a panic (T-2).
-#[allow(
-    dead_code,
-    reason = "task 6.12: no non-test consumer exists yet, unlike close_at/backdated_close \
-              which tracker.rs's production code now calls directly. duration_secs is \
-              currently exercised only by store.rs's and tracker.rs's own #[cfg(test)] \
-              modules; a real caller (e.g. cli-reporting's today/status) lands later. \
-              Narrowed to this item per tasks.md 6.12's own fallback clause rather than \
-              reinstating the module-level allow."
-)]
 pub fn duration_secs(start: WallTs, end: WallTs) -> u64 {
     end.0.checked_sub(start.0).filter(|d| *d >= 0).unwrap_or(0) as u64
 }
@@ -94,24 +85,12 @@ pub fn backdated_close(start: WallTs, now: WallTs, idle: Duration) -> Close {
 
 /// Wall time for persisted timestamps, monotonic time for durations and
 /// deadlines (design §2 D-8). The two are never substituted for one another.
-#[allow(
-    dead_code,
-    reason = "task 6.12: no non-test caller invokes now_wall/now_mono through this trait \
-              yet — main.rs (Phase 15) is what wires SystemClock through it for real; \
-              tracker.rs takes WallTs/MonoInstant values directly rather than a &dyn Clock, \
-              by design (module Purpose: no clock consulted except via given values)."
-)]
 pub trait Clock {
     fn now_wall(&self) -> WallTs;
     fn now_mono(&self) -> MonoInstant;
 }
 
 /// The real clock, backed by the OS.
-#[allow(
-    dead_code,
-    reason = "task 6.12: SystemClock is constructed for real at Phase 15's daemon \
-              composition (main.rs); no non-test consumer exists yet in Phase 6."
-)]
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
@@ -128,24 +107,12 @@ impl Clock for SystemClock {
 /// An injected, advanceable clock (design §2 D-8) — the mechanism that turns
 /// a full simulated day (P2) into a millisecond-scale test instead of a
 /// twenty-four-hour one.
-#[allow(
-    dead_code,
-    reason = "task 6.12: FakeClock exists purely as the design §2 D-8 test-injection \
-              mechanism, consumed only by store.rs's and tracker.rs's own #[cfg(test)] \
-              modules — it has no place in the shipped daemon by design, unlike \
-              SystemClock which Phase 15 wires in for real."
-)]
 #[derive(Debug)]
 pub struct FakeClock {
     wall: Cell<WallTs>,
     mono: Cell<Instant>,
 }
 
-#[allow(
-    dead_code,
-    reason = "task 6.12: see the FakeClock struct's own allow immediately above — same \
-              test-only rationale applies to its constructor and mutators."
-)]
 impl FakeClock {
     pub fn new(start: WallTs) -> Self {
         FakeClock {

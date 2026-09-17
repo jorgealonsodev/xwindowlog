@@ -28,6 +28,17 @@
 //! shape; `pipeline_integration.rs` is reserved for the full
 //! exclude→tracker→store wiring and the §14.3 ordering guarantee.
 //!
+//! P3 asserts per-`app_id` duration buckets, not only the grand total
+//! (adversarial verification finding, post-Phase-8): a telescoping total is
+//! conserved by any *interior* boundary shift, exactly like P2's own
+//! comment explains for the working-day sum, so a total-only P3 only
+//! catches a dropped interval when the drop happens to move the very first
+//! or very last boundary. The case that matters is different and more
+//! privacy-relevant: an excluded window opening no interval of its own,
+//! folding its time into the *previous visible app's* bucket — e.g.
+//! KeePassXC minutes silently recorded as Firefox minutes. Per-bucket
+//! assertions catch that misattribution; a total-only assertion does not.
+//!
 //! Task 8.4's `WindowInfo.title: String` -> `SafeTitle` swap lands between
 //! 8.0b and 8.1 in this same batch, so every window fixture in this file
 //! (moved-in P1/P2 included) goes through `safe_title()` below — the real
@@ -35,6 +46,7 @@
 //! no other way to construct a `SafeTitle` (`from_sanitized` is private to
 //! `exclude.rs`).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use xwindowlog::clock::{duration_secs, Clock, FakeClock, WallTs};
@@ -423,19 +435,26 @@ mod p3_exclusion_preserves_time {
     }
 
     /// Runs `advances` through the real `Excluder::evaluate` -> `Tracker`
-    /// boundary (§14.3's ordering) and returns the total recorded duration,
-    /// derived the same telescoping-sum way P1/P2 above do: the difference
-    /// between the first and last emitted effect boundary. A trailing
-    /// `Shutdown` closes the final open interval so it is counted too.
-    fn total_duration_secs(excluder: &Excluder, advances: &[(u16, u8)]) -> u64 {
+    /// boundary (§14.3's ordering) and returns both the total recorded
+    /// duration and a per-`app_id` duration bucket map. The total is derived
+    /// the same telescoping-sum way P1/P2 above do: the difference between
+    /// the first and last emitted effect boundary. The per-app buckets are
+    /// derived the same per-bucket way P2's own `active_secs`/`afk_secs`/...
+    /// are: `boundaries[i]`'s opened `NewInterval.app` owns the span
+    /// `[boundaries[i], boundaries[i + 1])`, for every boundary except the
+    /// final `Shutdown` close (which opens nothing). A trailing `Shutdown`
+    /// closes the final open interval so it is counted too.
+    fn run_scripted(excluder: &Excluder, advances: &[(u16, u8)]) -> (u64, HashMap<String, u64>) {
         let clock = FakeClock::new(WallTs::new(1_000_000));
         let mut tracker = Tracker::new();
         let mut boundaries: Vec<WallTs> = Vec::new();
+        let mut opened_apps: Vec<String> = Vec::new();
 
         for &(advance_secs, idx) in advances {
             clock.advance(Duration::from_secs(u64::from(advance_secs)));
             let (app_id, title) = window_for(idx);
             let evaluated = excluder.evaluate(app_id, RawTitle::new(title));
+
             let event = SourceEvent::ActiveWindow(Some(WindowInfo {
                 app_id: evaluated.app_id,
                 title: evaluated.title,
@@ -443,8 +462,9 @@ mod p3_exclusion_preserves_time {
             }));
             for effect in send(&mut tracker, event, &clock) {
                 match effect {
-                    Effect::OpenOnly { at, .. } | Effect::Transition { at, .. } => {
+                    Effect::OpenOnly { at, open } | Effect::Transition { at, open } => {
                         boundaries.push(at);
+                        opened_apps.push(open.app);
                     }
                     Effect::CloseOnly { at } => boundaries.push(at),
                     Effect::Diagnostic(_) | Effect::ArmTimer(..) | Effect::CancelTimer(_) => {}
@@ -459,9 +479,18 @@ mod p3_exclusion_preserves_time {
         }
 
         if boundaries.len() < 2 {
-            return 0;
+            return (0, HashMap::new());
         }
-        duration_secs(*boundaries.first().unwrap(), *boundaries.last().unwrap())
+
+        let total = duration_secs(*boundaries.first().unwrap(), *boundaries.last().unwrap());
+
+        let mut buckets: HashMap<String, u64> = HashMap::new();
+        for i in 0..boundaries.len() - 1 {
+            let secs = duration_secs(boundaries[i], boundaries[i + 1]);
+            *buckets.entry(opened_apps[i].clone()).or_insert(0) += secs;
+        }
+
+        (total, buckets)
     }
 
     proptest! {
@@ -472,13 +501,37 @@ mod p3_exclusion_preserves_time {
             let excluding = Excluder::from_toml_str("").expect("defaults compile");
             let not_excluding = no_exclusion_excluder();
 
-            let with_exclusion = total_duration_secs(&excluding, &advances);
-            let without_exclusion = total_duration_secs(&not_excluding, &advances);
+            let (with_exclusion_total, with_exclusion_buckets) =
+                run_scripted(&excluding, &advances);
+            let (without_exclusion_total, without_exclusion_buckets) =
+                run_scripted(&not_excluding, &advances);
 
             prop_assert_eq!(
-                with_exclusion, without_exclusion,
+                with_exclusion_total, without_exclusion_total,
                 "excluding vs not-excluding must record the same total duration D"
             );
+
+            // Per-app buckets, not only the total: `app_id` stays visible for
+            // the password-managers default rule (`hide_app = false`), so
+            // "keepassxc" is directly comparable between both runs. A bug
+            // that folds an excluded window's time into the previous app
+            // (privacy misattribution) shifts an interior boundary and is
+            // conserved by the total above, but not by these per-app sums.
+            let mut all_apps: Vec<&String> = with_exclusion_buckets
+                .keys()
+                .chain(without_exclusion_buckets.keys())
+                .collect();
+            all_apps.sort();
+            all_apps.dedup();
+            for app in all_apps {
+                let with_secs = with_exclusion_buckets.get(app).copied().unwrap_or(0);
+                let without_secs = without_exclusion_buckets.get(app).copied().unwrap_or(0);
+                prop_assert_eq!(
+                    with_secs, without_secs,
+                    "app {:?} must record the same duration excluding vs not-excluding",
+                    app
+                );
+            }
         }
     }
 }

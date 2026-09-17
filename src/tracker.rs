@@ -56,11 +56,6 @@
 //!    live in Phase 17"), so `on_event_paused` stays a no-op for every event
 //!    in this phase, matching Phase 5's original wildcard fallback rather
 //!    than inventing an unspecified transition.
-#![allow(
-    dead_code,
-    reason = "tracker.rs lands before its consumers per design §8, the same ordering constraint clock.rs already documents. Its public API (Tracker, WindowSource, SourceEvent, Effect) is exercised only by this module's own tests until the pipeline (Phase 8) and the reactor (Phase 14) wire a real WindowSource and call Tracker::on_event. Phase 6 task 6.12 removes clock.rs's identical allow once store.rs/tracker.rs consume it; tracker.rs's own allow needs the equivalent removal task once Phase 8 or Phase 14 gives it a real caller — flagged here rather than left to be rediscovered."
-)]
-
 use std::time::Duration;
 
 use crate::clock::{backdated_close, close_at, Close, MonoInstant, WallTs};

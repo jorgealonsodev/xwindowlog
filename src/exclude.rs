@@ -16,20 +16,6 @@
 //! `hide_app` substitutes the literal string `"[hidden]"`, same mechanism as the title). The
 //! `WindowInfo` swap to safe types is tasks.md 8.3/8.4's job, per Phase 6's discovery #5.
 
-// Module-level allow, not narrowed to individual items: every public item in this file is
-// exercised only by this module's own `#[cfg(test)]` suite so far, because Phase 7 (this phase)
-// deliberately does not wire `Excluder` into `main.rs`/`tracker.rs` — that wiring is Phase 8's
-// task (design §3's data-flow diagram: `x11.rs -> exclude.rs -> tracker.rs`). This mirrors
-// `clock.rs`'s own state at the end of Phase 2, before Phase 3/4/6 gave it real callers; task
-// 6.12 narrowed clock.rs's allow once real (non-test) callers existed; the same narrowing is
-// expected here once Phase 8 lands, not before.
-#![allow(
-    dead_code,
-    reason = "no non-test consumer of exclude.rs exists yet — Phase 8 wires Excluder into the \
-              pipeline (design §3), matching clock.rs's own Phase 2 state before Phase 6 gave it \
-              real callers (task 6.12's precedent for narrowing this allow once that happens)"
-)]
-
 use std::env;
 use std::fmt;
 use std::fs;
@@ -208,11 +194,11 @@ impl std::error::Error for ExcludeError {
 
 /// A denylist rule after its patterns have been compiled and validated (rust-systems skill:
 /// "validate any regex from user configuration with `Regex::new` before storing or applying it,
-/// and cache compiled expressions"). `id` is `Some` only for a built-in RF-48 default rule —
-/// that is what `disable_default_excludes` matches against; user rules from `config.toml` are
-/// never individually named or disabled.
+/// and cache compiled expressions"). RF-48's per-category `id` is matched against
+/// `disable_default_excludes` in `Excluder::from_config`, before a `CompiledRule` is ever built
+/// for a disabled category — a disabled default is filtered out of `DEFAULT_RULES` entirely
+/// rather than compiled and later ignored, so this type carries no `id` field of its own.
 struct CompiledRule {
-    id: Option<&'static str>,
     app: Option<Regex>,
     title: Option<Regex>,
     hide_app: bool,
@@ -350,7 +336,6 @@ impl Excluder {
         let mut rules = Vec::with_capacity(config.exclude.len() + DEFAULT_RULES.len());
         for rule in &config.exclude {
             rules.push(CompiledRule {
-                id: None,
                 app: compile_opt(rule.app.as_deref())?,
                 title: compile_opt(rule.title.as_deref())?,
                 hide_app: rule.hide_app,
@@ -362,7 +347,6 @@ impl Excluder {
                 continue;
             }
             rules.push(CompiledRule {
-                id: Some(id),
                 app: compile_opt(app)?,
                 title: compile_opt(title)?,
                 hide_app,
@@ -780,6 +764,59 @@ mod tests {
         );
     }
 
+    /// RF-48: `disable_default_excludes = ["password-managers"]` disables
+    /// exactly that category — a KeePassXC title stays visible — while the
+    /// other four default categories (`banking-generic`, `private-browsing`,
+    /// `gpg-ssh-prompts`, `2fa-otp`) stay active. Investigates whether
+    /// `disable_default_excludes` genuinely works end to end, since
+    /// `CompiledRule.id` (the field RF-48 is documented to match against) is
+    /// never read anywhere in this module's evaluation path.
+    #[test]
+    fn disable_default_excludes_disables_only_the_named_category() {
+        let excluder = Excluder::from_toml_str(
+            r#"
+            disable_default_excludes = ["password-managers"]
+            "#,
+        )
+        .expect("valid config compiles");
+
+        let keepassxc = excluder.evaluate("keepassxc", RawTitle::new("KeePassXC - vault.kdbx"));
+        assert_eq!(keepassxc.app_id, "keepassxc");
+        assert_eq!(
+            keepassxc.title,
+            SafeTitle::from_sanitized("KeePassXC - vault.kdbx".to_string()),
+            "password-managers is disabled, so keepassxc must stay visible"
+        );
+
+        let banking = excluder.evaluate("firefox", RawTitle::new("Revolut - Account Overview"));
+        assert_eq!(
+            banking.title,
+            SafeTitle::from_sanitized("[hidden]".to_string()),
+            "banking-generic must stay active"
+        );
+
+        let private_browsing = excluder.evaluate("firefox", RawTitle::new("New Incognito Tab"));
+        assert_eq!(
+            private_browsing.title,
+            SafeTitle::from_sanitized("[hidden]".to_string()),
+            "private-browsing must stay active"
+        );
+
+        let gpg_ssh = excluder.evaluate("pinentry-gtk-2", RawTitle::new("Enter passphrase"));
+        assert_eq!(
+            gpg_ssh.title,
+            SafeTitle::from_sanitized("[hidden]".to_string()),
+            "gpg-ssh-prompts must stay active"
+        );
+
+        let two_fa = excluder.evaluate("authy", RawTitle::new("Authy"));
+        assert_eq!(
+            two_fa.title,
+            SafeTitle::from_sanitized("[hidden]".to_string()),
+            "2fa-otp must stay active"
+        );
+    }
+
     /// RF-48 scenario "A default rule is individually disabled".
     #[test]
     fn a_default_rule_is_individually_disabled() {
@@ -1032,6 +1069,76 @@ mod tests {
     #[test]
     fn safe_title_empty_is_the_empty_string() {
         assert_eq!(SafeTitle::empty().as_str(), "");
+    }
+
+    /// RF-7/§14.3's invariant is "SafeTitle has exactly one construction path
+    /// carrying caller-supplied content" — not merely "the name
+    /// `from_sanitized` is unreachable outside this module". The compile-fail
+    /// fixture in `tests/trybuild/fail/no_safetitle_bypass.rs` guards the
+    /// latter; it does not guard the former. `SafeTitle::empty()` above is
+    /// benign only because it is nullary — a future `pub fn
+    /// from_stored(s: String) -> Self` would land with every existing test
+    /// green. Symmetric to this module's own `impl Display for RawTitle`
+    /// source-grep guard (task 7.16's doc comment at the top of this file):
+    /// this test greps this file's own `impl SafeTitle` block and fails if
+    /// any `pub fn` there takes a `String`, `&str`, or `impl Into<String>`
+    /// parameter.
+    #[test]
+    fn no_public_safetitle_constructor_takes_string_content() {
+        let source = include_str!("exclude.rs");
+
+        let block_start = source
+            .find("impl SafeTitle {")
+            .expect("this file defines impl SafeTitle");
+        let block = &source[block_start..];
+        let brace_start = block
+            .find('{')
+            .expect("impl SafeTitle has an opening brace");
+
+        // Matches the opening brace found above against its closing brace by
+        // tracking depth over the raw text — adequate here since the block
+        // contains no string/char literals with unbalanced braces.
+        let mut depth = 0i32;
+        let mut block_end = None;
+        for (i, c) in block[brace_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = Some(brace_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block_end = block_end.expect("impl SafeTitle has a matching closing brace");
+        let block = &block[..=block_end];
+
+        let mut search_from = 0;
+        while let Some(offset) = block[search_from..].find("pub fn ") {
+            let sig_start = search_from + offset;
+            let sig = &block[sig_start..];
+            let paren_open = sig.find('(').expect("a pub fn has a parameter list");
+            let paren_close = paren_open
+                + sig[paren_open..]
+                    .find(')')
+                    .expect("a pub fn's parameter list closes");
+            let params = &sig[paren_open + 1..paren_close];
+
+            assert!(
+                !params.contains("String") && !params.contains("&str"),
+                "a public SafeTitle constructor takes caller-supplied string content \
+                 ({:?}) — only Excluder::evaluate (via the private from_sanitized) may \
+                 mint a SafeTitle from arbitrary content; add a separately-named \
+                 constructor with a comment justifying the trust instead of widening \
+                 this one",
+                &sig[..paren_close + 1]
+            );
+
+            search_from = sig_start + "pub fn ".len();
+        }
     }
 
     // ---- RF-9: config reload on SIGHUP (unit-level hot-swap; full E2E is task 15.7) ----
