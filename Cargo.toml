@@ -1,0 +1,66 @@
+[package]
+name = "xwindowlog"
+version = "0.1.0"
+edition = "2021"
+# MSRV pinned to the toolchain actually verified in this environment (RNF-11).
+# The stable+beta CI matrix (Phase 19/20, design.md §4 .github/workflows/ci.yml)
+# is the mechanism that keeps this honest across other toolchains.
+rust-version = "1.98"
+description = "Lightweight X11 active-window logger in Rust. Ask your AI what you worked on today via MCP."
+license = "MIT"
+
+[[bin]]
+name = "xwindowlog"
+path = "src/main.rs"
+
+[profile.release]
+# PRD.md §3: release profile for a shipped binary.
+lto = true
+codegen-units = 1
+strip = true
+# proposal A-1 / design.md §4: `panic = "unwind"`, not "abort" — the daemon
+# is long-lived and a single unhandled panic must not kill an unrelated
+# in-flight request path (see rust-systems skill, Cargo hygiene).
+panic = "unwind"
+
+[dependencies]
+# X11 capture (design.md §4 src/x11.rs, assumptions A-1/A-2/A-7 in §12).
+x11rb = { version = "0.13", features = ["screensaver", "sync"] }
+
+# D-Bus / logind, bridged not polled (design.md D-3). Default features only —
+# no feature gate removes the TCP transport (V-13), which is why RNF-5 is
+# verified behaviourally (/proc/self/fd) rather than by dependency shape.
+zbus = "5"
+
+# Interval storage (design.md §4 src/store.rs, D-1, D-10, D-11).
+rusqlite = { version = "0.32", features = ["bundled", "functions", "backup"] }
+
+# Reactor primitives: poll(2), PollFd, PollTimeout (design.md D-2, verified
+# V-1..V-5 in §12), SO_PEERCRED (V-5), umask/flock (RF-10, RF-34).
+nix = { version = "0.30", features = ["poll", "socket", "fs", "signal"] }
+
+# Signal self-pipe + flags (design.md D-4, assumption A-3).
+signal-hook = "0.3"
+
+# CLI surface (PRD.md §13 main.rs subcommands).
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
+# Config and wire protocol (design.md §5 control.rs Request/Response/Envelope;
+# contrib/config.example.toml).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Exclusion rule matching (src/exclude.rs).
+regex = "1"
+
+# WallTs / MonoInstant (design.md D-3->clock.rs, rust-systems skill: separate
+# wall time from monotonic time in the type system).
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+# Explicitly NOT a Phase 1 dependency (proposal *In Scope*, design.md §4):
+# no `rmcp`, no `tokio`. Both arrive with the MCP subprocess in a later phase.
+
+[dev-dependencies]

@@ -82,7 +82,7 @@ task boundaries already drawn, rather than compress.
 
 ## Phase 1: Crate Bootstrap (TDD-exempt — creates the runner)
 
-- [ ] 1.1 Create `Cargo.toml`: edition 2021, `panic = "unwind"` (proposal A-1),
+- [x] 1.1 Create `Cargo.toml`: edition 2021, `panic = "unwind"` (proposal A-1),
       explicit MSRV pin (RNF-11), release profile. Phase 1 dependencies only —
       `x11rb` (`screensaver`, `sync` features), `zbus` (default features, see
       design §2 D-3), `rusqlite` (`bundled`, `functions`, `backup`), `nix`
@@ -90,23 +90,23 @@ task boundaries already drawn, rather than compress.
       `clap_complete` + `clap_mangen`, `serde` + `serde_json` + `toml`,
       `regex`, `time`. Explicitly **no `rmcp`, no `tokio`** (proposal *In
       Scope*).
-- [ ] 1.2 Create module skeletons: `src/main.rs`, `src/reactor.rs`,
+- [x] 1.2 Create module skeletons: `src/main.rs`, `src/reactor.rs`,
       `src/clock.rs`, `src/x11.rs`, `src/logind.rs`, `src/control.rs`,
       `src/signals.rs`, `src/tracker.rs`, `src/exclude.rs`, `src/store.rs`,
       each with a one-line purpose comment (design §4 File Changes) and an
       empty `#[cfg(test)] mod tests {}`.
-- [ ] 1.3 **Acceptance check:** `cargo test` runs successfully against the
+- [x] 1.3 **Acceptance check:** `cargo test` runs successfully against the
       empty skeleton with zero failures. This is what makes every later RED
       test in this document observable — nothing proceeds until this passes.
-- [ ] 1.4 **Acceptance check (E-1):** a C toolchain (`cc`) is present and
+- [x] 1.4 **Acceptance check (E-1):** a C toolchain (`cc`) is present and
       `rusqlite`'s `bundled` feature links; `cargo build` succeeds. Fail
       loudly here, not at Phase 4 packaging.
-- [ ] 1.5 **Acceptance check (E-2, D-10 layer 2, assumption A-5):** write
+- [x] 1.5 **Acceptance check (E-2, D-10 layer 2, assumption A-5):** write
       `tests/sqlite_version.rs` asserting
       `rusqlite::version_number() >= 3_031_000`. This is diagnosable-in-10-
       seconds scaffolding; the load-bearing behavioral proof is D-10 layer 1
       in Phase 3 (task 3.1).
-- [ ] 1.6 **Acceptance check (assumption A-1, DR-1, proposal's single
+- [x] 1.6 **Acceptance check (assumption A-1, DR-1, proposal's single
       load-bearing unverified claim):** a throwaway five-line program proves
       `x11rb`'s connection type exposes a pollable fd (`AsRawFd`/`AsFd` or a
       `stream()` accessor over one), and that the fd is genuinely poll-able.
@@ -114,16 +114,16 @@ task boundaries already drawn, rather than compress.
       and apply the D-3-pattern bridge-thread-plus-`eventfd` fallback (the
       same pattern already used for `logind.rs`) instead — record the
       decision and continue; do not discover this mid-`x11.rs`.
-- [ ] 1.7 **Acceptance check (assumption A-2):** the same throwaway program
+- [x] 1.7 **Acceptance check (assumption A-2):** the same throwaway program
       proves `x11rb` offers a non-blocking event drain
       (`poll_for_event() -> Option<Event>`, distinct from a blocking
       `wait_for_event`), which D-6's drain-before-poll invariant needs. Same
       stop-and-fallback rule as 1.6 if false.
-- [ ] 1.8 **Acceptance check (assumption A-3):** a compile-only check that
+- [x] 1.8 **Acceptance check (assumption A-3):** a compile-only check that
       `signal_hook::flag::register(sig, Arc<AtomicBool>)` and
       `signal_hook::low_level::pipe::register(sig, writer)` exist with the
       shapes design §2 D-4 assumes.
-- [ ] 1.9 REFACTOR: run `cargo fmt` and `cargo clippy` on the skeleton and
+- [x] 1.9 REFACTOR: run `cargo fmt` and `cargo clippy` on the skeleton and
       confirm both are clean, establishing the baseline every later task is
       diffed against.
 
