@@ -26,6 +26,7 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use xwindowlog::exclude::Excluder;
 use xwindowlog::x11::{CaptureMode, RawEvent, X11Source};
 
 /// Guarantees unique, non-colliding display numbers across concurrently running tests in
@@ -114,6 +115,7 @@ struct FakeWm {
     net_active_window: u32,
     net_wm_name: u32,
     net_wm_pid: u32,
+    wm_name: u32,
     wm_class: u32,
     utf8_string: u32,
 }
@@ -127,6 +129,7 @@ impl FakeWm {
         let net_active_window = intern(&conn, b"_NET_ACTIVE_WINDOW");
         let net_wm_name = intern(&conn, b"_NET_WM_NAME");
         let net_wm_pid = intern(&conn, b"_NET_WM_PID");
+        let wm_name = intern(&conn, b"WM_NAME");
         let wm_class = intern(&conn, b"WM_CLASS");
         let utf8_string = intern(&conn, b"UTF8_STRING");
         FakeWm {
@@ -137,9 +140,42 @@ impl FakeWm {
             net_active_window,
             net_wm_name,
             net_wm_pid,
+            wm_name,
             wm_class,
             utf8_string,
         }
+    }
+
+    /// Destroys `window` outright — task 10.1/10.2's RF-22 race: the active window can be
+    /// destroyed between the daemon's `GetProperty(_NET_ACTIVE_WINDOW)` and its own
+    /// `ChangeWindowAttributes(...).check()`/metadata read on that same window.
+    fn destroy(&self, window: Window) {
+        self.conn
+            .destroy_window(window)
+            .expect("destroy_window request")
+            .check()
+            .expect("destroy_window reply");
+        self.conn.flush().expect("flush");
+    }
+
+    /// Sets the **legacy** `WM_NAME` property with the X11 core protocol's `STRING` type
+    /// directly — never touching `_NET_WM_NAME`/`UTF8_STRING` — so a test can prove RF-31's
+    /// atom-type-aware decoding rather than always assuming UTF-8 (task 10.9/10.10).
+    /// `latin1_bytes` is written verbatim: the caller supplies the raw bytes a Latin-1-typed
+    /// `STRING` property would actually carry, not text `x11rb` reinterprets.
+    fn set_legacy_wm_name(&self, window: Window, latin1_bytes: &[u8]) {
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                window,
+                self.wm_name,
+                AtomEnum::STRING,
+                latin1_bytes,
+            )
+            .expect("set WM_NAME request")
+            .check()
+            .expect("set WM_NAME reply");
+        self.conn.flush().expect("flush");
     }
 
     /// The acts a real EWMH window manager performs at startup, which is what RF-24's
@@ -674,8 +710,8 @@ fn ewmh_unconditional_read_never_reuses_cached_metadata() {
     let first = source
         .on_active_window_changed()
         .expect("on_active_window_changed");
-    let RawEvent::ActiveWindow(Some(first_info)) = first else {
-        panic!("expected ActiveWindow(Some(..)) on first read")
+    let Some(RawEvent::ActiveWindow(Some(first_info))) = first else {
+        panic!("expected ActiveWindow(Some(..)) on first read, got {first:?}")
     };
     // `RawTitle` deliberately has no public raw-content accessor outside `exclude.rs` (D-7's
     // privacy boundary) — its redacting `Debug` (char count only) is the one thing this test,
@@ -703,6 +739,49 @@ fn ewmh_unconditional_read_never_reuses_cached_metadata() {
         format!("{:?}", second_info.title),
         "second read must reflect the updated title, not a cached value"
     );
+}
+
+/// window-capture "Title changes between the property read and the event mask being active"
+/// (task 10.3/10.4, RF-22): a title change that lands on a window while it is becoming the
+/// active window — before the daemon's subscription to *that* window's own events is even
+/// registered, so no `PropertyNotify` for the change could ever be delivered to it — must
+/// still be reflected. It is, because task 9.7's unconditional read runs *after* the
+/// subscribe completes and reads current server state, never relying on a notify for the
+/// value that raced it.
+#[test]
+fn title_racing_the_subscribe_is_still_reflected_by_the_unconditional_read() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_title(w, "before-subscribe");
+    wm.set_active_window(w);
+    // The race: this title change happens before the daemon has ever subscribed to `w`'s own
+    // events (that only starts once it processes the active-window change above), so no
+    // `PropertyNotify` for it is lost — there was never a subscription to lose one from.
+    wm.set_title(w, "after-subscribe");
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    // `_NET_ACTIVE_WINDOW` was already set to `w` before `connect`'s subscription began, so
+    // no `PropertyNotify` will ever fire for it — an explicit initial read is the real
+    // startup path, exactly as in `ewmh_unconditional_read_never_reuses_cached_metadata`.
+    let event = source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+
+    match event {
+        Some(RawEvent::ActiveWindow(Some(info))) => assert_eq!(
+            format!("{:?}", info.title),
+            format!(
+                "RawTitle(<{} chars, redacted>)",
+                "after-subscribe".chars().count()
+            ),
+            "the unconditional read must reflect the racing title, not the one that predates it"
+        ),
+        other => panic!("expected ActiveWindow(Some(..)) for w, got {other:?}"),
+    }
 }
 
 /// **CRITICAL-2 anti-regression (RF-24's degraded path).** On a display whose window manager
@@ -895,6 +974,349 @@ fn title_read_is_bounded_rather_than_unlimited() {
     );
 }
 
+/// window-capture "Active window is destroyed before its event mask is set" (task 10.1/10.2,
+/// RF-22, subscribe half): `_NET_ACTIVE_WINDOW` names a window that is destroyed before the
+/// daemon's `ChangeWindowAttributes(...).check()` on it — deterministically simulated here by
+/// destroying the window *before* the daemon ever attempts to subscribe to it, so the check
+/// always observes `BadWindow`. This must be a valid transition, not a daemon failure: no
+/// error, no event, and the daemon keeps waiting for the next real change.
+#[test]
+fn active_window_destroyed_before_subscribe_is_a_valid_transition_not_an_error() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let dead = wm.create_window();
+    wm.set_active_window(dead);
+    wm.destroy(dead);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+
+    let event = source
+        .on_active_window_changed()
+        .expect("BadWindow on the subscribe half must not surface as an error");
+    assert!(
+        event.is_none(),
+        "a destroyed active window must produce no event, got {event:?}"
+    );
+
+    // RF-22: the daemon must keep waiting for the next real change, not get stuck.
+    let alive = wm.create_window();
+    wm.set_wm_class(alive, "app", "App");
+    wm.set_active_window(alive);
+    match wait_for_raw_event(&mut source) {
+        RawEvent::ActiveWindow(Some(info)) => assert_eq!(info.app_id, "App"),
+        other => panic!("expected the daemon to observe the next real change, got {other:?}"),
+    }
+}
+
+/// window-capture "Active window is destroyed before its event mask is set" (task 10.1/10.2,
+/// RF-22, the `GetProperty` half Phase 9's verification additionally found): the subscribe
+/// succeeds because the window still exists, but the window is destroyed before the following
+/// unconditional metadata read. Deterministically forced by re-triggering the same still-
+/// current window after destroying it out from under the daemon: `retarget_subscription`
+/// short-circuits (the window is already the one subscribed), so only the `GetProperty` half
+/// runs and hits `BadWindow`.
+#[test]
+fn active_window_destroyed_before_metadata_read_is_a_valid_transition_not_an_error() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_active_window(w);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let first = source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+    assert!(
+        matches!(first, Some(RawEvent::ActiveWindow(Some(_)))),
+        "expected a normal ActiveWindow event while w is alive, got {first:?}"
+    );
+
+    wm.destroy(w);
+
+    // `_NET_ACTIVE_WINDOW` still names `w` (destroying a window does not touch the root
+    // property), so this re-read exercises the metadata `GetProperty` on an already-dead,
+    // already-subscribed window.
+    let second = source
+        .on_active_window_changed()
+        .expect("BadWindow on the GetProperty half must not surface as an error");
+    assert!(
+        second.is_none(),
+        "a metadata read racing window destruction must produce no event, got {second:?}"
+    );
+}
+
+/// window-capture "Destruction safety net" (task 10.5/10.6, RF-23): `DestroyNotify` for the
+/// currently tracked active window surfaces as `RawEvent::ActiveWindowDestroyed` — the raw
+/// surfacing half; the 250 ms grace-period state machine itself was already proven in
+/// `tracker.rs` (Phase 6, tasks 6.6-6.7). This module's only job is to notice and translate.
+#[test]
+fn destroy_notify_on_the_tracked_window_surfaces_as_active_window_destroyed() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_active_window(w);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    // Establishes the subscription on `w` (pre-existing state, no notify for it — see the
+    // other tests' identical initial-read pattern).
+    source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+
+    wm.destroy(w);
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::ActiveWindowDestroyed => {}
+        other => panic!("expected ActiveWindowDestroyed, got {other:?}"),
+    }
+}
+
+/// A `DestroyNotify` for a window that is **not** the currently tracked active window (for
+/// example, a window that was active earlier and has since been retargeted away from) must be
+/// drained like any other event this module does not translate, never surfaced.
+#[test]
+fn destroy_notify_on_an_untracked_window_is_drained_not_surfaced() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w1 = wm.create_window();
+    wm.set_wm_class(w1, "app1", "App1");
+    wm.set_active_window(w1);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+
+    let w2 = wm.create_window();
+    wm.set_wm_class(w2, "app2", "App2");
+    wm.set_active_window(w2);
+    match wait_for_raw_event(&mut source) {
+        RawEvent::ActiveWindow(Some(info)) => assert_eq!(info.app_id, "App2"),
+        other => panic!("expected ActiveWindow(Some(..)) for w2, got {other:?}"),
+    }
+
+    let baseline = source.drained_untranslated();
+    // w1 is no longer subscribed at all (`unsubscribe_window` cleared its event mask when
+    // w2 took over), so its destruction generates no event whatsoever on this connection —
+    // not even one to drain. The real assertion is simply that it never surfaces as
+    // `ActiveWindowDestroyed`.
+    wm.destroy(w1);
+    let _ = source.read_window_info(w2).expect("round trip");
+    assert!(source.poll_for_event().expect("poll_for_event").is_none());
+    assert_eq!(
+        source.drained_untranslated(),
+        baseline,
+        "an untracked window's destruction must produce nothing to drain, since it was already unsubscribed"
+    );
+}
+
+/// window-capture "Title debounce" (task 10.7/10.8, RF-30 — the surfacing half only): a title
+/// change on the tracked window surfaces as `RawEvent::TitleChanged` with no delay of its
+/// own, proving the debounce state machine is exclusively `tracker.rs`'s concern (design §2
+/// D-8) and this module merely notices and reports.
+#[test]
+fn title_change_on_the_tracked_window_surfaces_undebounced() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_title(w, "before");
+    wm.set_active_window(w);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+
+    wm.set_title(w, "after");
+
+    let started = Instant::now();
+    let event = wait_for_raw_event(&mut source);
+    let elapsed = started.elapsed();
+
+    match event {
+        RawEvent::TitleChanged(title) => assert_eq!(
+            format!("{title:?}"),
+            format!("RawTitle(<{} chars, redacted>)", "after".chars().count())
+        ),
+        other => panic!("expected TitleChanged, got {other:?}"),
+    }
+    // The default debounce is 2000 ms (RF-30); surfacing well under that proves this module
+    // does not itself wait for stability — the tracker's debounce state machine does that.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "x11.rs must not itself debounce title changes; took {elapsed:?}"
+    );
+}
+
+/// A title change on a window that is **not** the tracked active window must not surface at
+/// all — only the currently active window's title is this module's concern.
+#[test]
+fn title_change_on_an_untracked_window_is_drained_not_surfaced() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w1 = wm.create_window();
+    wm.set_wm_class(w1, "app1", "App1");
+    wm.set_title(w1, "w1 title");
+    wm.set_active_window(w1);
+
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+
+    let w2 = wm.create_window();
+    wm.set_wm_class(w2, "app2", "App2");
+    wm.set_active_window(w2);
+    match wait_for_raw_event(&mut source) {
+        RawEvent::ActiveWindow(Some(info)) => assert_eq!(info.app_id, "App2"),
+        other => panic!("expected ActiveWindow(Some(..)) for w2, got {other:?}"),
+    }
+
+    // w1 is retargeted away (unsubscribed) — its title churn must produce no event at all.
+    wm.set_title(w1, "w1 title changed after losing focus");
+    let _ = source.read_window_info(w2).expect("round trip");
+    assert!(source.poll_for_event().expect("poll_for_event").is_none());
+}
+
+/// window-capture "Title exceeds the maximum length" (task 10.9/10.10, RF-31): a 600-character
+/// title truncates to exactly 512 characters, the last of which is the trailing ellipsis.
+#[test]
+fn title_over_512_characters_truncates_with_a_trailing_ellipsis() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_title(w, &"x".repeat(600));
+    wm.set_active_window(w);
+
+    let (source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let info = source.read_window_info(w).expect("read_window_info");
+
+    assert_eq!(
+        format!("{:?}", info.title),
+        "RawTitle(<512 chars, redacted>)",
+        "600 characters must truncate to exactly 512, ellipsis included"
+    );
+}
+
+/// A title at or under the 512-character limit must be left untouched — no ellipsis added.
+#[test]
+fn title_at_512_characters_is_not_truncated() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    wm.set_title(w, &"x".repeat(512));
+    wm.set_active_window(w);
+
+    let (source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let info = source.read_window_info(w).expect("read_window_info");
+
+    assert_eq!(
+        format!("{:?}", info.title),
+        "RawTitle(<512 chars, redacted>)"
+    );
+}
+
+/// **RF-31 atom-type-aware decoding.** `WM_NAME` typed `STRING` (the X11 core/ICCCM legacy
+/// type, Latin-1) must be decoded as Latin-1, not assumed to be UTF-8. Bytes `[0xC3, 0xA9]`
+/// are a deliberately adversarial pair: interpreted as UTF-8 they form one perfectly valid
+/// character ('é', U+00E9) with no decode error at all — silently wrong, not merely garbled —
+/// while the correct Latin-1 reading is **two** separate characters (U+00C3 'Ã', U+00A9 '©').
+/// The two readings are distinguishable purely by character count, which is all `RawTitle`'s
+/// redacting `Debug` exposes outside `exclude.rs` (D-7).
+#[test]
+fn legacy_wm_name_typed_string_decodes_as_latin1_not_utf8() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let w = wm.create_window();
+    wm.set_wm_class(w, "app", "App");
+    // No `_NET_WM_NAME` is ever set — only the legacy `WM_NAME`/`STRING` path is exercised.
+    wm.set_legacy_wm_name(w, &[0xC3, 0xA9]);
+    wm.set_active_window(w);
+
+    let (source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let info = source.read_window_info(w).expect("read_window_info");
+
+    assert_eq!(
+        format!("{:?}", info.title),
+        "RawTitle(<2 chars, redacted>)",
+        "STRING must decode as Latin-1 (2 code points), not UTF-8 (which reads 1)"
+    );
+}
+
+/// window-capture "WM_CLASS absent, PID present" (task 10.9-10.12, RF-31): no `WM_CLASS`, but
+/// `_NET_WM_PID` names a real, live process — `app_id` falls back to `/proc/<pid>/comm`. Uses
+/// a real spawned child so the pid and its `comm` are both genuine, not fabricated.
+#[test]
+fn wm_class_absent_pid_present_reads_proc_comm() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a short-lived child process");
+    let w = wm.create_window();
+    wm.set_title(w, "no wm_class here");
+    wm.set_pid(w, child.id());
+    wm.set_active_window(w);
+
+    let (source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let info = source.read_window_info(w).expect("read_window_info");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(info.app_id, "sleep");
+}
+
+/// window-capture "WM_CLASS and PID both absent, or comm read fails" (task 10.9-10.12,
+/// RF-31): no `WM_CLASS` and an already-exited pid (so `/proc/<pid>/comm` cannot be read)
+/// falls back to the `"?"` sentinel — capture continues, no error.
+#[test]
+fn wm_class_absent_pid_exited_falls_back_to_sentinel() {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let mut child = Command::new("true").spawn().expect("spawn a child process");
+    let dead_pid = child.id();
+    let _ = child.wait(); // reaped: /proc/<dead_pid>/comm is now gone.
+
+    let w = wm.create_window();
+    wm.set_title(w, "no wm_class here either");
+    wm.set_pid(w, dead_pid);
+    wm.set_active_window(w);
+
+    let (source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    let info = source.read_window_info(w).expect("read_window_info");
+
+    assert_eq!(info.app_id, "?");
+}
+
 /// Polls (bounded) until an event arrives and translates it — mirrors what the reactor
 /// (Phase 14) will eventually drive via `poll(2)`; here it is a short bounded loop since this
 /// test has no separate reactor thread of its own.
@@ -910,4 +1332,120 @@ fn wait_for_raw_event(source: &mut X11Source) -> RawEvent {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// One EWMH window, active and already subscribed on a throwaway Xvfb: the setup all four
+/// Phase 10 correction scenarios below share. Pre-existing state produces no notify, so the
+/// explicit `on_active_window_changed` is what establishes the subscription — the same
+/// initial-read pattern the tests above use. The guard is returned, not dropped: dropping it
+/// tears the display down.
+fn tracked_window(title: &str) -> (XvfbGuard, FakeWm, Window, X11Source) {
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(&xvfb.display);
+    wm.declare_ewmh_supported();
+    let window = wm.create_window();
+    wm.set_wm_class(window, "app", "App");
+    wm.set_title(window, title);
+    wm.set_active_window(window);
+    let (mut source, _diagnostics) =
+        X11Source::connect(Some(&xvfb.display)).expect("X11Source::connect");
+    source
+        .on_active_window_changed()
+        .expect("on_active_window_changed");
+    (xvfb, wm, window, source)
+}
+
+/// **CRITICAL-1 anti-regression** (task 10.14). `ewmh_poll_drains_past_an_untranslated_event_in_one_call`
+/// covers only the *untranslated* exit; this pins the `Ok(None)` valid-transition exit, whose
+/// lost-wakeup consequence `poll_for_event`'s own comment explains.
+#[test]
+fn poll_continues_draining_past_a_valid_transition_that_produced_no_event() {
+    let (_xvfb, wm, tracked, mut source) = tracked_window("before");
+
+    // Queued first: an active-window change naming an already-destroyed window — RF-22's valid
+    // transition, which yields no event. Queued second: a real title change on the tracked
+    // window. The `read_window_info` round trip forces both into `x11rb`'s in-process queue
+    // before the single `poll_for_event` below.
+    let dead = wm.create_window();
+    wm.set_active_window(dead);
+    wm.destroy(dead);
+    wm.set_title(tracked, "after");
+    let _ = source.read_window_info(tracked).expect("round trip");
+
+    let event = source
+        .poll_for_event()
+        .expect("poll_for_event")
+        .expect("one call must drain past the valid transition and surface the queued change");
+    assert!(
+        matches!(event, RawEvent::TitleChanged(_)),
+        "expected the title change queued behind the dead window, got {event:?}"
+    );
+}
+
+/// **CRITICAL-2 anti-regression** (task 10.15): a retarget that fails must leave the tracked
+/// window still subscribed and still named by `active_window`. `retarget_subscription`'s doc
+/// explains why subscribing before releasing is the property that guarantees it.
+#[test]
+fn a_retarget_that_fails_leaves_the_tracked_window_subscribed() {
+    let (_xvfb, wm, tracked, mut source) = tracked_window("before");
+
+    // The race: `_NET_ACTIVE_WINDOW` names a window destroyed before the subscribe reaches the
+    // server, so the retarget fails and the tracked window must stay tracked.
+    let dead = wm.create_window();
+    wm.set_active_window(dead);
+    wm.destroy(dead);
+    let _ = source.read_window_info(tracked).expect("round trip");
+    assert!(
+        source.poll_for_event().expect("poll_for_event").is_none(),
+        "a destroyed active window must produce no event"
+    );
+
+    // Still tracked, so its title change must still reach the daemon — this is the assertion
+    // that fails if the subscription was released and never retaken.
+    wm.set_title(tracked, "after");
+    match wait_for_raw_event(&mut source) {
+        RawEvent::TitleChanged(_) => {}
+        other => panic!("expected TitleChanged for the still-tracked window, got {other:?}"),
+    }
+}
+
+/// **CRITICAL-3 anti-regression** (task 10.16): the title read inside the drain loop is RF-22's
+/// third `BadWindow` surface. See `poll_for_event` for why propagating it would read as
+/// connection loss to the reactor (RF-6, RF-32).
+#[test]
+fn a_title_read_racing_window_destruction_is_tolerated_not_an_error() {
+    let (_xvfb, wm, tracked, mut source) = tracked_window("before");
+
+    // X11 delivers these in the order the server processed them, so the title `PropertyNotify`
+    // is queued ahead of the `DestroyNotify` — and by the time the daemon reads the title, the
+    // window is already gone.
+    wm.set_title(tracked, "after");
+    wm.destroy(tracked);
+
+    match wait_for_raw_event(&mut source) {
+        RawEvent::ActiveWindowDestroyed => {}
+        other => panic!("expected ActiveWindowDestroyed, got {other:?}"),
+    }
+}
+
+/// **WARNING-1 anti-regression** (task 10.17). Unlike `truncate_with_ellipsis`'s unit test,
+/// which passes the flag by hand, this proves the real X11 path actually *sets* it: that a
+/// title the 2048-byte read bound capped arrives with `bytes_after > 0` and so keeps its
+/// ellipsis. `truncate_with_ellipsis`'s doc explains why the character count cannot see it.
+#[test]
+fn a_title_capped_by_the_read_bound_still_carries_the_ellipsis() {
+    // U+1D11E encodes as four UTF-8 bytes, so 600 of them are 2400 bytes and the 2048-byte
+    // read bound returns exactly 512 whole codepoints — precisely `MAX_TITLE_CHARS`.
+    let (_xvfb, _wm, tracked, source) = tracked_window(&"\u{1D11E}".repeat(600));
+    let info = source.read_window_info(tracked).expect("read_window_info");
+
+    // D-7: the only sanctioned way to read a captured title outside `exclude.rs` is to put it
+    // through `Excluder::evaluate`, which is exactly what the reactor does in production.
+    let excluder = Excluder::from_toml_str("").expect("an empty config compiles");
+    let evaluated = excluder.evaluate("App", info.title);
+    assert_eq!(evaluated.title.as_str().chars().count(), 512);
+    assert!(
+        evaluated.title.as_str().ends_with('…'),
+        "a title the read bound truncated must be marked as truncated"
+    );
 }

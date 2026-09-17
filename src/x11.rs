@@ -3,11 +3,26 @@
 //! by atom type + 512-char truncation + `/proc/<pid>/comm` fallback (RF-31); reconnect backoff (RF-32).
 //! Emits `RawTitle`.
 //!
-//! **Phase 9 scope (this slice, 1 of 3).** Connection + EWMH verification/fallback (RF-24),
+//! **Phase 9 scope (slice 1 of 3).** Connection + EWMH verification/fallback (RF-24),
 //! `_NET_ACTIVE_WINDOW` subscription (RF-1), the unconditional post-change property read (RF-1,
-//! RF-2), and the XWayland startup warning (RF-29). Phase 10 adds the BadWindow race handling
-//! (RF-22), `DestroyNotify` surfacing (RF-23), and full RF-31 decoding (atom-type dispatch,
-//! 512-char truncation, `/proc/<pid>/comm` fallback).
+//! RF-2), and the XWayland startup warning (RF-29).
+//!
+//! **Phase 10 scope (slice 2 of 3, tasks 10.1-10.13).** RF-22's `BadWindow` race, tolerated at
+//! all three points it can occur — `retarget_subscription`'s `ChangeWindowAttributes(...)
+//! .check()`, the metadata `GetProperty` that follows it in `apply_active_window`, and the
+//! `read_title` a queued title `PropertyNotify` triggers in `poll_for_event` — as a valid
+//! transition, never a propagated error. `DestroyNotify` for the tracked
+//! window surfaces as `RawEvent::ActiveWindowDestroyed` (RF-23's raw half; the 250 ms grace
+//! timer and `unknown`-state transition are `tracker.rs`'s, Phase 6). `PropertyNotify` for a
+//! title change on the tracked window surfaces as `RawEvent::TitleChanged`, undebounced
+//! (RF-30's raw half; the debounce state machine is exclusively `tracker.rs`'s). `read_title`
+//! decodes by the reply's actual atom type — `UTF8_STRING` as UTF-8, anything else (`STRING`
+//! included) as Latin-1 — then truncates to 512 characters with a trailing ellipsis
+//! (`decode_property_text`, `truncate_with_ellipsis`). `read_app_id` gains the
+//! `WM_CLASS` → `/proc/<pid>/comm` → `"?"` fallback chain (`read_process_comm`,
+//! `sanitize_comm`), best-effort throughout: a nonexistent, exited, or recycled pid, a `comm`
+//! containing control characters, or invalid UTF-8 in `comm` all fall through to the sentinel,
+//! never an error (RF-31, design §7's "Process integration — subprocess inputs" row).
 //!
 //! **Corrections applied 2026-09-17 (tasks 9.14-9.23), after an adversarial verification
 //! pass.** RF-24's verification no longer asks the X server whether two atom *names* exist —
@@ -20,6 +35,9 @@
 //! translate, which was silently losing wakeups. `WM_CLASS` is sanitized at the point of
 //! capture, property reads are length-bounded, and the tracked-window subscription moves
 //! rather than accumulating.
+//!
+//! **Corrections applied 2026-09-17 (tasks 10.14-10.18), after a second adversarial pass.**
+//! Four defects Phase 10 was green over; each is explained at the site it corrects.
 //!
 //! **Module boundary (task 9.13, design §1 layering).** `tracker.rs` never names an `x11rb`
 //! type and this module never names a `tracker` type. What crosses out of this module is
@@ -54,9 +72,13 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::exclude::RawTitle;
 
-/// `WM_CLASS`/`_NET_WM_PID` both absent (RF-31's sentinel) — this slice's plain fallback; the
-/// `/proc/<pid>/comm` intermediate step is Phase 10 (task 10.9-10.12).
+/// `WM_CLASS` absent, and either `_NET_WM_PID` is also absent or its `/proc/<pid>/comm`
+/// could not be read (task 10.9-10.12, RF-31's final fallback).
 const APP_ID_SENTINEL: &str = "?";
+
+/// RF-31's stored-title character limit. Character-counted, never byte-counted: a byte-index
+/// truncation can split a multi-byte UTF-8 codepoint in half.
+const MAX_TITLE_CHARS: usize = 512;
 
 /// Bound on the root window's `_NET_SUPPORTED` read, in `GetProperty`'s 32-bit units — 512
 /// atoms, 2 KiB. Real window managers advertise on the order of 60-90 hints, so this is a wide
@@ -67,7 +89,8 @@ const MAX_SUPPORTED_ATOMS: u32 = 512;
 /// Bound on each title read, in `GetProperty`'s 32-bit units — 512 units, 2048 bytes. That is
 /// the widest UTF-8 encoding of RF-31's 512-character limit (4 bytes per character), so the
 /// bound never costs a character the requirement says to keep, while making the read finite.
-/// RF-31's truncation to 512 characters with an ellipsis is Phase 10 (task 10.9/10.10).
+/// The truncation to `MAX_TITLE_CHARS` with a trailing ellipsis happens after decoding
+/// (`truncate_with_ellipsis`), since this bound is in bytes and the limit is in characters.
 const MAX_TITLE_UNITS: u32 = 512;
 
 /// Bound on the `WM_CLASS` read, in `GetProperty`'s 32-bit units — 128 units, 512 bytes.
@@ -158,6 +181,20 @@ pub enum RawEvent {
     /// caller decides the `"(desktop)"` sentinel, matching how `tracker::WindowInfo::desktop()`
     /// already models it; this module carries no window-capture domain sentinel of its own.
     ActiveWindow(Option<RawWindowInfo>),
+    /// `DestroyNotify` for the window this module was actively tracking (RF-23, task
+    /// 10.5/10.6). Carries no timestamp of its own: the wall-clock instant the safety net's
+    /// 250 ms grace period measures from is the caller's job — it must stamp `now` at the
+    /// moment it receives this event (see `tracker::PendingTimer::DestroyGrace`'s
+    /// `destroyed_at`, which is exactly that stamp). This module's job stops at noticing and
+    /// translating; the timer and the `unknown`-state transition are entirely `tracker.rs`'s
+    /// (Phase 6, tasks 6.6-6.7).
+    ActiveWindowDestroyed,
+    /// RF-30: a title change on the tracked window, surfaced exactly as X11 reported it —
+    /// **undebounced** (task 10.7/10.8). The debounce state machine lives exclusively in
+    /// `tracker.rs` (design §2 D-8); this module's only job is to notice the property
+    /// changed and hand back a fresh, unconditional read, never to decide whether the change
+    /// is "stable" long enough to matter.
+    TitleChanged(RawTitle),
 }
 
 /// Atoms this module resolves once per connection (task 9.2, 9.7-9.10).
@@ -356,7 +393,7 @@ impl X11Source {
             Ok(None) => Ok(false),
             // The window manager exited and its check window went with it. A valid answer to
             // "is a WM running?", not a daemon error.
-            Err(ReplyError::X11Error(err)) if err.error_kind == ErrorKind::Window => Ok(false),
+            Err(err) if is_bad_window(&err) => Ok(false),
             Err(err) => Err(err),
         }
     }
@@ -435,7 +472,7 @@ impl X11Source {
             .check()
         {
             Ok(()) => {}
-            Err(ReplyError::X11Error(err)) if err.error_kind == ErrorKind::Window => {}
+            Err(err) if is_bad_window(&err) => {}
             Err(err) => return Err(err),
         }
         self.conn.flush()?;
@@ -444,17 +481,36 @@ impl X11Source {
 
     /// Moves the single tracked-window subscription from the previously active window to
     /// `window`, so exactly one window is subscribed at a time.
-    fn retarget_subscription(&self, window: Option<Window>) -> Result<(), ReplyError> {
+    ///
+    /// Returns `Ok(false)` when `window` itself no longer existed by the time the subscribe
+    /// request reached the server (RF-22, task 10.1/10.2's `ChangeWindowAttributes(...)
+    /// .check()` half) — the caller MUST treat that as a valid transition producing no
+    /// event, never propagate the error. `Ok(true)` covers every ordinary case, including
+    /// retargeting to `None` (desktop focus) and the no-op "already tracking this window"
+    /// case.
+    ///
+    /// **The new window is subscribed BEFORE the previous one is released** (task 10.15); that
+    /// order is the correctness property. Releasing first left a failed retarget with
+    /// `active_window` naming a window whose mask was already cleared, which the short-circuit
+    /// above then never re-subscribed — killing RF-30 and RF-23 for the active window.
+    /// Subscribing first makes the failure path a no-op by construction, stronger than
+    /// restoring afterwards because the restore is itself a request that can fail. Both windows
+    /// are briefly subscribed, costing at most one drained untranslated event.
+    fn retarget_subscription(&self, window: Option<Window>) -> Result<bool, ReplyError> {
         if self.active_window == window {
-            return Ok(());
+            return Ok(true);
+        }
+        if let Some(next) = window {
+            match self.subscribe_window(next) {
+                Ok(()) => {}
+                Err(err) if is_bad_window(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            }
         }
         if let Some(previous) = self.active_window {
             self.unsubscribe_window(previous)?;
         }
-        if let Some(next) = window {
-            self.subscribe_window(next)?;
-        }
-        Ok(())
+        Ok(true)
     }
 
     /// The window that is active right now, determined the way this connection's
@@ -491,9 +547,7 @@ impl X11Source {
         for _ in 0..MAX_TOPLEVEL_WALK {
             let tree = match self.conn.query_tree(current)?.reply() {
                 Ok(tree) => tree,
-                Err(ReplyError::X11Error(err)) if err.error_kind == ErrorKind::Window => {
-                    return Ok(None)
-                }
+                Err(err) if is_bad_window(&err) => return Ok(None),
                 Err(err) => return Err(err),
             };
             if tree.parent == self.root || tree.parent == FOCUS_NONE {
@@ -519,37 +573,57 @@ impl X11Source {
         if window == self.active_window {
             return Ok(None);
         }
-        Ok(Some(self.apply_active_window(window)?))
+        self.apply_active_window(window)
     }
 
     /// Handles one active-window change end to end (tasks 9.5-9.10): determines the active
     /// window for the current `CaptureMode`, moves the subscription to it, then performs the
     /// unconditional fresh metadata read — never reusing any value from a previous call
     /// (window-capture "Property read follows every active-window change").
-    pub fn on_active_window_changed(&mut self) -> Result<RawEvent, ReplyError> {
+    ///
+    /// `Ok(None)` is RF-22's valid-transition case (task 10.1/10.2): the window named by
+    /// `_NET_ACTIVE_WINDOW` no longer existed by the time the daemon tried to subscribe to
+    /// it or read its metadata. Not an error, not a daemon failure — the caller simply keeps
+    /// waiting for the next `_NET_ACTIVE_WINDOW` change.
+    pub fn on_active_window_changed(&mut self) -> Result<Option<RawEvent>, ReplyError> {
         let window = self.current_window()?;
         self.apply_active_window(window)
     }
 
     /// The shared tail of both paths into an active-window transition: retarget the
     /// subscription, record the new window, and read its metadata fresh.
-    fn apply_active_window(&mut self, window: Option<Window>) -> Result<RawEvent, ReplyError> {
-        self.retarget_subscription(window)?;
+    ///
+    /// RF-22 (task 10.1/10.2): a `BadWindow` from either half of that sequence — the
+    /// subscribe's `.check()`, or the metadata `GetProperty` that follows it — means the
+    /// window was destroyed mid-transition. Both are valid transitions, not failures:
+    /// `Ok(None)`, no event, no propagated error.
+    fn apply_active_window(
+        &mut self,
+        window: Option<Window>,
+    ) -> Result<Option<RawEvent>, ReplyError> {
+        if !self.retarget_subscription(window)? {
+            return Ok(None);
+        }
         self.active_window = window;
         let info = match window {
-            Some(w) => Some(self.read_window_info(w)?),
+            Some(w) => match self.read_window_info(w) {
+                Ok(info) => Some(info),
+                Err(err) if is_bad_window(&err) => return Ok(None),
+                Err(err) => return Err(err),
+            },
             None => None,
         };
-        Ok(RawEvent::ActiveWindow(info))
+        Ok(Some(RawEvent::ActiveWindow(info)))
     }
 
-    /// Unconditional read of title, PID and `WM_CLASS` for `window` (RF-2; RF-31's non-decoding
-    /// half — atom-type dispatch, 512-char truncation and the `/proc/<pid>/comm` fallback chain
-    /// are Phase 10, tasks 10.9/10.10).
+    /// Unconditional read of title, PID and `WM_CLASS` for `window` (RF-2, RF-31): atom-type
+    /// dispatch and 512-character truncation for the title, and the `WM_CLASS` →
+    /// `/proc/<pid>/comm` → `"?"` fallback chain for `app_id` (tasks 10.9-10.12). `pid` is
+    /// read before `app_id` because the fallback chain needs it.
     pub fn read_window_info(&self, window: Window) -> Result<RawWindowInfo, ReplyError> {
         let title = self.read_title(window)?;
         let pid = self.read_pid(window)?;
-        let app_id = self.read_app_id(window)?;
+        let app_id = self.read_app_id(window, pid)?;
         Ok(RawWindowInfo {
             app_id,
             title: RawTitle::new(title),
@@ -557,16 +631,22 @@ impl X11Source {
         })
     }
 
-    /// Prefers `_NET_WM_NAME` (`UTF8_STRING`), falls back to `WM_NAME` (`STRING`). Phase 9 reads
-    /// both as UTF-8 directly; Phase 10 dispatches on the reply's `type_` atom instead of always
-    /// assuming UTF-8 (RF-31).
+    /// Prefers `_NET_WM_NAME`, falls back to the legacy `WM_NAME`. Both are requested with
+    /// `AtomEnum::ANY` (`AnyPropertyType`) rather than a fixed expected type, so the reply's
+    /// own `type_` field always reflects what the property was actually stored as —
+    /// `decode_property_text` then dispatches on that, rather than this module assuming
+    /// `_NET_WM_NAME` is always `UTF8_STRING` and `WM_NAME` is always `STRING` (RF-31).
     ///
     /// Both reads are bounded by `MAX_TITLE_UNITS`. They previously passed `long_length =
     /// u32::MAX`, which asks the server for the entire property: a window advertising a
     /// 200,000-character title had all 200,000 characters copied into the daemon in one reply,
     /// for a value RF-31 caps at 512 characters anyway. The title is attacker-influenced
     /// content from an arbitrary application, so its read has to be bounded at the point it
-    /// enters the process.
+    /// enters the process. The character-count truncation to `MAX_TITLE_CHARS` happens after
+    /// decoding, since a byte bound cannot express a character limit exactly.
+    ///
+    /// `reply.bytes_after` tells `truncate_with_ellipsis` the *read bound* cut the property
+    /// short (task 10.17); see there for why the character count alone cannot notice.
     fn read_title(&self, window: Window) -> Result<String, ReplyError> {
         let reply = self
             .conn
@@ -574,13 +654,16 @@ impl X11Source {
                 false,
                 window,
                 self.atoms.net_wm_name,
-                self.atoms.utf8_string,
+                AtomEnum::ANY,
                 0,
                 MAX_TITLE_UNITS,
             )?
             .reply()?;
         if reply.value_len > 0 {
-            return Ok(String::from_utf8_lossy(&reply.value).into_owned());
+            return Ok(truncate_with_ellipsis(
+                &decode_property_text(&reply.value, reply.type_, self.atoms.utf8_string),
+                reply.bytes_after > 0,
+            ));
         }
         let reply = self
             .conn
@@ -588,12 +671,15 @@ impl X11Source {
                 false,
                 window,
                 self.atoms.wm_name,
-                AtomEnum::STRING,
+                AtomEnum::ANY,
                 0,
                 MAX_TITLE_UNITS,
             )?
             .reply()?;
-        Ok(String::from_utf8_lossy(&reply.value).into_owned())
+        Ok(truncate_with_ellipsis(
+            &decode_property_text(&reply.value, reply.type_, self.atoms.utf8_string),
+            reply.bytes_after > 0,
+        ))
     }
 
     fn read_pid(&self, window: Window) -> Result<Option<u32>, ReplyError> {
@@ -610,7 +696,7 @@ impl X11Source {
             .reply()?;
         // `0` is the reserved pid, never a real process — mirroring how `read_active_window`
         // already filters the reserved `0` window id. Without this a `_NET_WM_PID` of 0 yields
-        // `Some(0)` and Phase 10's `/proc/<pid>/comm` fallback goes looking for `/proc/0/comm`.
+        // `Some(0)` and the `/proc/<pid>/comm` fallback below goes looking for `/proc/0/comm`.
         Ok(reply
             .value32()
             .and_then(|mut it| it.next())
@@ -618,9 +704,12 @@ impl X11Source {
     }
 
     /// `WM_CLASS`'s second (class) component (window-capture "Metadata captured for a normal
-    /// window"). Falls back to the `"?"` sentinel when the property is absent or malformed; the
-    /// `/proc/<pid>/comm` intermediate fallback is Phase 10 (task 10.9-10.12).
-    fn read_app_id(&self, window: Window) -> Result<String, ReplyError> {
+    /// window"), falling back to `/proc/<pid>/comm` when `WM_CLASS` is absent but `pid` is
+    /// `Some`, and finally to the `"?"` sentinel (RF-31, tasks 10.9-10.12). The `comm` read is
+    /// best-effort — any failure at all (missing pid, exited or recycled process, unreadable
+    /// procfs) falls through to the sentinel rather than propagating an error, matching design
+    /// §7's "Process integration — subprocess inputs" threat-matrix response.
+    fn read_app_id(&self, window: Window, pid: Option<u32>) -> Result<String, ReplyError> {
         let reply = self
             .conn
             .get_property(
@@ -632,7 +721,15 @@ impl X11Source {
                 MAX_WM_CLASS_UNITS,
             )?
             .reply()?;
-        Ok(parse_wm_class(&reply.value).unwrap_or_else(|| APP_ID_SENTINEL.to_string()))
+        if let Some(class) = parse_wm_class(&reply.value) {
+            return Ok(class);
+        }
+        if let Some(pid) = pid {
+            if let Some(comm) = read_process_comm(pid) {
+                return Ok(comm);
+            }
+        }
+        Ok(APP_ID_SENTINEL.to_string())
     }
 
     /// Drains `x11rb`'s event queue until it is **genuinely empty** or an event translates
@@ -651,6 +748,10 @@ impl X11Source {
     /// pending active-window change is lost rather than delayed. Draining to empty restores
     /// D-6's drain-before-poll invariant, which the reactor consumes in Phase 14.
     ///
+    /// **Every in-loop exit that produces no event must `continue`, not `return`** (task
+    /// 10.14). Task 9.19 fixed the untranslated exit and left two more — RF-22's valid
+    /// transition, and a title read racing destruction — so the defect had moved, not gone.
+    ///
     /// In `CaptureMode::Ewmh` this method issues no query of its own, so "no query
     /// beforehand" (window-capture "Active window changes while idle") holds: nothing runs
     /// until an event is already queued. `CaptureMode::InputFocusFallback` is the deliberate
@@ -659,7 +760,26 @@ impl X11Source {
     pub fn poll_for_event(&mut self) -> Result<Option<RawEvent>, ReplyError> {
         while let Some(event) = self.conn.poll_for_event()? {
             if self.is_active_window_notify(&event) {
-                return Ok(Some(self.on_active_window_changed()?));
+                // `Ok(None)` is RF-22's valid transition, NOT "the queue is empty". Returning
+                // it here abandons whatever is queued behind it, and the fd is already drained,
+                // so the reactor would sleep through it. Keep draining.
+                match self.on_active_window_changed()? {
+                    Some(event) => return Ok(Some(event)),
+                    None => continue,
+                }
+            }
+            if self.is_active_window_destroy_notify(&event) {
+                return Ok(Some(self.on_active_window_destroyed()));
+            }
+            if let Some(window) = self.active_window_title_notify(&event) {
+                // RF-22's third `BadWindow` surface: this read races the window's death.
+                // Propagating it reads as connection loss to the reactor (RF-6, RF-32). Keep
+                // draining — the `DestroyNotify` behind it is what describes what happened.
+                match self.read_title(window) {
+                    Ok(title) => return Ok(Some(RawEvent::TitleChanged(RawTitle::new(title)))),
+                    Err(err) if is_bad_window(&err) => continue,
+                    Err(err) => return Err(err),
+                }
             }
             self.drained_untranslated += 1;
         }
@@ -679,6 +799,39 @@ impl X11Source {
                 Event::PropertyNotify(ev)
                     if ev.window == self.root && ev.atom == self.atoms.net_active_window
             )
+    }
+
+    /// `DestroyNotify` for the window this module currently considers active (RF-23, task
+    /// 10.5/10.6). A `DestroyNotify` for any other window — one that was active earlier and
+    /// has since been retargeted away from — is not this module's concern and is drained
+    /// like any other untranslated event.
+    fn is_active_window_destroy_notify(&self, event: &Event) -> bool {
+        matches!(event, Event::DestroyNotify(ev) if Some(ev.window) == self.active_window)
+    }
+
+    /// Bookkeeping for a translated `DestroyNotify` on the tracked window: the destroyed
+    /// window is no longer active from this module's perspective, so `active_window` clears
+    /// — X11 has already released its own resources for it, this is purely local state.
+    fn on_active_window_destroyed(&mut self) -> RawEvent {
+        self.active_window = None;
+        RawEvent::ActiveWindowDestroyed
+    }
+
+    /// A `PropertyNotify` for a title atom (`_NET_WM_NAME` or the legacy `WM_NAME`) on the
+    /// tracked window (RF-30, task 10.7/10.8) — returns the window id so the caller can issue
+    /// the fresh, unconditional read without a second lookup through `self.active_window`.
+    /// `None` for anything else, including a title change on a window that is not (or is no
+    /// longer) the tracked one: only the active window's title is this module's concern.
+    fn active_window_title_notify(&self, event: &Event) -> Option<Window> {
+        match event {
+            Event::PropertyNotify(ev)
+                if Some(ev.window) == self.active_window
+                    && (ev.atom == self.atoms.net_wm_name || ev.atom == self.atoms.wm_name) =>
+            {
+                Some(ev.window)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -719,6 +872,19 @@ pub fn xwayland_warning() -> Option<String> {
     }
 }
 
+/// True for a `ReplyError` carrying X11's `BadWindow` — the discriminant RF-22's "a destroyed
+/// window is a valid transition, not a failure" condition is built on (task 10.13's
+/// cross-check). Centralized here so every call site that must tolerate a dead window agrees
+/// on exactly the same X11 condition, rather than four separate inline matches drifting apart.
+///
+/// **`ErrorKind::Window` and nothing else**, deliberately. Widening it to any `X11Error`, or to
+/// any error, turns connection loss into a silent `continue` at every call site — RF-6/RF-32
+/// need exactly the opposite. Pinned by
+/// `is_bad_window_tolerates_only_badwindow_and_never_connection_loss` (task 10.18).
+fn is_bad_window(err: &ReplyError) -> bool {
+    matches!(err, ReplyError::X11Error(e) if e.error_kind == ErrorKind::Window)
+}
+
 /// Reads a single-window-valued property (`WINDOW`, length 1) from `window`. `None` when the
 /// property is absent, has the wrong format, or holds the reserved `0` window id. Used for
 /// `_NET_SUPPORTING_WM_CHECK` on both the root window and the check window itself.
@@ -734,6 +900,75 @@ fn read_window_property(
         .value32()
         .and_then(|mut it| it.next())
         .filter(|&w| w != 0))
+}
+
+/// RF-31: decodes a text property's raw bytes according to the atom type the server actually
+/// returned, rather than always assuming UTF-8 (task 10.9/10.10).
+///
+/// `UTF8_STRING` decodes as UTF-8, lossily — invalid byte sequences become the replacement
+/// character instead of an error, since a malformed title must never fail capture. Anything
+/// else — the X11 core/ICCCM legacy `STRING` type, and any other/unrecognized type this
+/// module has no reason to special-case — decodes as Latin-1 (ISO 8859-1), where every byte
+/// maps directly onto the Unicode code point of the same numeric value; that is `STRING`'s
+/// defined encoding. Decoding `STRING` content as UTF-8 corrupted a Latin-1 accented
+/// character such as 'é' (byte `0xE9`, a single valid Latin-1 code point but an invalid lone
+/// UTF-8 continuation byte) into the replacement character; Latin-1 decoding keeps it intact.
+fn decode_property_text(value: &[u8], type_: u32, utf8_string_atom: u32) -> String {
+    if type_ == utf8_string_atom {
+        String::from_utf8_lossy(value).into_owned()
+    } else {
+        value.iter().map(|&byte| byte as char).collect()
+    }
+}
+
+/// RF-31: caps a decoded title at `MAX_TITLE_CHARS`, appending a single ellipsis when
+/// truncation happens (task 10.9/10.10). Character-counted, not byte-counted —
+/// `MAX_TITLE_UNITS` already bounds the `GetProperty` read itself in bytes; this bounds the
+/// *decoded* value in characters, so a multi-byte UTF-8 codepoint is never sliced in half.
+///
+/// `bound_truncated` says the `GetProperty` read itself was capped (task 10.17) — truncation
+/// the character count cannot see. A title of four-byte codepoints hits the 2048-byte bound at
+/// exactly 512 characters, so `MAX_TITLE_CHARS` finds nothing to cut and the result is
+/// indistinguishable from a genuine 512-character title. The ellipsis follows either bound.
+fn truncate_with_ellipsis(text: &str, bound_truncated: bool) -> String {
+    let chars = text.chars().count();
+    if !bound_truncated && chars <= MAX_TITLE_CHARS {
+        return text.to_string();
+    }
+    // Never grow the value: when the read bound already stopped short of `MAX_TITLE_CHARS`,
+    // the ellipsis replaces the last character it did return rather than being appended.
+    let keep = chars.min(MAX_TITLE_CHARS).saturating_sub(1);
+    let mut truncated: String = text.chars().take(keep).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Best-effort `/proc/<pid>/comm` read — RF-31's `WM_CLASS`-absent fallback (tasks
+/// 10.9-10.12; design §7's "Process integration — subprocess inputs" threat-matrix row).
+/// `None` on any failure whatsoever: the pid already exited, was recycled onto an unrelated
+/// process, procfs is unreadable, or the entry is simply not there. The caller falls back to
+/// the `"?"` sentinel; this never becomes an error the daemon has to propagate.
+fn read_process_comm(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
+    sanitize_comm(&raw)
+}
+
+/// `comm`'s sanitization, split out from the `/proc` read itself so it is unit-testable
+/// without a real process (task 10.11/10.12's threat-matrix cases: a `comm` containing a
+/// newline, invalid UTF-8). `comm` is untrusted input from an arbitrary process, exactly like
+/// `WM_CLASS` and a window title: invalid UTF-8 is replaced rather than rejected, and every
+/// control character — including the trailing newline procfs always appends — is stripped
+/// before this value is allowed anywhere near diagnostics, SQLite, or `exclude.rs`. `None`
+/// when nothing usable survives sanitization, letting the caller fall back to the sentinel
+/// rather than record a blank application name.
+fn sanitize_comm(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
 }
 
 /// Parses `WM_CLASS`'s NUL-separated `"instance\0class\0"` form and returns the second
@@ -875,5 +1110,143 @@ mod tests {
     fn parse_wm_class_none_when_class_component_missing() {
         assert_eq!(parse_wm_class(b"firefox\0"), None);
         assert_eq!(parse_wm_class(b""), None);
+    }
+
+    // task 10.9/10.10 (RF-31) — pure decode/truncate functions, no X11 connection needed.
+
+    #[test]
+    fn decode_property_text_utf8_string_decodes_as_utf8() {
+        let utf8_atom = 999;
+        assert_eq!(
+            decode_property_text("Café".as_bytes(), utf8_atom, utf8_atom),
+            "Café"
+        );
+    }
+
+    #[test]
+    fn decode_property_text_string_type_decodes_as_latin1() {
+        let utf8_atom = 999;
+        let string_atom = AtomEnum::STRING.into();
+        // 0xE9 is Latin-1 'é' — a single code point, not a UTF-8 continuation byte.
+        assert_eq!(
+            decode_property_text(&[b'C', b'a', b'f', 0xE9], string_atom, utf8_atom),
+            "Café"
+        );
+    }
+
+    #[test]
+    fn decode_property_text_unrecognized_type_falls_back_to_latin1() {
+        let utf8_atom = 999;
+        // Neither UTF8_STRING nor STRING: still must not assume UTF-8.
+        assert_eq!(decode_property_text(&[0xE9], utf8_atom, utf8_atom + 1), "é");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_leaves_short_titles_untouched() {
+        assert_eq!(truncate_with_ellipsis("short", false), "short");
+        assert_eq!(
+            truncate_with_ellipsis(&"x".repeat(512), false),
+            "x".repeat(512),
+            "exactly at the limit must not be truncated"
+        );
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_caps_long_titles_at_512_with_trailing_ellipsis() {
+        let truncated = truncate_with_ellipsis(&"x".repeat(600), false);
+        assert_eq!(truncated.chars().count(), 512);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(
+            &truncated[..truncated.len() - '…'.len_utf8()],
+            "x".repeat(511)
+        );
+    }
+
+    /// Task 10.17: the *read bound*, not the character count, did the truncating. Without the
+    /// ellipsis the value is indistinguishable from a genuine 512-character title.
+    #[test]
+    fn truncate_with_ellipsis_marks_a_title_the_read_bound_capped() {
+        let capped = truncate_with_ellipsis(&"x".repeat(512), true);
+        assert_eq!(capped.chars().count(), 512);
+        assert!(capped.ends_with('…'));
+    }
+
+    /// **`is_bad_window` mutation pin (task 10.18; task 10.13's cross-check made executable).**
+    ///
+    /// Two mutations survived the whole suite: always true, and accepting any `X11Error` kind.
+    /// Both turn every protocol fault — connection loss included — into a silent `continue`.
+    /// Nothing else catches them: every other test only ever produces a real `BadWindow`.
+    #[test]
+    fn is_bad_window_tolerates_only_badwindow_and_never_connection_loss() {
+        fn x11(error_kind: ErrorKind) -> ReplyError {
+            ReplyError::X11Error(x11rb::x11_utils::X11Error {
+                error_kind,
+                error_code: 0,
+                sequence: 0,
+                bad_value: 0,
+                minor_opcode: 0,
+                major_opcode: 0,
+                extension_name: None,
+                request_name: None,
+            })
+        }
+
+        assert!(is_bad_window(&x11(ErrorKind::Window)));
+        // A different X11 error is a genuine protocol fault, not a window that went away.
+        for kind in [ErrorKind::Value, ErrorKind::Access, ErrorKind::Match] {
+            assert!(
+                !is_bad_window(&x11(kind)),
+                "{kind:?} is not a destroyed window and must not be tolerated"
+            );
+        }
+        // RF-6/RF-32: connection loss MUST propagate so the reconnect path can run.
+        let lost = ReplyError::ConnectionError(ConnectionError::UnknownError);
+        assert!(!is_bad_window(&lost));
+    }
+
+    // task 10.11/10.12 (RF-31, design §7 "Process integration — subprocess inputs") —
+    // `comm` sanitization, pure and X11-independent.
+
+    #[test]
+    fn sanitize_comm_strips_trailing_newline() {
+        // Real `/proc/<pid>/comm` always ends with `\n`.
+        assert_eq!(sanitize_comm(b"firefox\n"), Some("firefox".to_string()));
+    }
+
+    #[test]
+    fn sanitize_comm_strips_embedded_control_characters() {
+        assert_eq!(
+            sanitize_comm(b"ev\x1b[31mil\napp\x07"),
+            Some("ev[31milapp".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_comm_handles_invalid_utf8_without_panicking() {
+        // 0xFF is never valid UTF-8 on its own; lossy decoding must replace it, not panic.
+        let result = sanitize_comm(b"a\xFFb\n");
+        assert!(result.is_some());
+        assert!(result.unwrap().contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn sanitize_comm_none_when_only_control_characters_survive() {
+        assert_eq!(sanitize_comm(b"\n\x1b\x07"), None);
+        assert_eq!(sanitize_comm(b""), None);
+    }
+
+    #[test]
+    fn read_process_comm_none_for_a_pid_that_does_not_exist() {
+        // /proc pids are bounded well below u32::MAX on every real Linux kernel; this pid
+        // cannot correspond to a live, recycled, or exited-but-still-cached process.
+        assert_eq!(read_process_comm(u32::MAX), None);
+    }
+
+    #[test]
+    fn read_process_comm_reads_a_real_process() {
+        // This test binary's own process is guaranteed to exist for the test's duration.
+        let comm = read_process_comm(std::process::id()).expect("own process must be readable");
+        assert!(!comm.is_empty());
+        assert!(!comm.chars().any(char::is_control));
     }
 }

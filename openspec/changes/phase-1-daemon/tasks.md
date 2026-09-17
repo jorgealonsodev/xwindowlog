@@ -588,49 +588,91 @@ observed RED against the code as it stood.
 
 **Traces:** RF-22, RF-23 (surfacing half), RF-30 (surfacing half), RF-31.
 
-- [ ] 10.1 RED: on every active-window change, `GetProperty` then
+- [x] 10.1 RED: on every active-window change, `GetProperty` then
       `ChangeWindowAttributes(...).check()` runs in that order; a BadWindow
       result on the check is a valid transition — no error, no event emitted,
       daemon awaits the next change (RF-22, "Active window is destroyed
       before its event mask is set").
-- [ ] 10.2 GREEN: implement the ordered read-then-register-with-check
+- [x] 10.2 GREEN: implement the ordered read-then-register-with-check
       sequence and BadWindow handling — validates assumption A-4 (design §12);
       adjust to whatever discriminant `x11rb` actually returns and record the
       correction if it differs from the PRD's hypothesis.
-- [ ] 10.3 RED: a title change racing the event-mask registration is still
+- [x] 10.3 RED: a title change racing the event-mask registration is still
       reflected by the next unconditional property read (RF-22, "Title
       changes between the property read and the event mask being active").
-- [ ] 10.4 GREEN: confirm 9.7's unconditional-read logic covers this; add the
+- [x] 10.4 GREEN: confirm 9.7's unconditional-read logic covers this; add the
       specific race-timing test.
-- [ ] 10.5 RED: `DestroyNotify` for the tracked window surfaces as
+- [x] 10.5 RED: `DestroyNotify` for the tracked window surfaces as
       `SourceEvent::ActiveWindowDestroyed` — E2E cases: the WM updates the
       property promptly (no gap recorded), and a lax WM under `kill -9` lets
       the 250 ms grace elapse (RF-23, both scenarios; the state-machine
       handling itself was proven in Phase 6, task 6.6-6.7).
-- [ ] 10.6 GREEN: implement `DestroyNotify` → `SourceEvent::
+- [x] 10.6 GREEN: implement `DestroyNotify` → `SourceEvent::
       ActiveWindowDestroyed` surfacing.
-- [ ] 10.7 RED: `x11.rs` surfaces raw `TitleChanged` events without itself
+- [x] 10.7 RED: `x11.rs` surfaces raw `TitleChanged` events without itself
       debouncing — confirms the debounce state machine stays exclusively in
       `tracker.rs` (RF-30, x11-side surfacing only; the debounce logic is
       Phase 6).
-- [ ] 10.8 GREEN: confirm/adjust `x11.rs` to surface undebounced
+- [x] 10.8 GREEN: confirm/adjust `x11.rs` to surface undebounced
       `TitleChanged` events.
-- [ ] 10.9 RED: a 600-character title truncates to 512 with a trailing
+- [x] 10.9 RED: a 600-character title truncates to 512 with a trailing
       ellipsis; `STRING` vs `UTF8_STRING` atom types decode correctly rather
       than assuming UTF-8; `WM_CLASS` absent + `_NET_WM_PID` present reads
       `/proc/<pid>/comm`; `WM_CLASS` absent and no readable `comm` falls back
       to the `"?"` sentinel without erroring (RF-31, all scenarios).
-- [ ] 10.10 GREEN: implement atom-type-aware decoding, 512-char truncation
+- [x] 10.10 GREEN: implement atom-type-aware decoding, 512-char truncation
       with ellipsis, and the `/proc/<pid>/comm` fallback chain.
-- [ ] 10.11 RED (threat-matrix "Process integration — subprocess inputs",
+- [x] 10.11 RED (threat-matrix "Process integration — subprocess inputs",
       design §7): `/proc/<pid>/comm` for an exited or recycled pid; a `comm`
       containing a newline; invalid UTF-8 in `comm`.
-- [ ] 10.12 GREEN: implement best-effort `comm` reading that never errors,
+- [x] 10.12 GREEN: implement best-effort `comm` reading that never errors,
       falls back to `"?"` on any failure, strips control characters, and
       passes the result through `exclude.rs` like any other title component.
-- [ ] 10.13 REFACTOR: confirm the BadWindow/decode error paths never
+- [x] 10.13 REFACTOR: confirm the BadWindow/decode error paths never
       `panic!` and never log a raw title (cross-check against Phase 8's
       §14.3 ordering test).
+
+### Phase 10 corrections (2026-09-17, from a second adversarial pass)
+
+Phase 10 was green — 143 tests, clippy and fmt clean — over four defects the
+suite could not observe. Every correction below was driven by an observed RED
+against the code as it stood, never by reverting a fix afterwards.
+
+- [x] 10.14 RED/GREEN: the drain loop `return`ed on a valid-transition
+      `Ok(None)`. Observed RED: with a title change queued behind an
+      active-window change naming an already-destroyed window, one
+      `poll_for_event` answered `None` while the title event sat pending —
+      Phase 9's task 9.18 defect reappearing at a different exit, and just as
+      lost rather than delayed, since `x11rb` has already drained the fd. The
+      loop now `continue`s; only a real event returns.
+- [x] 10.15 RED/GREEN: `retarget_subscription` released the previous window's
+      event mask *before* subscribing the new one, so a `BadWindow` on the
+      subscribe left `active_window` naming an unsubscribed window that the
+      `active_window == window` short-circuit then never re-subscribed.
+      Observed RED: after the race, a title change on the tracked window never
+      arrived (5 s timeout). Subscribing before releasing makes the failure
+      path a no-op by construction, which is stronger than restoring state
+      afterwards because the restore is itself a request that can fail.
+- [x] 10.16 RED/GREEN: `read_title` in the drain loop was a third, untreated
+      `BadWindow` surface — the module doc claimed tolerance "at both points
+      it can occur" while this one propagated. Observed RED: a title change
+      followed by the window's destruction surfaced
+      `X11Error { error_kind: Window, request_name: "GetProperty" }` out of
+      `poll_for_event`, which RF-6/RF-32 have the reactor read as connection
+      loss. Now tolerated; the doc says three points.
+- [x] 10.17 RED/GREEN: the 2048-byte read bound pre-truncated a title of
+      four-byte codepoints to exactly 512 characters, so
+      `truncate_with_ellipsis` took its no-op branch and the result was
+      indistinguishable from a genuine 512-character title. Observed RED: a
+      600-codepoint `U+1D11E` title came back as 512 characters with no
+      ellipsis. The ellipsis now follows `reply.bytes_after` too, not only the
+      character count.
+- [x] 10.18 GREEN (mutation pin, no RED possible — `is_bad_window` was already
+      correct): two mutations survived the whole suite, making it always true
+      and making it accept any `X11Error` kind. Both turn connection loss into
+      a silent `continue` at every call site, which is the opposite of what
+      RF-6/RF-32 need. Validated by applying each mutation and observing the
+      new pin — and only the new pin — fail, then restoring.
 
 ---
 
