@@ -167,50 +167,50 @@ explicit ordering constraint.
 
 **Traces:** RF-10, RF-11, RF-35, RF-36, RNF-6 (consistency half).
 
-- [ ] 3.1 RED (D-10 layer 1, the behavioral proof of E-2 that does not trust
+- [x] 3.1 RED (D-10 layer 1, the behavioral proof of E-2 that does not trust
       any version string): apply the real RF-11 schema to
       `Connection::open_in_memory()`; insert one open interval, insert a
       second, assert the second fails `SQLITE_CONSTRAINT_UNIQUE` on
       `idx_intervals_one_open` (interval-storage "A second open interval is
       rejected").
-- [ ] 3.2 GREEN: implement the full RF-11 schema in `store.rs` — pragmas
+- [x] 3.2 GREEN: implement the full RF-11 schema in `store.rs` — pragmas
       (`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`,
       `temp_store=MEMORY`, `busy_timeout=5000`), `apps`/`titles` tables with
       sentinel rows (`apps(1,'?')`, `titles(1,'-')`), `intervals` with the
       `open_marker` generated column and `idx_intervals_one_open`, `projects`
       and `rules` tables (proposal assumption A-3: full schema at
       `user_version = 1`, including tables nothing reads/writes in Phase 1).
-- [ ] 3.3 RED: an invalid `state = 'activ'` fails its `CHECK`; an
+- [x] 3.3 RED: an invalid `state = 'activ'` fails its `CHECK`; an
       `end < start` insert fails `CHECK ("end" IS NULL OR "end" >= start)`; an
       interval referencing a nonexistent `apps.id` fails its foreign-key
       constraint (interval-storage, three "rejected" scenarios).
-- [ ] 3.4 GREEN: fix any constraint definition gap 3.3 surfaces.
-- [ ] 3.5 RED: with ambient umask `022`, `xwindowlog.db`,
+- [x] 3.4 GREEN: fix any constraint definition gap 3.3 surfaces.
+- [x] 3.5 RED: with ambient umask `022`, `xwindowlog.db`,
       `xwindowlog.db-wal`, `xwindowlog.db-shm` are all created `0600`; data
       and config directories are created `0700` (RF-10, both scenarios).
-- [ ] 3.6 GREEN: implement `store::open()` calling `umask(0o077)` before any
+- [x] 3.6 GREEN: implement `store::open()` calling `umask(0o077)` before any
       `Connection::open`, and explicit-mode directory creation.
-- [ ] 3.7 RED: `store::open()` returns a typed error mapped to exit code 3
+- [x] 3.7 RED: `store::open()` returns a typed error mapped to exit code 3
       (environment error, cli-reporting RF-60) rather than a panic, when the
       linked SQLite fails the D-10 layer-1 behavioral assertion at runtime.
-- [ ] 3.8 GREEN: implement the runtime guard (D-10 layer 3).
-- [ ] 3.9 RED: `PRAGMA user_version` equal to current → no migration, no
+- [x] 3.8 GREEN: implement the runtime guard (D-10 layer 3).
+- [x] 3.9 RED: `PRAGMA user_version` equal to current → no migration, no
       backup runs; below current → an Online-Backup-API backup is taken
       before the first migration statement, each pending migration runs in
       its own transaction with `PRAGMA user_version` as the last statement;
       above current → startup aborts with an explicit message and the schema
       is not modified (RF-35, all three scenarios).
-- [ ] 3.10 GREEN: implement the forward-only migration runner and the
+- [x] 3.10 GREEN: implement the forward-only migration runner and the
       Online-Backup-API pre-migration backup, exercised with **synthetic**
       migrations since v1 migrates nothing real (design §8).
-- [ ] 3.11 RED: exactly one stale open interval is closed at the startup
+- [x] 3.11 RED: exactly one stale open interval is closed at the startup
       instant and an `unknown` interval opens immediately from that point;
       more than one open interval logs an error and closes all but the most
       recent with `end = start` (RF-36, both scenarios).
-- [ ] 3.12 GREEN: implement `recover_on_startup` returning
+- [x] 3.12 GREEN: implement `recover_on_startup` returning
       `Recovery { closed_stale, extra_open_rows }` (design §5 `IntervalStore`
       contract).
-- [ ] 3.13 REFACTOR: consolidate the DDL into one `const SCHEMA_V1: &str`
+- [x] 3.13 REFACTOR: consolidate the DDL into one `const SCHEMA_V1: &str`
       used by every test and by `open()`, eliminating any duplicated fixture
       copy of the schema (design §6 testing-strategy note: "never a fixture
       copy").
