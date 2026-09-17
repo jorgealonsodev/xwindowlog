@@ -1,0 +1,62 @@
+# openspec/config.yaml
+schema: spec-driven
+
+context: |
+  Project: xwindowlog — Linux active-window logger with AI analysis (X11).
+  Stack: Rust (edition 2021, planned), no Cargo.toml yet — greenfield.
+  Crates (planned, PRD §13): x11rb (screensaver, sync), zbus (blocking),
+  rusqlite (bundled, functions, backup), rmcp, clap (+clap_complete,
+  clap_mangen), serde+toml, regex, time, signal-hook.
+  Architecture: single binary, modules main/x11/logind/tracker/exclude/
+  store/rules/mcp. No async runtime in the daemon; tokio only linked for
+  the MCP subprocess via rmcp.
+  Testing: cargo test (unit + in-memory SQLite integration + Xvfb/openbox
+  X11 integration), proptest, criterion — all planned, unverified.
+  Source of truth: /PRD.md (v2.0, English, 765 lines).
+
+strict_tdd: true # source: user global CLAUDE.md ("Strict TDD Mode: enabled"). This is a
+                 # policy decision, not a detected capability. The runner below is the part
+                 # that is not yet verifiable; the mode itself is not in question.
+
+testing:
+  runner: intended-unverified
+  test_command: "cargo test" # intended per PRD §15; not runnable until Cargo.toml exists
+  layers:
+    unit: intended # WindowSource trait synthetic events, exclusion regex table, interval clipping
+    integration: intended # rusqlite in-memory SQLite with real schema applied per test
+    e2e: intended # Xvfb + openbox --sm-disable EWMH WM, cargo test --test x11_integration
+  coverage: not-configured
+  quality_tools:
+    linter: intended # clippy expected, not yet configured
+    formatter: intended # rustfmt expected, not yet configured
+    type_checker: n/a # Rust compiler is the type checker
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Respect the privacy/threat model in PRD §14 (no plaintext secrets beyond documented exceptions)
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows (X11 event loop, tracker state machine, MCP tool calls)
+    - Document architecture decisions with rationale, consistent with PRD §13
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+    - Cargo.toml and workspace bootstrap must be an explicit early task before any module work
+  apply:
+    guidelines:
+      - Follow module boundaries from PRD §13 (main/x11/logind/tracker/exclude/store/rules/mcp)
+      - tracker.rs logic must go through the WindowSource trait to stay testable without a real X server
+    tdd: true # RED -> GREEN -> REFACTOR is required for every task EXCEPT the crate
+              # bootstrap task, which creates Cargo.toml and therefore cannot be preceded
+              # by an observable failing test. Bootstrap must land first and `cargo test`
+              # must be confirmed runnable before any other task starts.
+    test_command: "cargo test"
+  verify:
+    test_command: "cargo test"
+    build_command: "cargo build"
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
