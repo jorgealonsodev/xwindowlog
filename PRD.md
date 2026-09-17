@@ -238,10 +238,23 @@ title = "(?i)banco|bbva|santander|caixa"
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
-PRAGMA foreign_keys = ON;       -- rusqlite does NOT enable it by default, and it is per-connection
+PRAGMA foreign_keys = ON;       -- keep this: it is per-connection, and portability demands it
 PRAGMA temp_store   = MEMORY;
 PRAGMA busy_timeout = 5000;     -- the mcp process and the daemon open the same file
 
+```
+
+> *(Corrected 2026-09-17, verified during Phase 1 implementation.)* The earlier
+> comment on `foreign_keys` said rusqlite does not enable it by default. That is
+> true of the crate but misleading in this project's configuration: the
+> `bundled` feature compiles SQLite with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`
+> (`libsqlite3-sys-0.30.1/build.rs:123`), so foreign keys are already enforced
+> before any pragma runs. The explicit `PRAGMA` is kept anyway, because it is
+> per-connection and a build against a **system** SQLite would not have that
+> flag. Relying on the bundled default would make correctness depend on a build
+> option rather than on the schema.
+
+```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE apps   (id INTEGER PRIMARY KEY, app_id TEXT NOT NULL UNIQUE);
