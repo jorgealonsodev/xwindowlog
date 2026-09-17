@@ -67,3 +67,9 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # Compile-fail proof for RF-28: no `From` conversion exists between `WallTs`
 # and `MonoInstant` in either direction (design.md D-9, tasks.md 2.7/2.8).
 trybuild = "1"
+
+# Property tests for P1 (no overlap) and P2 (working-day sum invariant),
+# PRD.md §15.5 / interval-tracking spec.md (design.md §6 Testing Strategy,
+# tasks.md 6.8/6.9). Invariants over generated sequences, not examples
+# (rust-systems skill).
+proptest = "1"

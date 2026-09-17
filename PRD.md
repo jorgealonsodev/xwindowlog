@@ -181,9 +181,20 @@ This must be written down, not discovered after the first forum comment:
 | `active`/`afk` | `LockedHint → true`, or `PrepareForSleep(true)` | `locked` | `now()` of the property change or of the signal |
 | `active`/`afk` | `xwindowlog pause` (RF-49) | `paused` | `now()` |
 | `locked` | `LockedHint → false`, or `PrepareForSleep(false)` | `unknown` | — |
+| `paused` | `xwindowlog resume` (RF-49) | `unknown` | `now()` |
+| `paused` | `--minutes N` expiry elapses (RF-49) | `unknown` | `now()` of the expiry |
 | `afk` | `IDLETIME` alarm, negative transition | `active` (same window if it still exists, otherwise `unknown`) | `now()` of the return |
 | any | Loss of the X11 connection | `unknown` | `now()` of the detected error |
 | any | `SIGTERM`/`SIGINT` | process exit | `now()` of the signal |
+
+*(Rows added 2026-09-17, found while implementing Phase 6.)* The table
+previously had no way **out** of `paused`: it recorded the entry from
+`active`/`afk` but never the exit, even though RF-49 defines both `resume` and
+an automatic `--minutes N` expiry. Both exits land in `unknown` rather than
+returning to the previous window, because the daemon stopped tracking while
+paused and cannot know whether that window still exists or still has focus;
+the next `_NET_ACTIVE_WINDOW` resolves it. Inventing a return to the
+pre-pause window would fabricate time the daemon did not observe.
 
 The `start` of every new interval is always equal to the `end` of the previous one (RF-3). The focused desktop (`_NET_ACTIVE_WINDOW = None`) is legitimate user activity, not absence and not an error, and is never discarded.
 

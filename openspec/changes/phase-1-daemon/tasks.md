@@ -312,7 +312,7 @@ explicit ordering constraint.
 **Traces:** RF-3 (full table), RF-4 (backdating), RF-23, RF-30, P1, P2 — **the
 phase's closing invariant (proposal §Intent).**
 
-- [ ] 6.1 RED+GREEN, one pair per remaining §11.1 row (interval-tracking
+- [x] 6.1 RED+GREEN, one pair per remaining §11.1 row (interval-tracking
       "State transition table"), each proven with `ScriptedSource` +
       `FakeClock`: stable title change → `active` (new interval) at the title
       event's instant; `active`/`afk` + `LockedHint→true` or
@@ -321,44 +321,44 @@ phase's closing invariant (proposal §Intent).**
       `unknown`; `afk` + idle negative transition → `active` (same window if
       it still exists) or `unknown`; any + X11 connection loss → `unknown` at
       detection instant; any + shutdown signal → process-exit effect.
-- [ ] 6.2 RED: the absence closing timestamp is `t_alarm − ms_since_user_input`
+- [x] 6.2 RED: the absence closing timestamp is `t_alarm − ms_since_user_input`
       (backdated), never `t_alarm` itself (idle-detection "User goes idle
       past the threshold").
-- [ ] 6.3 GREEN: implement the backdated-close branch using Phase 2's
+- [x] 6.3 GREEN: implement the backdated-close branch using Phase 2's
       `clock::backdated_close`.
-- [ ] 6.4 RED: a title change closes/opens an interval only after
+- [x] 6.4 RED: a title change closes/opens an interval only after
       `title_debounce_ms` of stability; a second title change before the
       debounce elapses discards the first pending title and restarts the
       timer, recording no transition for the intermediate title (RF-30, both
       scenarios).
-- [ ] 6.5 GREEN: implement `ArmTimer(TitleDebounce)`/`CancelTimer` emission
+- [x] 6.5 GREEN: implement `ArmTimer(TitleDebounce)`/`CancelTimer` emission
       and the pending-title state.
-- [ ] 6.6 RED: `DestroyNotify` on the tracked window arms a 250 ms
+- [x] 6.6 RED: `DestroyNotify` on the tracked window arms a 250 ms
       `DestroyGrace` deadline; a new `_NET_ACTIVE_WINDOW` change before it
       elapses cancels the deadline with no gap recorded; if the deadline
       fires first, the interval closes with `end` = the original
       `DestroyNotify` timestamp (not the deadline-fired time), transitioning
       to `unknown` (RF-23, both scenarios).
-- [ ] 6.7 GREEN: implement the `DestroyGrace` arm/cancel/fire logic, stashing
+- [x] 6.7 GREEN: implement the `DestroyGrace` arm/cancel/fire logic, stashing
       the `DestroyNotify` timestamp at arm time.
-- [ ] 6.8 RED (P1): a `proptest` generator of arbitrary valid event
+- [x] 6.8 RED (P1): a `proptest` generator of arbitrary valid event
       sequences never produces two overlapping intervals (interval-tracking
       "Randomized event sequences never produce overlapping intervals").
-- [ ] 6.9 RED (P2 — **the phase's closing condition**): a scripted,
+- [x] 6.9 RED (P2 — **the phase's closing condition**): a scripted,
       deterministic full-simulated-day sequence (window changes, idle
       transitions, lock/unlock, suspend/resume, pause/resume, an X11
       connection loss and recovery) sums
       `active+afk+locked+paused+unknown` to exactly
       `end_of_day − start_of_day`, using `FakeClock` (interval-tracking "A
       full simulated day sums exactly").
-- [ ] 6.10 GREEN: fix whatever P1/P2 uncover. This task exists because the
+- [x] 6.10 GREEN: fix whatever P1/P2 uncover. This task exists because the
       properties are expected to surface edge cases the row-by-row tests
       miss — get this green well before the phase ends, not at the end
       (proposal, design §1).
-- [ ] 6.11 REFACTOR: structure the transition function as one match arm per
+- [x] 6.11 REFACTOR: structure the transition function as one match arm per
       source state so it can be audited against the §11.1 table by
       inspection, side by side with `interval-tracking/spec.md`.
-- [ ] 6.12 REFACTOR (**interim-debt cleanup, added by the orchestrator after
+- [x] 6.12 REFACTOR (**interim-debt cleanup, added by the orchestrator after
       PR 2**): remove the module-level `#![allow(dead_code, reason = "...")]`
       from `src/clock.rs`. By the end of this phase `clock.rs` has real consumers
       in `store.rs` and `tracker.rs`, so its allow is no longer justified.
@@ -430,6 +430,26 @@ phase's closing invariant (proposal §Intent).**
 
 **Traces:** P3, §14.3 ordering guarantee (proposal *Success Criteria*).
 
+- [ ] 8.0 GREEN (**added by the orchestrator after PR 6 — blocking, do this
+      first**): introduce `src/lib.rs` and turn the crate into a lib plus a
+      thin `src/main.rs` shell. The crate is currently binary-only, and a
+      binary-only crate cannot expose its internals to `tests/*.rs`, so the
+      integration-test files this plan and the PRD both name are impossible
+      as things stand: task 8.1's `tests/pipeline_integration.rs` and the
+      `tests/invariants.rs` that PRD.md's M-1 line cites as the proof of the
+      product's headline metric. Phase 6 had to put P1 and P2 inside
+      `tracker.rs`'s own test module for exactly this reason.
+      Move the module declarations to `lib.rs`, leave `main.rs` as argument
+      parsing plus a call into the library, and re-export what integration
+      tests need. This is ordinary Rust practice for a binary with logic
+      worth testing, and it also unblocks the Phase 2 MCP work later.
+      Acceptance: `cargo test` still green with the same test count, and a
+      trivial `tests/` file can `use xwindowlog::...` and compile.
+- [ ] 8.0b REFACTOR: move P1 and P2 from `tracker.rs`'s test module into
+      `tests/invariants.rs`, the location PRD.md's M-1 line actually names,
+      now that 8.0 makes it possible. Keep the per-bucket assertions exactly
+      as they are — they are what catches a boundary shift, since the grand
+      total is conserved by any such bug.
 - [ ] 8.1 RED (P3): a scripted sequence mixing excluded and non-excluded
       windows over total duration `D`, run once with exclusion active and
       once without, sums to `D` in both cases (privacy-filtering "Mixed
