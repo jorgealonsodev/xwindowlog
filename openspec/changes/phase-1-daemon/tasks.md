@@ -481,37 +481,106 @@ phase's closing invariant (proposal §Intent).**
 
 **Traces:** RF-1, RF-2, RF-24, RF-29.
 
-- [ ] 9.1 RED (Xvfb E2E, using the fd/drain accessors proven in 1.6/1.7):
+- [x] 9.1 RED (Xvfb E2E, using the fd/drain accessors proven in 1.6/1.7):
       `_NET_SUPPORTED` and `_NET_ACTIVE_WINDOW` both exist at startup → no
       diagnostic, proceeds with subscription (window-capture "Window manager
       is EWMH-compliant").
-- [ ] 9.2 GREEN: implement `intern_atom(only_if_exists=true)` verification.
-- [ ] 9.3 RED (Xvfb with no EWMH-compliant WM): missing EWMH properties emit
+- [x] 9.2 GREEN: implement the EWMH verification. *(Mechanism corrected
+      2026-09-17 — see task 9.14. Originally worded "implement
+      `intern_atom(only_if_exists=true)` verification", which the PRD itself
+      specified and which does not test what RF-24 means.)*
+- [x] 9.3 RED (Xvfb with no EWMH-compliant WM): missing EWMH properties emit
       an explicit stderr diagnostic and the daemon falls back to
       `GetInputFocus`, without sitting idle waiting for events that will
       never arrive (RF-24, degradation scenario).
-- [ ] 9.4 GREEN: implement the `GetInputFocus` fallback path.
-- [ ] 9.5 RED: subscribes to `PropertyNotify` on `_NET_ACTIVE_WINDOW` (root
+- [x] 9.4 GREEN: implement the `GetInputFocus` fallback path. *(Was checked
+      over an enum variant with no behaviour; the actual polling landed
+      2026-09-17 — see task 9.16.)*
+- [x] 9.5 RED: subscribes to `PropertyNotify` on `_NET_ACTIVE_WINDOW` (root
       window) and to `PropertyChangeMask`/`StructureNotifyMask` on the active
       window; wakes exactly once per change with no query beforehand
       (window-capture "Active window changes while idle").
-- [ ] 9.6 GREEN: implement the subscription.
-- [ ] 9.7 RED: after every active-window change, an unconditional fresh read
+- [x] 9.6 GREEN: implement the subscription.
+- [x] 9.7 RED: after every active-window change, an unconditional fresh read
       of `_NET_WM_NAME`/`WM_NAME`, `_NET_WM_PID`, `WM_CLASS` occurs, never
       reusing cached values (window-capture "Property read follows every
       active-window change").
-- [ ] 9.8 GREEN: implement the unconditional read.
-- [ ] 9.9 RED: `WM_CLASS = "firefox\0Firefox"` + title + `_NET_WM_PID = 4821`
+- [x] 9.8 GREEN: implement the unconditional read.
+- [x] 9.9 RED: `WM_CLASS = "firefox\0Firefox"` + title + `_NET_WM_PID = 4821`
       capture `app_id = "Firefox"` correctly (window-capture "Metadata
       captured for a normal window").
-- [ ] 9.10 GREEN: implement `WindowInfo` extraction from the read properties.
-- [ ] 9.11 RED: `DISPLAY` + `WAYLAND_DISPLAY` (or `XDG_SESSION_TYPE=wayland`)
+- [x] 9.10 GREEN: implement `WindowInfo` extraction from the read properties.
+- [x] 9.11 RED: `DISPLAY` + `WAYLAND_DISPLAY` (or `XDG_SESSION_TYPE=wayland`)
       present → a reduced-reliability warning is emitted, daemon continues;
       native X11 → no warning (RF-29, both scenarios).
-- [ ] 9.12 GREEN: implement the XWayland startup check.
-- [ ] 9.13 REFACTOR: confirm `x11.rs` emits only `RawTitle`/owned
+- [x] 9.12 GREEN: implement the XWayland startup check.
+- [x] 9.13 REFACTOR: confirm `x11.rs` emits only `RawTitle`/owned
       `SourceEvent` values across its boundary — no `x11rb` type crosses into
       `tracker.rs` (design §1 layering).
+
+### Phase 9 corrections (2026-09-17, from an adversarial verification pass)
+
+Phase 9 was green — 106 tests, clippy and fmt clean — over three broken
+guarantees. These tasks record the corrections. Every one was driven by an
+observed RED against the code as it stood.
+
+- [x] 9.14 RED (Xvfb, **no window manager at all**, both EWMH atom names
+      already interned by an unrelated client): `X11Source::connect` must
+      report non-compliance. Observed RED: reported `Ewmh`. Second RED: a
+      compliant WM that exits leaves a stale `_NET_SUPPORTED` on the
+      server-owned root window and still reported `Ewmh`. Third RED (found by
+      mutation testing, not by reading): a *live* WM whose `_NET_SUPPORTED`
+      omits `_NET_ACTIVE_WINDOW` — RF-24's headline tiling-WM case — was not
+      covered by either of the first two, because both also lack a live check
+      window.
+- [x] 9.15 GREEN: correct all three layers, PRD first. `PRD.md` RF-24 and
+      `specs/window-capture/spec.md` replace `intern_atom(only_if_exists =
+      true)` — a query against the X server's *global atom-name table*, which
+      is server-wide, written by any client and outlives all of them — with
+      the root window's `_NET_SUPPORTED` contents plus a
+      `_NET_SUPPORTING_WM_CHECK` liveness probe. Both carry a dated
+      correction note. `src/x11.rs` implements the corrected check.
+- [x] 9.16 RED: on a WM-less display where the X server confirms the input
+      focus genuinely moved, the daemon must **observe** the change.
+      Observed RED: zero events in 5 s — `CaptureMode::InputFocusFallback`
+      was an enum variant with no behaviour behind it, and task 9.4 was
+      checked over its absence.
+- [x] 9.17 GREEN: implement the `GetInputFocus` degrade — query, resolve the
+      focused window to its top-level ancestor, and emit `RawEvent` only on a
+      real change. The polling interval stays a reactor concern (Phase 14).
+- [x] 9.18 RED: one `poll_for_event` call must drain until the queue is
+      genuinely empty. Observed RED: with an untranslated root-property event
+      queued ahead of a real `_NET_ACTIVE_WINDOW` change, a single call
+      returned `None` while the change sat pending — and since `x11rb` has
+      already drained the socket, the fd is no longer readable, so a `poll(2)`
+      reactor would sleep through it. The wakeup is lost, not delayed.
+- [x] 9.19 GREEN: loop until the queue is empty; add `drained_untranslated()`
+      so "no event" and "event I did not translate" are distinguishable; make
+      the docstring's drain-before-poll claim true rather than asserted.
+- [x] 9.20 RED/GREEN: the Xvfb harness dropped its readiness connection, so
+      the client count hit zero, the server performed a close-down reset, and
+      the next connect raced it — measured 1 failure in 30 runs. `XvfbGuard`
+      now holds that connection for the test's lifetime: 0 failures in 30
+      runs, then 0 in 25 more.
+- [x] 9.21 RED/GREEN (threat-matrix, same class as 10.11/10.12's
+      `/proc/<pid>/comm`): `WM_CLASS` is untrusted input from an arbitrary
+      application and reached diagnostics and SQLite verbatim, control
+      characters included. Observed RED: a class component of `"\n\x1b\x07"`
+      arrived as `app_id` unchanged. Control characters are now stripped at
+      the point of capture, with the `"?"` sentinel when nothing survives.
+- [x] 9.22 GREEN (cheap correctness, each with its own RED): `_NET_WM_PID =
+      0` yielded `Some(0)` and would have sent Phase 10 to `/proc/0/comm` —
+      now `None`; `long_length = u32::MAX` read a 200,000-character title
+      whole — now bounded to 2048 bytes, the widest encoding of RF-31's 512
+      characters; `subscribe_window` never released the previous window, so
+      subscriptions accumulated for the whole session and amplified 9.18 —
+      the subscription now moves instead of accumulating.
+- [x] 9.23 GREEN: `X11Source::connect` now emits its startup diagnostics to
+      stderr via `emit_startup_diagnostics`, so task 9.3's "emit an explicit
+      stderr diagnostic" is true at the point the condition is detected
+      rather than deferred to a `reactor.rs` that is still a Phase 14 stub.
+      The writer is injected so the emission is unit-tested against an
+      in-memory sink; `connect` still returns the strings for callers.
 
 ---
 

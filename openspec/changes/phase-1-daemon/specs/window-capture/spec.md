@@ -155,16 +155,37 @@ to the `unknown` state.
 
 **Traces:** RF-24
 
-At startup, the system MUST verify, using `intern_atom(only_if_exists =
-true)`, that `_NET_SUPPORTED` and `_NET_ACTIVE_WINDOW` exist. If either is
-missing, the system MUST emit an explicit diagnostic on stderr stating that
-the window manager does not appear to be EWMH-compliant, and MUST degrade to
-using `GetInputFocus` as an approximation of the active window rather than
-silently waiting for events that will never arrive.
+At startup, the system MUST verify EWMH compliance by reading the window
+manager's own root-window properties, and MUST NOT infer compliance from the
+X server's global atom-name table (see the correction note below):
+
+1. The system MUST read the `_NET_SUPPORTED` property of the **root window**
+   (type `ATOM[]`) and MUST confirm that `_NET_ACTIVE_WINDOW` is listed among
+   its atoms.
+2. The system MUST perform a `_NET_SUPPORTING_WM_CHECK` liveness probe: read
+   that property from the root window to obtain the window manager's check
+   window, then read the same property from that check window and confirm it
+   points back at the check window itself. A `BadWindow` result MUST be
+   treated as "no live window manager", not as a daemon failure.
+
+If either step fails, the system MUST emit an explicit diagnostic on stderr
+stating that the window manager does not appear to be EWMH-compliant, and
+MUST degrade to using `GetInputFocus` as an approximation of the active
+window rather than silently waiting for events that will never arrive.
+
+> **Mechanism corrected 2026-09-17.** This requirement previously prescribed
+> `intern_atom(only_if_exists = true)` on `_NET_SUPPORTED` and
+> `_NET_ACTIVE_WINDOW`. Interning queries the server's global atom-**name**
+> table, which is server-wide, populated by any client, and outliving all of
+> them; it carries no information about whether a window manager is running.
+> See PRD.md RF-24's correction note for the full rationale and the observed
+> proof. The requirement's intent is unchanged.
 
 #### Scenario: Window manager is EWMH-compliant
 
-- GIVEN `_NET_SUPPORTED` and `_NET_ACTIVE_WINDOW` both exist at startup
+- GIVEN a running window manager that lists `_NET_ACTIVE_WINDOW` in the root
+  window's `_NET_SUPPORTED` property
+- AND its `_NET_SUPPORTING_WM_CHECK` window exists and points at itself
 - WHEN the daemon performs its startup verification
 - THEN the daemon proceeds using `_NET_ACTIVE_WINDOW` subscription with no
   diagnostic emitted about EWMH compliance
@@ -179,6 +200,23 @@ silently waiting for events that will never arrive.
 - AND the daemon falls back to tracking the focused window via
   `GetInputFocus`
 - AND the daemon does not sit idle waiting for events that will never arrive
+
+#### Scenario: EWMH atom names are interned but no window manager is running
+
+- GIVEN a display with no window manager at all
+- AND an unrelated client (for example a GTK application) has already
+  interned the `_NET_SUPPORTED` and `_NET_ACTIVE_WINDOW` atom names
+- WHEN the daemon performs its startup verification
+- THEN the daemon reports the window manager as non-compliant
+- AND the daemon emits the diagnostic and falls back to `GetInputFocus`
+
+#### Scenario: Compliant window manager exits after declaring support
+
+- GIVEN a window manager that set `_NET_SUPPORTED` on the root window and
+  then exited, destroying its `_NET_SUPPORTING_WM_CHECK` window
+- WHEN the daemon performs its startup verification
+- THEN the liveness probe fails and the daemon reports non-compliance
+- AND the daemon emits the diagnostic and falls back to `GetInputFocus`
 
 ### Requirement: XWayland session detection
 
