@@ -64,3 +64,6 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # no `rmcp`, no `tokio`. Both arrive with the MCP subprocess in a later phase.
 
 [dev-dependencies]
+# Compile-fail proof for RF-28: no `From` conversion exists between `WallTs`
+# and `MonoInstant` in either direction (design.md D-9, tasks.md 2.7/2.8).
+trybuild = "1"

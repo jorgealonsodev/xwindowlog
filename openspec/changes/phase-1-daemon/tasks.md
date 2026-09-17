@@ -134,31 +134,31 @@ task boundaries already drawn, rather than compress.
 **Traces:** RF-28, design §2 D-9. Landed before `tracker.rs` per design §8's
 explicit ordering constraint.
 
-- [ ] 2.1 RED: `close_at(start, requested_end)` — forward case returns
+- [x] 2.1 RED: `close_at(start, requested_end)` — forward case returns
       `Close::Ok`; a backwards `requested_end < start` returns
       `Close::ClampedBackwards { to: start }` (interval-tracking "Backwards
       wall-clock jump during an open interval").
-- [ ] 2.2 GREEN: implement `WallTs`/`MonoInstant` newtypes (no `Sub` impl, no
+- [x] 2.2 GREEN: implement `WallTs`/`MonoInstant` newtypes (no `Sub` impl, no
       `From` in either direction between them — RF-28's "never derived from
       the other" enforced by absence of a conversion) and `close_at`.
-- [ ] 2.3 RED: `duration_secs(start, end)` never negative and never panics,
+- [x] 2.3 RED: `duration_secs(start, end)` never negative and never panics,
       including `i64::MIN`/`i64::MAX` inputs (T-2).
-- [ ] 2.4 GREEN: implement `duration_secs` via `checked_sub` +
+- [x] 2.4 GREEN: implement `duration_secs` via `checked_sub` +
       `.filter(|d| *d >= 0)` + `.unwrap_or(0)`. No bare `-` on a `WallTs`
       anywhere.
-- [ ] 2.5 RED: `backdated_close(start, now, idle)` clamps to `start` when
+- [x] 2.5 RED: `backdated_close(start, now, idle)` clamps to `start` when
       backdating past it would produce a negative duration (interval-tracking
       "Backdated absence close clamped by a backwards jump").
-- [ ] 2.6 GREEN: implement `backdated_close`.
-- [ ] 2.7 RED: a `trybuild` compile-fail fixture asserting no `From<WallTs>
+- [x] 2.6 GREEN: implement `backdated_close`.
+- [x] 2.7 RED: a `trybuild` compile-fail fixture asserting no `From<WallTs>
       for MonoInstant` (or the reverse) exists (interval-tracking "Monotonic
       and wall clocks are never substitutable").
-- [ ] 2.8 GREEN: add the `trybuild` fixture and wire it into `cargo test`.
-- [ ] 2.9 GREEN (no isolated RED — needed as test infrastructure for every
+- [x] 2.8 GREEN: add the `trybuild` fixture and wire it into `cargo test`.
+- [x] 2.9 GREEN (no isolated RED — needed as test infrastructure for every
       later module): implement the `Clock` trait, `SystemClock`, `FakeClock`
       (design §2 D-8) — this is what makes P2 a millisecond-scale test
       instead of a 24-hour one.
-- [ ] 2.10 REFACTOR: grep `clock.rs` for any bare `-` on a `WallTs` value;
+- [x] 2.10 REFACTOR: grep `clock.rs` for any bare `-` on a `WallTs` value;
       confirm none exists (design's stated reviewable convention).
 
 ---
@@ -358,6 +358,20 @@ phase's closing invariant (proposal §Intent).**
 - [ ] 6.11 REFACTOR: structure the transition function as one match arm per
       source state so it can be audited against the §11.1 table by
       inspection, side by side with `interval-tracking/spec.md`.
+- [ ] 6.12 REFACTOR (**interim-debt cleanup, added by the orchestrator after
+      PR 2**): remove the module-level `#![allow(dead_code, reason = "...")]`
+      from `src/clock.rs`, and from any other module that acquired one while
+      landing ahead of its consumers under design §8's ordering constraint.
+      By the end of this phase `clock.rs` has real consumers in `store.rs`
+      and `tracker.rs`, so the allow is no longer justified. A blanket
+      module-level `dead_code` allow that outlives its reason silently hides
+      genuinely dead code for the rest of the project's life — that is why
+      this is a task in the plan and not a note anyone has to remember.
+      Acceptance: `grep -rn 'allow(\s*$\|allow(dead_code' src/` returns
+      nothing, and `cargo clippy --all-targets -- -D warnings` is still
+      clean. If a specific item is legitimately unused at this point, narrow
+      the allow to that item with its own `reason`, never leave it at module
+      scope.
 
 ---
 

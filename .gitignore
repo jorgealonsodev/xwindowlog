@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# trybuild working directory for regenerated .stderr snapshots (tests/trybuild)
+/wip/
+
 # Local editor and tooling state
 .vscode/
 .atl/

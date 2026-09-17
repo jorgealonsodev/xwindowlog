@@ -1,0 +1,12 @@
+error[E0277]: the trait bound `MonoInstant: From<WallTs>` is not satisfied
+ --> tests/trybuild/fail/no_from_between_wallts_and_mono_instant.rs:9:42
+  |
+9 |     let _mono: clock::MonoInstant = wall.into();
+  |                                          ^^^^ unsatisfied trait bound
+  |
+help: the trait `From<WallTs>` is not implemented for `MonoInstant`
+ --> tests/trybuild/fail/../../../src/clock.rs
+  |
+  | pub struct MonoInstant(pub(crate) Instant);
+  | ^^^^^^^^^^^^^^^^^^^^^^
+  = note: required for `WallTs` to implement `Into<MonoInstant>`
