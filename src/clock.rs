@@ -19,6 +19,27 @@ use std::time::{Duration, Instant};
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct WallTs(pub(crate) i64);
 
+impl WallTs {
+    /// Constructs a `WallTs` from a raw Unix-epoch second count.
+    ///
+    /// Task 8.0b: `tests/invariants.rs` (a separate crate from this one) is
+    /// where P1/P2 now live, and both build synthetic `WallTs` values
+    /// directly (`FakeClock::new(WallTs(...))`, adversarial backwards
+    /// jumps). The tuple field stays `pub(crate)` — arithmetic on wall time
+    /// still only ever happens inside this module (RF-28) — so an explicit,
+    /// narrow constructor/accessor pair is what crosses the crate boundary,
+    /// not a wider field.
+    pub fn new(unix_secs: i64) -> Self {
+        WallTs(unix_secs)
+    }
+
+    /// Read access to the raw Unix-epoch second count, for the same reason
+    /// as `new` above.
+    pub fn as_unix_secs(self) -> i64 {
+        self.0
+    }
+}
+
 /// Monotonic instant. NEVER persisted, NEVER derived from `WallTs`, and vice
 /// versa (RF-28). There is deliberately no `From` in either direction.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]

@@ -430,7 +430,7 @@ phase's closing invariant (proposal §Intent).**
 
 **Traces:** P3, §14.3 ordering guarantee (proposal *Success Criteria*).
 
-- [ ] 8.0 GREEN (**added by the orchestrator after PR 6 — blocking, do this
+- [x] 8.0 GREEN (**added by the orchestrator after PR 6 — blocking, do this
       first**): introduce `src/lib.rs` and turn the crate into a lib plus a
       thin `src/main.rs` shell. The crate is currently binary-only, and a
       binary-only crate cannot expose its internals to `tests/*.rs`, so the
@@ -445,33 +445,33 @@ phase's closing invariant (proposal §Intent).**
       worth testing, and it also unblocks the Phase 2 MCP work later.
       Acceptance: `cargo test` still green with the same test count, and a
       trivial `tests/` file can `use xwindowlog::...` and compile.
-- [ ] 8.0b REFACTOR: move P1 and P2 from `tracker.rs`'s test module into
+- [x] 8.0b REFACTOR: move P1 and P2 from `tracker.rs`'s test module into
       `tests/invariants.rs`, the location PRD.md's M-1 line actually names,
       now that 8.0 makes it possible. Keep the per-bucket assertions exactly
       as they are — they are what catches a boundary shift, since the grand
       total is conserved by any such bug.
-- [ ] 8.1 RED (P3): a scripted sequence mixing excluded and non-excluded
+- [x] 8.1 RED (P3): a scripted sequence mixing excluded and non-excluded
       windows over total duration `D`, run once with exclusion active and
       once without, sums to `D` in both cases (privacy-filtering "Mixed
       excluded and non-excluded windows sum correctly").
-- [ ] 8.2 GREEN: wire `x11-shaped synthetic events → exclude.rs → tracker.rs
+- [x] 8.2 GREEN: wire `x11-shaped synthetic events → exclude.rs → tracker.rs
       → store.rs` end to end in an integration test harness (still
       `ScriptedSource`, no real X11 yet), fixing whatever P3 uncovers at the
       exclude/tracker boundary.
-- [ ] 8.3 RED: `SafeTitle` equality means two different raw titles that both
+- [x] 8.3 RED: `SafeTitle` equality means two different raw titles that both
       sanitize to `[hidden]` are equal, so an excluded app switching between
       hidden titles yields one continuous interval, not several — asserted
       explicitly (design §2 D-7's named consequence, DR-5), not left to be
       discovered.
-- [ ] 8.4 GREEN: confirm/adjust the tracker's title-change comparison to
+- [x] 8.4 GREEN: confirm/adjust the tracker's title-change comparison to
       operate on `SafeTitle`.
-- [ ] 8.5 RED: across the wired pipeline, no log call, panic message, or
+- [x] 8.5 RED: across the wired pipeline, no log call, panic message, or
       persisted value contains raw-title content before `exclude.rs` runs
       (§14.3 ordering guarantee, made executable rather than a review-
       checklist item only) — capture all log/panic output during a scripted
       run and assert no `RawTitle` substring appears downstream of exclusion.
-- [ ] 8.6 GREEN: fix any violation 8.5 finds.
-- [ ] 8.7 REFACTOR: re-run Phase 6's P1/P2 proptests with `exclude.rs` now
+- [x] 8.6 GREEN: fix any violation 8.5 finds.
+- [x] 8.7 REFACTOR: re-run Phase 6's P1/P2 proptests with `exclude.rs` now
       wired into the pipeline and confirm they still pass unchanged (no
       double-counting or overlap introduced by exclusion).
 

@@ -98,6 +98,19 @@ impl SafeTitle {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A fixed, empty `SafeTitle` — for contexts with no window title at
+    /// all (`tracker.rs`'s `WindowInfo::desktop()` sentinel, task 8.3/8.4),
+    /// not a window whose real title happens to be blank. Not a bypass of
+    /// the privacy boundary: it carries no untrusted content, only a
+    /// hardcoded empty string, and still routes through `from_sanitized`
+    /// rather than duplicating construction logic — this is exactly the
+    /// "separately named constructor with a comment justifying the trust"
+    /// pattern this module's own doc comment asks for, applied the first
+    /// time a genuine need for one arose.
+    pub fn empty() -> Self {
+        Self::from_sanitized(String::new())
+    }
 }
 
 /// `mode = "denylist"` (default) or `mode = "allowlist"` (RF-50). Same evaluation and storage
@@ -1010,6 +1023,15 @@ mod tests {
             result.title,
             SafeTitle::from_sanitized("PROJ-[REDACTED] - Jira".to_string())
         );
+    }
+
+    // ---- Task 8.3/8.4: SafeTitle::empty() (WindowInfo::desktop() sentinel) ----
+
+    /// `SafeTitle::empty()` is a fixed, hardcoded empty string, not a
+    /// pass-through of arbitrary content — the only assertion this needs.
+    #[test]
+    fn safe_title_empty_is_the_empty_string() {
+        assert_eq!(SafeTitle::empty().as_str(), "");
     }
 
     // ---- RF-9: config reload on SIGHUP (unit-level hot-swap; full E2E is task 15.7) ----

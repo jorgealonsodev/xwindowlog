@@ -6,15 +6,17 @@
 //! directly. That is what makes the state machine testable with synthetic
 //! event sequences and no X server, D-Bus connection, or database.
 //!
-//! **Deviation from design §2 D-8, documented rather than silent.** The
-//! design's literal `WindowInfo` uses `app_id: SafeAppId, title: SafeTitle`
-//! — `exclude.rs` types (D-7) that do not exist yet at this point in the
-//! build order (`exclude.rs` is Phase 7; this is Phase 5). `WindowInfo` and
-//! `SourceEvent::TitleChanged` use owned `String` here instead. This is not
-//! a gap being papered over: tasks 8.3/8.4 already plan to "confirm/adjust
-//! the tracker's title-change comparison to operate on `SafeTitle`" once
-//! `exclude.rs` exists, which is exactly this substitution, done in the
-//! order the task list itself expects.
+//! **Deviation from design §2 D-8, documented rather than silent — now
+//! partially resolved.** The design's literal `WindowInfo` uses
+//! `app_id: SafeAppId, title: SafeTitle` — `exclude.rs` types (D-7) that did
+//! not exist yet in Phase 5/6 (`exclude.rs` is Phase 7). `WindowInfo.title`
+//! and `SourceEvent::TitleChanged` used owned `String` through Phase 7;
+//! tasks 8.3/8.4 do the planned substitution to `SafeTitle`. `app_id` stays
+//! a plain `String`: `SafeAppId` is not defined anywhere in this crate (see
+//! `exclude.rs`'s own module doc, Deviation note — Phase 7 scoped that
+//! module to `RawTitle`/`SafeTitle` only), and RF-47's `hide_app` already
+//! substitutes the literal `"[hidden]"` string for `app_id`, the same
+//! mechanism `exclude.rs` uses for the title.
 //!
 //! **Deviations introduced in Phase 6, documented rather than silent.**
 //!
@@ -62,6 +64,7 @@
 use std::time::Duration;
 
 use crate::clock::{backdated_close, close_at, Close, MonoInstant, WallTs};
+use crate::exclude::SafeTitle;
 use crate::store::{IntervalState, NewInterval};
 
 /// RF-23's one-shot grace period after `DestroyNotify` on the tracked window.
@@ -78,12 +81,12 @@ const SENTINEL_APP: &str = "?";
 const SENTINEL_TITLE: &str = "-";
 
 /// Metadata for the currently active window (design §2 D-8). See the
-/// module-level deviation note re: `String` in place of `SafeAppId`/
-/// `SafeTitle`.
+/// module-level deviation note re: `String` still standing in for
+/// `SafeAppId` — `title` is `SafeTitle` as of task 8.3/8.4.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
     pub app_id: String,
-    pub title: String,
+    pub title: SafeTitle,
     pub pid: Option<u32>,
 }
 
@@ -95,7 +98,7 @@ impl WindowInfo {
     pub fn desktop() -> Self {
         WindowInfo {
             app_id: "(desktop)".to_string(),
-            title: String::new(),
+            title: SafeTitle::empty(),
             pid: None,
         }
     }
@@ -123,9 +126,10 @@ pub enum Timer {
 pub enum SourceEvent {
     /// `None` = desktop focused; legitimate activity, not absence.
     ActiveWindow(Option<WindowInfo>),
-    /// Pre-debounce, already sanitized (D-7 — see the module-level
-    /// deviation note: `String` stands in for `SafeTitle` until Phase 7/8).
-    TitleChanged(String),
+    /// Already sanitized (D-7): the only way to obtain a `SafeTitle` is
+    /// `Excluder::evaluate`, so this variant's own type is the proof that
+    /// §14.3's boundary was crossed before this event was constructed.
+    TitleChanged(SafeTitle),
     ActiveWindowDestroyed,
     UserIdle {
         idle_for: Duration,
@@ -226,7 +230,7 @@ enum PendingTimer {
     /// RF-30: the new title waiting to become stable, and the monotonic
     /// instant the debounce elapses.
     TitleDebounce {
-        pending_title: String,
+        pending_title: SafeTitle,
         deadline: MonoInstant,
     },
     /// RF-23: the wall-clock instant of the *original* `DestroyNotify` —
@@ -404,7 +408,7 @@ impl Tracker {
     /// title has been stable for `title_debounce_ms`. No transition happens
     /// here — only `ArmTimer`/`CancelTimer` bookkeeping; the actual close/
     /// open happens in `on_deadline_elapsed` when the debounce elapses.
-    fn on_title_changed(&mut self, new_title: String, now_mono: MonoInstant) -> Vec<Effect> {
+    fn on_title_changed(&mut self, new_title: SafeTitle, now_mono: MonoInstant) -> Vec<Effect> {
         let unchanged = matches!(&self.state, TrackerState::Active(w) if w.title == new_title);
         if unchanged {
             return Vec::new();
@@ -636,7 +640,11 @@ impl Tracker {
 fn new_interval(window: &WindowInfo) -> NewInterval {
     NewInterval {
         app: window.app_id.clone(),
-        title: window.title.clone(),
+        // `store.rs`'s `NewInterval.title` is a plain `String` (it names a
+        // storage column, not a trust boundary) — this is the one place
+        // that unwraps `SafeTitle`'s content, after sanitization has
+        // already happened (D-7).
+        title: window.title.as_str().to_string(),
         pid: window.pid,
         state: IntervalState::Active,
     }
@@ -656,10 +664,35 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, FakeClock};
 
+    /// Sanitizes `title` through a real, fixed pure-passthrough `Excluder`
+    /// (no exclusion rules, no secret redaction) to obtain a `SafeTitle` —
+    /// there is no other way to construct one outside `exclude.rs`
+    /// (`SafeTitle::from_sanitized` is private to that module), so every
+    /// test fixture in this module goes through the real boundary rather
+    /// than a tracker-local shortcut.
+    fn safe_title(title: &str) -> SafeTitle {
+        use crate::exclude::{Excluder, RawTitle};
+        static NO_OP: std::sync::LazyLock<Excluder> = std::sync::LazyLock::new(|| {
+            Excluder::from_toml_str(
+                r#"
+                sanitize_secrets = false
+                disable_default_excludes = [
+                    "password-managers", "banking-generic", "private-browsing",
+                    "gpg-ssh-prompts", "2fa-otp",
+                ]
+                "#,
+            )
+            .expect("valid literal config compiles")
+        });
+        NO_OP
+            .evaluate("test-fixture-app-never-excluded", RawTitle::new(title))
+            .title
+    }
+
     fn window(app_id: &str, title: &str, pid: Option<u32>) -> WindowInfo {
         WindowInfo {
             app_id: app_id.to_string(),
-            title: title.to_string(),
+            title: safe_title(title),
             pid,
         }
     }
@@ -785,7 +818,7 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         let arm_effects = send(
             &mut tracker,
-            SourceEvent::TitleChanged("vim".to_string()),
+            SourceEvent::TitleChanged(safe_title("vim")),
             &clock,
         );
         assert_eq!(arm_effects.len(), 1);
@@ -1060,7 +1093,7 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         let first_arm = send(
             &mut tracker,
-            SourceEvent::TitleChanged("T1".to_string()),
+            SourceEvent::TitleChanged(safe_title("T1")),
             &clock,
         );
         assert_eq!(first_arm.len(), 1);
@@ -1072,7 +1105,7 @@ mod tests {
         clock.advance(Duration::from_millis(300));
         let flicker_effects = send(
             &mut tracker,
-            SourceEvent::TitleChanged("T2".to_string()),
+            SourceEvent::TitleChanged(safe_title("T2")),
             &clock,
         );
         assert_eq!(flicker_effects.len(), 2);
@@ -1223,302 +1256,68 @@ mod tests {
         );
     }
 
-    // ---- Phase 6, task 6.9 (P2 — the phase's closing condition) ----
-    //
-    // interval-tracking spec.md "A full simulated day sums exactly": for a
-    // complete simulated day, `sum(active) + sum(afk) + sum(locked) +
-    // sum(paused) + sum(unknown)` must equal `end_of_day - start_of_day`
-    // exactly (PRD.md M-1). A test that only checks the grand total against
-    // the day's span would pass even if a bug shifted time from one state's
-    // bucket into an adjacent one (e.g. RF-23 closing at the wrong instant),
-    // because the closed/open chain's own telescoping sum is *structurally*
-    // always equal to `last_at - first_at`, independent of correctness at
-    // any interior boundary. So this test independently hand-derives the
-    // expected duration of every segment from the script below and asserts
-    // each state's bucket — not only the total — against that independent
-    // expectation.
+    // ---- Phase 8, tasks 8.3/8.4: SafeTitle equality collapses hidden
+    // titles (design §2 D-7's named consequence, DR-5) ----
 
+    /// D-7's named consequence: the tracker compares `SafeTitle`s, so two
+    /// different raw titles that both sanitize to `[hidden]` are *equal*,
+    /// and RF-3 produces no transition between them — an excluded app
+    /// switching between hidden titles yields one continuous interval, not
+    /// several. Both `SafeTitle`s are obtained through the real
+    /// `Excluder::evaluate` boundary (there is no other way to construct
+    /// one — `SafeTitle::from_sanitized` is private to `exclude.rs`).
+    ///
+    /// This does not compile against `SourceEvent::TitleChanged(String)` /
+    /// `WindowInfo { title: String, .. }` (Phase 5/6's shape) — passing a
+    /// `SafeTitle` where a `String` is expected is a type error. That
+    /// compile failure IS this task's RED: task 8.4's GREEN is the
+    /// `String` -> `SafeTitle` swap that makes it compile.
     #[test]
-    fn p2_full_simulated_day_sums_exactly() {
-        let clock = FakeClock::new(WallTs(0));
-        let mut tracker = Tracker::new();
-        let mut all_effects = Vec::new();
+    fn excluded_app_switching_between_hidden_titles_yields_one_continuous_interval() {
+        let excluder = crate::exclude::Excluder::from_toml_str(
+            r#"
+            [[exclude]]
+            app = "keepassxc"
+            "#,
+        )
+        .expect("valid config compiles");
 
-        let win_a = window("editor", "notes.md", Some(1));
-        let win_b = window("browser", "docs", Some(2));
-        let win_c = window("terminal", "zsh", Some(3));
-
-        // seg1 [0, 3_600) active(win_a) — startup.
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::ActiveWindow(Some(win_a)),
-            &clock,
-        ));
-
-        // seg2 [3_600, 5_100) active(win_b) — window change; ends early
-        // because seg3's close is backdated by 300s (RF-4).
-        clock.advance(Duration::from_secs(3_600));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::ActiveWindow(Some(win_b.clone())),
-            &clock,
-        ));
-
-        // seg3 [5_100, 6_000) afk — idle alarm positive transition, with a
-        // NON-ZERO `idle_for` on purpose. RF-4 requires the close to be
-        // backdated to `now - idle_for`, so the alarm firing at 5_400 after
-        // 300s of inactivity ends seg2 at 5_100, not 5_400. A zero here
-        // would leave the backdating path untested inside the invariant:
-        // the grand total is conserved by any boundary shift, so only the
-        // per-bucket assertions below can catch a backdating bug, and they
-        // can only catch it if backdating actually happens.
-        clock.advance(Duration::from_secs(1_800));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::UserIdle {
-                idle_for: Duration::from_secs(300),
-            },
-            &clock,
-        ));
-
-        // seg4 [6_000, 13_200) active(win_b) — idle alarm negative transition.
-        clock.advance(Duration::from_secs(600));
-        all_effects.extend(send(&mut tracker, SourceEvent::UserActive, &clock));
-
-        // seg5 [13_200, 15_000) locked — session lock.
-        clock.advance(Duration::from_secs(7_200));
-        all_effects.extend(send(&mut tracker, SourceEvent::SessionLocked, &clock));
-
-        // seg6 [15_000, 15_005) unknown — session unlock.
-        clock.advance(Duration::from_secs(1_800));
-        all_effects.extend(send(&mut tracker, SourceEvent::SessionUnlocked, &clock));
-
-        // seg7 [15_005, 18_605) active(win_b) — capture resumes.
-        clock.advance(Duration::from_secs(5));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::ActiveWindow(Some(win_b)),
-            &clock,
-        ));
-
-        // seg8 [18_605, 20_405) paused.
-        clock.advance(Duration::from_secs(3_600));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::Pause { until: None },
-            &clock,
-        ));
-
-        // seg9 [20_405, 20_415) unknown — X11 connection loss (also the
-        // path out of `paused`, since Resume is out of this phase's scope).
-        clock.advance(Duration::from_secs(1_800));
-        all_effects.extend(send(&mut tracker, SourceEvent::DisplayLost, &clock));
-
-        // seg10 [20_415, 24_015) active(win_c) — X11 connection recovery.
-        clock.advance(Duration::from_secs(10));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::ActiveWindow(Some(win_c.clone())),
-            &clock,
-        ));
-
-        // seg11 [24_015, 24_135) locked — suspend.
-        clock.advance(Duration::from_secs(3_600));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::PrepareForSleep(true),
-            &clock,
-        ));
-
-        // seg12 [24_135, 24_143) unknown — resume from suspend.
-        clock.advance(Duration::from_secs(120));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::PrepareForSleep(false),
-            &clock,
-        ));
-
-        // seg13 [24_143, 24_743) active(win_c) — capture resumes.
-        clock.advance(Duration::from_secs(8));
-        all_effects.extend(send(
-            &mut tracker,
-            SourceEvent::ActiveWindow(Some(win_c)),
-            &clock,
-        ));
-
-        // Closes seg13 and the day.
-        clock.advance(Duration::from_secs(600));
-        all_effects.extend(send(&mut tracker, SourceEvent::Shutdown, &clock));
-
-        let mut active_secs = 0u64;
-        let mut afk_secs = 0u64;
-        let mut locked_secs = 0u64;
-        let mut paused_secs = 0u64;
-        let mut unknown_secs = 0u64;
-        let mut boundaries: Vec<WallTs> = Vec::new();
-        let mut states: Vec<IntervalState> = Vec::new();
-
-        for effect in &all_effects {
-            match effect {
-                Effect::OpenOnly { at, open } | Effect::Transition { at, open } => {
-                    boundaries.push(*at);
-                    states.push(open.state);
-                }
-                Effect::CloseOnly { at } => {
-                    boundaries.push(*at);
-                }
-                Effect::Diagnostic(_) | Effect::ArmTimer(..) | Effect::CancelTimer(_) => {}
-            }
-        }
-
-        assert_eq!(
-            boundaries.len(),
-            14,
-            "expected 13 opened segments plus the closing shutdown boundary"
-        );
-
-        assert_eq!(
-            states.len(),
-            boundaries.len() - 1,
-            "every boundary except the final shutdown close must have opened a state"
-        );
-
-        // `states[i]` is the state opened at `boundaries[i]`, i.e. the state
-        // in effect over the span [boundaries[i], boundaries[i + 1]).
-        for i in 0..boundaries.len() - 1 {
-            let secs = crate::clock::duration_secs(boundaries[i], boundaries[i + 1]);
-            match states[i] {
-                IntervalState::Active => active_secs += secs,
-                IntervalState::Afk => afk_secs += secs,
-                IntervalState::Locked => locked_secs += secs,
-                IntervalState::Paused => paused_secs += secs,
-                IntervalState::Unknown => unknown_secs += secs,
-            }
-        }
-
-        // Independently hand-derived from the script's own advances above —
-        // not re-derived from `all_effects`, so a bug that shifts duration
-        // from one state's bucket into an adjacent one is still caught.
-        assert_eq!(active_secs, 20_100, "active bucket");
-        assert_eq!(afk_secs, 900, "afk bucket");
-        assert_eq!(locked_secs, 1_920, "locked bucket");
-        assert_eq!(paused_secs, 1_800, "paused bucket");
-        assert_eq!(unknown_secs, 23, "unknown bucket");
-
-        let start_of_day = *boundaries.first().unwrap();
-        let end_of_day = *boundaries.last().unwrap();
-        let total = active_secs + afk_secs + locked_secs + paused_secs + unknown_secs;
-        assert_eq!(
-            total,
-            crate::clock::duration_secs(start_of_day, end_of_day),
-            "M-1: active + afk + locked + paused + unknown must equal end_of_day - start_of_day exactly"
-        );
-    }
-}
-
-// ---- Phase 6, task 6.8 (P1) ----
-//
-// interval-tracking spec.md "Randomized event sequences never produce
-// overlapping intervals": for any sequence of events, no two resulting
-// intervals overlap. Since every emitted interval boundary comes from
-// `Effect::{OpenOnly, Transition, CloseOnly}.at`, and consecutive
-// transitions chain end=start through one shared field by construction,
-// "no overlap" reduces to "the sequence of emitted boundary instants is
-// non-decreasing" — this also exercises `open_or_transition`'s general
-// RF-28 clamp under randomly interleaved *backwards* wall-clock jumps,
-// not only forward-advancing time.
-#[cfg(test)]
-mod p1_proptest {
-    use super::*;
-    use crate::clock::{Clock, FakeClock};
-    use proptest::prelude::*;
-
-    fn window_for(idx: u8) -> WindowInfo {
-        match idx % 3 {
-            0 => WindowInfo {
-                app_id: "editor".to_string(),
-                title: "notes".to_string(),
-                pid: Some(1),
-            },
-            1 => WindowInfo {
-                app_id: "browser".to_string(),
-                title: "docs".to_string(),
-                pid: Some(2),
-            },
-            _ => WindowInfo {
-                app_id: "terminal".to_string(),
-                title: "zsh".to_string(),
-                pid: Some(3),
-            },
-        }
-    }
-
-    /// Decodes `(op, aux)` into one `SourceEvent`, covering every variant
-    /// the tracker actually consumes so the generator can reach every
-    /// branch of the transition table, not only the "happy path" rows.
-    fn event_for(op: u8, aux: u8) -> SourceEvent {
-        match op % 13 {
-            0 => SourceEvent::ActiveWindow(Some(window_for(aux))),
-            1 => SourceEvent::ActiveWindow(None),
-            2 => SourceEvent::TitleChanged(format!("title-{}", aux % 4)),
-            3 => SourceEvent::ActiveWindowDestroyed,
-            4 => SourceEvent::UserIdle {
-                idle_for: Duration::from_millis(u64::from(aux) * 100),
-            },
-            5 => SourceEvent::UserActive,
-            6 => SourceEvent::SessionLocked,
-            7 => SourceEvent::SessionUnlocked,
-            8 => SourceEvent::PrepareForSleep(aux.is_multiple_of(2)),
-            9 => SourceEvent::Pause { until: None },
-            10 => SourceEvent::DisplayLost,
-            11 => SourceEvent::DeadlineElapsed(Timer::TitleDebounce),
-            _ => SourceEvent::DeadlineElapsed(Timer::DestroyGrace),
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn p1_no_overlap_for_arbitrary_event_sequences(
-            ops in proptest::collection::vec(
-                (0u16..500, 0u8..13, 0u8..8, -50i64..50),
-                1..60,
+        let hidden_t1 = excluder
+            .evaluate(
+                "keepassxc",
+                crate::exclude::RawTitle::new("KeePassXC - workVault.kdbx"),
             )
-        ) {
-            let clock = FakeClock::new(WallTs(1_000_000));
-            let mut tracker = Tracker::new();
-            let mut boundaries: Vec<i64> = Vec::new();
+            .title;
+        let hidden_t2 = excluder
+            .evaluate(
+                "keepassxc",
+                crate::exclude::RawTitle::new("KeePassXC - personalVault.kdbx"),
+            )
+            .title;
+        // Different raw titles, same sanitized result — the premise DR-5
+        // relies on; asserted explicitly rather than assumed.
+        assert_eq!(hidden_t1, hidden_t2);
 
-            for (advance_secs, op, aux, backward_jump) in ops {
-                clock.advance(Duration::from_secs(u64::from(advance_secs)));
-                if backward_jump < 0 {
-                    // Adversarial input: an NTP-style backwards wall-clock
-                    // jump, independent of the (always forward) mono clock.
-                    clock.set_wall(WallTs(clock.now_wall().0 + backward_jump));
-                }
+        let clock = FakeClock::new(WallTs(50_000));
+        let mut tracker = Tracker::new();
+        send(
+            &mut tracker,
+            SourceEvent::ActiveWindow(Some(WindowInfo {
+                app_id: "keepassxc".to_string(),
+                title: hidden_t1,
+                pid: None,
+            })),
+            &clock,
+        );
 
-                let effects = tracker.on_event(
-                    event_for(op, aux),
-                    clock.now_wall(),
-                    clock.now_mono(),
-                );
-                for effect in effects {
-                    match effect {
-                        Effect::OpenOnly { at, .. }
-                        | Effect::Transition { at, .. }
-                        | Effect::CloseOnly { at } => boundaries.push(at.0),
-                        Effect::Diagnostic(_) | Effect::ArmTimer(..) | Effect::CancelTimer(_) => {}
-                    }
-                }
-            }
+        clock.advance(Duration::from_secs(5));
+        let effects = send(&mut tracker, SourceEvent::TitleChanged(hidden_t2), &clock);
 
-            for pair in boundaries.windows(2) {
-                prop_assert!(
-                    pair[0] <= pair[1],
-                    "intervals overlapped: boundary {} was followed by an earlier boundary {}",
-                    pair[0],
-                    pair[1]
-                );
-            }
-        }
+        assert_eq!(
+            effects,
+            Vec::new(),
+            "two different raw titles that both sanitize to [hidden] must compare \
+             equal, so no transition (and no debounce timer) is armed at all"
+        );
     }
 }
