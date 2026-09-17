@@ -380,47 +380,47 @@ phase's closing invariant (proposal §Intent).**
 **Traces:** RF-7, RF-8, RF-9 (unit half), RF-47, RF-48, RF-50, RF-51, P3
 (partial — sum invariant proven in Phase 8), design §2 D-7.
 
-- [ ] 7.1 GREEN (pure type definitions): define `RawTitle` (redacting
+- [x] 7.1 GREEN (pure type definitions): define `RawTitle` (redacting
       `Debug`, no `Display`) and `SafeTitle` (private field, single
       constructor `from_sanitized`, living in this module) per design §2 D-7.
-- [ ] 7.2 RED: a config rule matching `app_id` excludes the window; a rule
+- [x] 7.2 RED: a config rule matching `app_id` excludes the window; a rule
       matching title excludes the window; no raw title is ever logged during
       exclusion evaluation (RF-7, all three scenarios).
-- [ ] 7.3 GREEN: implement `$XDG_CONFIG_HOME/xwindowlog/config.toml` rule
+- [x] 7.3 GREEN: implement `$XDG_CONFIG_HOME/xwindowlog/config.toml` rule
       loading and `app_id`/title regex matching.
-- [ ] 7.4 RED: an excluded window's title stores as `[hidden]` with duration
+- [x] 7.4 RED: an excluded window's title stores as `[hidden]` with duration
       unchanged; two different excluded apps remain distinguishable by
       `app_id` (RF-8, both scenarios).
-- [ ] 7.5 GREEN: implement hidden-title substitution.
-- [ ] 7.6 RED: `hide_app = true` additionally hides `app_id`; a rule without
+- [x] 7.5 GREEN: implement hidden-title substitution.
+- [x] 7.6 RED: `hide_app = true` additionally hides `app_id`; a rule without
       `hide_app` leaves `app_id` visible (RF-47, both scenarios).
-- [ ] 7.7 GREEN: implement `hide_app`.
-- [ ] 7.8 RED, one task per RF-48 default-list category, **each with its own
+- [x] 7.7 GREEN: implement `hide_app`.
+- [x] 7.8 RED, one task per RF-48 default-list category, **each with its own
       case table** (design §6): 7.8a `password-managers`; 7.8b
       `banking-generic`; 7.8c `private-browsing`; 7.8d `gpg-ssh-prompts`;
       7.8e `2fa-otp`; plus `disable_default_excludes = ["banking-generic"]`
       disabling one category while others stay active, and an unmatched
       window (`app_id = "firefox"`) passing through unmodified.
-- [ ] 7.9 GREEN: implement the embedded default exclusion list (active with
+- [x] 7.9 GREEN: implement the embedded default exclusion list (active with
       no `config.toml`) and `disable_default_excludes`.
-- [ ] 7.10 RED: `mode = "allowlist"` excludes an app not matching any
+- [x] 7.10 RED: `mode = "allowlist"` excludes an app not matching any
       `[[include]]` rule and includes one that does (RF-50, both scenarios).
-- [ ] 7.11 GREEN: implement allowlist inversion as the same evaluation path,
+- [x] 7.11 GREEN: implement allowlist inversion as the same evaluation path,
       not a separate mechanism.
-- [ ] 7.12 RED, its own case table: a `ghp_...`-shaped token fragment is
+- [x] 7.12 RED, its own case table: a `ghp_...`-shaped token fragment is
       redacted; an email address fragment is redacted; `sanitize_secrets =
       false` leaves fragments intact; a title that both matches an exclusion
       rule and contains a redactable secret is stored as `[hidden]` with
       secret sanitization not separately visible (RF-51, all four scenarios).
-- [ ] 7.13 GREEN: implement `sanitize_secrets` — known token prefixes
+- [x] 7.13 GREEN: implement `sanitize_secrets` — known token prefixes
       (`sk-`, `ghp_`, `xox*-`, `AKIA`), hex ≥32 chars, base64-shaped ≥24
       chars, email addresses — as fragment-level `[REDACTED]` replacement,
       independent of and in addition to exclusion.
-- [ ] 7.14 RED: `Excluder` reload applies an updated rule set to subsequent
+- [x] 7.14 RED: `Excluder` reload applies an updated rule set to subsequent
       events without modifying already-recorded intervals (RF-9, unit-level —
       full `SIGHUP` E2E delivery is Phase 15's task 15.7).
-- [ ] 7.15 GREEN: implement config reload as an `Excluder` hot-swap.
-- [ ] 7.16 REFACTOR: confirm the crate has exactly one constructor path for
+- [x] 7.15 GREEN: implement config reload as an `Excluder` hot-swap.
+- [x] 7.16 REFACTOR: confirm the crate has exactly one constructor path for
       `SafeTitle` (`from_sanitized`, in this file) — there is no second way
       to build one.
 
