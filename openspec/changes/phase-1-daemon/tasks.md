@@ -221,34 +221,34 @@ explicit ordering constraint.
 
 **Traces:** RF-12, RF-13, RF-52, RF-53, RF-66, RNF-6 (durability trade-off).
 
-- [ ] 4.1 RED (D-1): within one `BEGIN IMMEDIATE` transaction, an
+- [x] 4.1 RED (D-1): within one `BEGIN IMMEDIATE` transaction, an
       `INSERT`-before-`UPDATE` ordering fails on `idx_intervals_one_open`; a
       `UPDATE`-before-`INSERT` ordering succeeds (interval-storage "Closing
       before opening within the transaction avoids a false collision").
-- [ ] 4.2 GREEN: implement `transition(at, open)`, `close_only(at)`,
+- [x] 4.2 GREEN: implement `transition(at, open)`, `close_only(at)`,
       `open_only(at, open)` per the `IntervalStore` trait (design §5),
       `BEGIN IMMEDIATE`, `UPDATE` before `INSERT`, no `RETURNING` (keeps the
       3.31 floor true — D-1 rationale point 3).
-- [ ] 4.3 RED: a single transition writes exactly one transaction that both
+- [x] 4.3 RED: a single transition writes exactly one transaction that both
       closes the old interval and opens the new one with identical
       `end`/`start` timestamps (RF-12 "A transition writes exactly one
       transaction").
-- [ ] 4.4 GREEN: fix any transaction-boundary gap 4.3 surfaces.
-- [ ] 4.5 RED: an interval spanning 23:50–00:10 attributes exactly 10 minutes
+- [x] 4.4 GREEN: fix any transaction-boundary gap 4.3 surfaces.
+- [x] 4.5 RED: an interval spanning 23:50–00:10 attributes exactly 10 minutes
       to the earlier day's query and exactly the remaining 10 to the later
       day's, with no gap or overlap; an open interval clips against the
       query's upper bound (`now`) (RF-66, both scenarios).
-- [ ] 4.6 GREEN: implement the clipping CTE (PRD §11.3) as a `store.rs` query
+- [x] 4.6 GREEN: implement the clipping CTE (PRD §11.3) as a `store.rs` query
       function, consumed later by Phase 16's `today`/`status`.
-- [ ] 4.7 RED: `prune --older-than <duration>` deletes closed intervals older
+- [x] 4.7 RED: `prune --older-than <duration>` deletes closed intervals older
       than cutoff, never the open interval; preserves `rules`/`projects` even
       when their only referencing intervals are pruned; deletes orphaned
       `apps`/`titles` excluding sentinels; the file shrinks after `VACUUM`;
       `prune`'s delete/VACUUM logic is reachable only via the CLI, never from
       within the daemon (RF-13, all five scenarios).
-- [ ] 4.8 GREEN: implement `prune()` — delete phase in one `BEGIN IMMEDIATE`
+- [x] 4.8 GREEN: implement `prune()` — delete phase in one `BEGIN IMMEDIATE`
       transaction with `busy_timeout = 5000`, `VACUUM` as a separate phase.
-- [ ] 4.9 RED (D-11, three contention cases): `VACUUM` succeeds against a
+- [x] 4.9 RED (D-11, three contention cases): `VACUUM` succeeds against a
       second idle connection; `VACUUM` retries (`busy_timeout = 10000`, 1s /
       2s / 4s) and succeeds once a concurrent `BEGIN IMMEDIATE` writer
       commits; `VACUUM` against a permanently-busy database exhausts its 3
@@ -257,16 +257,16 @@ explicit ordering constraint.
       survived (interval-storage "VACUUM contends with a live daemon
       connection"; cli-reporting "prune exits 2 when VACUUM exhausts its
       retries").
-- [ ] 4.10 GREEN: implement the bounded `VACUUM` retry ladder, the exact
+- [x] 4.10 GREEN: implement the bounded `VACUUM` retry ladder, the exact
       stderr message, and `--vacuum-only`.
-- [ ] 4.11 RED: `forget --from/--to` and `forget --window <id>` physically
+- [x] 4.11 RED: `forget --from/--to` and `forget --window <id>` physically
       delete matching rows (not a flag), clean up orphaned `apps`/`titles`,
       run `VACUUM`; without `--yes`, the command shows row count and range
       and waits for confirmation before deleting (RF-53, all scenarios).
-- [ ] 4.12 GREEN: implement `forget()` sharing `prune`'s delete/orphan-
+- [x] 4.12 GREEN: implement `forget()` sharing `prune`'s delete/orphan-
       cleanup/`VACUUM` machinery, differing only in the `WHERE` clause and
       the interactive-confirmation path (proposal's stated cost rationale).
-- [ ] 4.13 REFACTOR: grep the crate for any write to `intervals` outside
+- [x] 4.13 REFACTOR: grep the crate for any write to `intervals` outside
       `store.rs` — there should be none. This is re-checked in Phase 13 once
       the control socket exists, since that is the module most tempted to
       write directly.
@@ -874,6 +874,25 @@ RF-62, RF-19 (remaining).
 - [ ] 17.22 REFACTOR: confirm every subcommand's exit-code mapping lives in
       one place, so RF-60's contract stays reviewable as a single table
       against the code.
+- [ ] 17.23 RED (**added by the orchestrator after PR 4**): `prune` must not
+      report plain success when the on-disk file did not actually shrink.
+      `vacuum_with_retry` runs `PRAGMA wal_checkpoint(TRUNCATE)` after a
+      successful `VACUUM`, because in WAL mode `VACUUM` alone only lowers the
+      logical page count and the file stays at its old size while any
+      connection holds it open. That checkpoint is deliberately best-effort —
+      a blocked checkpoint must not fail an already-successful `VACUUM` — but
+      its result is currently discarded with `let _ =`, so a blocked
+      checkpoint is indistinguishable from a full one. RF-13 says retention
+      means the file shrinks *to the user*, so silently returning
+      `VacuumOutcome::Vacuumed` in that case tells them something untrue.
+      Write the test first: with the checkpoint unable to truncate, `prune`
+      reports reclaimed-but-not-yet-truncated, not plain success.
+- [ ] 17.24 GREEN: split the outcome (for example
+      `VacuumOutcome::VacuumedNotTruncated`) by inspecting the checkpoint
+      result instead of discarding it, and have the CLI say plainly that
+      space was reclaimed inside the database and the file will shrink once
+      other connections release it. Keep the checkpoint best-effort: report
+      the difference, never fail the `VACUUM` over it.
 
 ---
 
