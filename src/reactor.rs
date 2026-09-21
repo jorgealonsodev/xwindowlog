@@ -11,7 +11,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::Uid;
@@ -226,6 +226,23 @@ impl WakeupCause {
     }
 }
 
+/// Bound on `wakeup_causes` (R3-wakeup-causes-unbounded): a long-lived daemon must not grow
+/// this attribution record without limit, so it is a ring — oldest evicted first.
+const WAKEUP_CAUSES_CAP: usize = 256;
+
+/// Pushes onto the bounded ring, evicting the oldest entry once full, and recovers a poisoned
+/// lock instead of `expect`ing it, so another holder's panic degrades this record rather than
+/// taking the reactor thread down with it.
+fn record_wakeup_cause(causes: &Mutex<VecDeque<WakeupCause>>, cause: WakeupCause) {
+    let mut guard = causes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() >= WAKEUP_CAUSES_CAP {
+        guard.pop_front();
+    }
+    guard.push_back(cause);
+}
+
 /// A budgeted, userspace-buffered event source (design §2 D-6): X11's event queue and the
 /// logind bridge channel both drain multiple buffered items off one `POLLIN` notification, so
 /// a single read is not enough — the fd can be empty while the source's own queue is not. This
@@ -278,7 +295,8 @@ fn drain_budget<S: BudgetedSource>(
 /// `control::service_connection`'s blocking read, so a peer that trickles bytes in slowly
 /// cannot stall any other fd in the poll set. `deadline` is a single `Instant` captured at
 /// `accept()` time and re-checked on every wakeup, never reset per read — the same 1s budget
-/// `CLIENT_DEADLINE` names, enforced here instead of inside a blocking read loop.
+/// `CLIENT_DEADLINE` names, enforced here instead of inside a blocking read loop — and also
+/// folded into the `poll(2)` timeout, so an idle reactor still wakes to reap it.
 struct ControlClient {
     stream: std::os::unix::net::UnixStream,
     partial: Vec<u8>,
@@ -306,7 +324,7 @@ pub struct ReactorSource<X, L, C> {
     wakeups: Arc<AtomicU64>,
     /// Task 14.10/D-12's attribution record: one [`WakeupCause`] pushed per `poll(2)` return,
     /// behind the same `Arc` pattern as `wakeups` for cross-thread test observability.
-    wakeup_causes: Arc<Mutex<Vec<WakeupCause>>>,
+    wakeup_causes: Arc<Mutex<VecDeque<WakeupCause>>>,
     /// Events already drained but not yet handed to the caller (design §2 D-6's
     /// per-wakeup drain can find more than one item; `WindowSource::next_event` hands them out
     /// one at a time without polling again while this is non-empty).
@@ -343,7 +361,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
             deadlines: Deadlines::new(),
             clock,
             wakeups: Arc::new(AtomicU64::new(0)),
-            wakeup_causes: Arc::new(Mutex::new(Vec::new())),
+            wakeup_causes: Arc::new(Mutex::new(VecDeque::new())),
             pending: VecDeque::new(),
             paused: false,
         }
@@ -364,7 +382,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
 
     /// A shared, clonable handle onto the per-wakeup attribution record (task 14.10), readable
     /// independently of `self` for the same reason as [`Self::wakeups_handle`].
-    pub fn wakeup_causes_handle(&self) -> Arc<Mutex<Vec<WakeupCause>>> {
+    pub fn wakeup_causes_handle(&self) -> Arc<Mutex<VecDeque<WakeupCause>>> {
         Arc::clone(&self.wakeup_causes)
     }
 
@@ -390,7 +408,17 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
 /// `self` borrowed (task 14.9).
 fn accept_one(listener: &UnixListener, clients: &mut Vec<ControlClient>, own_uid: Uid) {
     let mut stderr = io::stderr();
-    match control::accept(listener, clients.len(), own_uid, &mut stderr) {
+    let outcome = control::accept(listener, clients.len(), own_uid, &mut stderr);
+    apply_accept_outcome(outcome, clients);
+}
+
+/// A persistent `accept()` failure never consumes the queued connection, so unthrottled it
+/// spins `poll(2)` at 100% CPU. Split from [`accept_one`] so a test can inject a synthetic
+/// `Err` without exhausting real fds.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+fn apply_accept_outcome(outcome: io::Result<Accepted>, clients: &mut Vec<ControlClient>) {
+    match outcome {
         Ok(Accepted::Client(stream)) => {
             let _ = stream.set_nonblocking(true);
             clients.push(ControlClient {
@@ -400,7 +428,10 @@ fn accept_one(listener: &UnixListener, clients: &mut Vec<ControlClient>, own_uid
             });
         }
         Ok(Accepted::RejectedUid) | Ok(Accepted::RejectedCapacity) => {}
-        Err(_) => {}
+        Err(e) => {
+            eprintln!("xwindowlog: accept() failed, backing off {ACCEPT_ERROR_BACKOFF:?}: {e}");
+            std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+        }
     }
 }
 
@@ -547,14 +578,20 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
 
                 let deadlines = &self.deadlines;
                 let clock = &self.clock;
+                // R3-client-deadline-unenforced: fold the earliest client deadline in too.
+                let client_deadline = self.clients.iter().map(|c| c.deadline).min();
                 poll_retrying(
                     || {
                         let now = clock.now_mono();
-                        let base = timeout_for_wakeup(deadlines, now, x11_backlog, dbus_backlog);
-                        match deadline {
-                            Some(at) => min_timeout(base, timeout_until(now, at)),
-                            None => base,
+                        let mut timeout =
+                            timeout_for_wakeup(deadlines, now, x11_backlog, dbus_backlog);
+                        if let Some(at) = deadline {
+                            timeout = min_timeout(timeout, timeout_until(now, at));
                         }
+                        if let Some(at) = client_deadline {
+                            timeout = min_timeout(timeout, timeout_until(now, MonoInstant(at)));
+                        }
+                        timeout
                     },
                     |timeout| poll(&mut pfds, timeout),
                 )
@@ -589,10 +626,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                     cause.external_deadline_elapsed = true;
                 }
             }
-            self.wakeup_causes
-                .lock()
-                .expect("wakeup_causes lock poisoned")
-                .push(cause);
+            record_wakeup_cause(&self.wakeup_causes, cause);
 
             if self.pending.is_empty() && cause.external_deadline_elapsed {
                 return Ok(None);
@@ -833,8 +867,10 @@ mod tests {
 
         // Three connections queued in the listener's backlog before the reactor ever polls —
         // a connect storm. None of them ever sends a byte, so no `SourceEvent` is ever
-        // produced; the reactor keeps waking up (each wakeup finding the listener still
-        // backlogged) until the external deadline elapses.
+        // produced; the reactor keeps waking up until the external deadline elapses. That
+        // 200ms deadline stays shorter than `CLIENT_DEADLINE`'s 1s, so all three survive here
+        // regardless of R3-client-deadline-unenforced's fix; see
+        // `an_idle_client_past_its_deadline_is_reaped_and_frees_its_slot` for the reaping case.
         let _clients: Vec<UnixStream> = (0..3)
             .map(|_| UnixStream::connect(&socket_path).expect("connect must succeed"))
             .collect();
@@ -856,6 +892,131 @@ mod tests {
              (observed {}); a lower count means the listener was drained in a single wakeup's \
              accept loop instead of being throttled to one accept() per wakeup",
             reactor.wakeups()
+        );
+    }
+
+    // --- R3-client-deadline-unenforced: an idle client's own 1s budget must wake the reactor
+    // even when nothing else does -----------------------------------------------------------
+
+    #[test]
+    fn an_idle_client_past_its_deadline_is_reaped_and_frees_its_slot() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+
+        // Real `SystemClock`: `ControlClient::deadline` is always a real `Instant`, so only
+        // real wall-clock time can prove it was folded into the poll timeout.
+        let (x11, _x11_writer) = SyntheticSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, socket_path) = bind_test_listener("idle-client-reaped");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+
+        // One silent client, never sending a byte. The external deadline (1.5s) is set just
+        // past `CLIENT_DEADLINE` (1s) so the call is bounded either way; only whether the
+        // client's own budget was folded into the poll timeout decides whether it is reaped
+        // *before* that unrelated external deadline fires.
+        let _client = UnixStream::connect(&socket_path).expect("connect must succeed");
+        let deadline = MonoInstant(Instant::now() + Duration::from_millis(1500));
+        let event = reactor
+            .next_event(Some(deadline))
+            .expect("next_event must not error");
+
+        assert_eq!(event, None, "a silent client never produces a SourceEvent");
+        assert_eq!(
+            reactor.clients.len(),
+            0,
+            "a client that never completes a line must be reaped once its own 1s deadline \
+             elapses, freeing its MAX_CONCURRENT_CLIENTS slot, instead of surviving until an \
+             unrelated external deadline"
+        );
+    }
+
+    // --- R3-accept-failure-spin: a persistent accept() failure must back off, never spin ----
+
+    #[test]
+    fn apply_accept_outcome_adds_the_client_on_success() {
+        let mut clients = Vec::new();
+        let (_listener, socket_path) = bind_test_listener("apply-outcome-success");
+        let stream = UnixStream::connect(&socket_path).expect("connect must succeed");
+        apply_accept_outcome(Ok(Accepted::Client(stream)), &mut clients);
+        assert_eq!(
+            clients.len(),
+            1,
+            "a successful accept must add exactly one client"
+        );
+    }
+
+    #[test]
+    fn apply_accept_outcome_ignores_a_rejection_without_backing_off() {
+        let mut clients = Vec::new();
+        let started = Instant::now();
+        apply_accept_outcome(Ok(Accepted::RejectedCapacity), &mut clients);
+        apply_accept_outcome(Ok(Accepted::RejectedUid), &mut clients);
+        assert!(clients.is_empty(), "a rejection must never add a client");
+        assert!(
+            started.elapsed() < ACCEPT_ERROR_BACKOFF,
+            "a rejection already consumed its fd and must not pay the hard-failure backoff"
+        );
+    }
+
+    #[test]
+    fn apply_accept_outcome_backs_off_on_a_hard_failure_instead_of_spinning() {
+        let mut clients = Vec::new();
+        let started = Instant::now();
+        apply_accept_outcome(
+            Err(io::Error::other(
+                "synthetic EMFILE for R3-accept-failure-spin",
+            )),
+            &mut clients,
+        );
+        assert!(clients.is_empty(), "a hard failure must never add a client");
+        assert!(
+            started.elapsed() >= ACCEPT_ERROR_BACKOFF,
+            "a persistent accept() failure that does not consume the queued connection must be \
+             throttled, or the listener stays ready and poll(2) spins at 100% CPU"
+        );
+    }
+
+    // --- R3-wakeup-causes-unbounded: the attribution record must be bounded and lock-poison
+    // safe -------------------------------------------------------------------------------------
+
+    #[test]
+    fn wakeup_causes_ring_never_grows_past_its_cap() {
+        let causes = Mutex::new(VecDeque::new());
+        for _ in 0..(WAKEUP_CAUSES_CAP + 5) {
+            record_wakeup_cause(&causes, WakeupCause::default());
+        }
+        assert_eq!(
+            causes.lock().unwrap().len(),
+            WAKEUP_CAUSES_CAP,
+            "a long-lived daemon must never grow this record past its cap"
+        );
+    }
+
+    #[test]
+    fn record_wakeup_cause_survives_a_poisoned_lock() {
+        let causes = Mutex::new(VecDeque::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = causes.lock().unwrap();
+            panic!("simulate another holder (e.g. a test observer) panicking with the lock held");
+        }));
+        assert!(causes.is_poisoned());
+
+        // Must not panic: a poisoned lock degrades this record, it does not take the reactor
+        // thread down with it.
+        record_wakeup_cause(&causes, WakeupCause::default());
+        assert_eq!(
+            causes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
         );
     }
 
