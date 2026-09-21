@@ -13,3 +13,6 @@
 *.db
 *.db-wal
 *.db-shm
+
+# Engram memories in portable form — never commit these.
+.engram/chunks/
