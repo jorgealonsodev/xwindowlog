@@ -476,6 +476,23 @@ impl X11Source {
         self.mode
     }
 
+    /// The connection's raw fd, for a Phase 15 composition adapter to register in the
+    /// reactor's `poll(2)` set (design §2 D-2's fd0). `RustConnection<DefaultStream>`'s stream
+    /// implements `AsRawFd` on unix (verified: `x11rb-0.13.2/src/rust_connection/stream.rs`);
+    /// this is the one place that reaches through `.stream()` to expose it, so no other module
+    /// needs to know `x11rb`'s stream type at all.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.conn.stream().as_raw_fd()
+    }
+
+    /// Flushes any outbound requests before this wakeup's drain (design §2 D-6: "outbound
+    /// requests must actually leave" — a `SYNC` alarm re-arm or an EWMH probe sent earlier this
+    /// iteration must reach the server even when nothing new arrived to read).
+    pub fn flush(&self) -> Result<(), ConnectionError> {
+        self.conn.flush()
+    }
+
     /// How many X11 events this source has drained without translating them into a
     /// `RawEvent` — the "event I did not translate" half of `poll_for_event`'s outcomes,
     /// which its `Option` return type collapses into the same `None` as "queue empty".

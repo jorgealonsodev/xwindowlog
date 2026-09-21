@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use nix::fcntl::{Flock, FlockArg};
 
+mod adapters;
 mod config;
 
 use config::{ConfigError, DaemonConfig};
