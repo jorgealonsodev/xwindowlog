@@ -23,7 +23,7 @@ use xwindowlog::logind::{
 use xwindowlog::reactor::ReactorSource;
 use xwindowlog::signals::SelfPipe;
 use xwindowlog::store::{IntervalStore as _, Store, StoreError};
-use xwindowlog::tracker::{SourceEvent, WindowSource as _};
+use xwindowlog::tracker::{SourceEvent, Timer, WindowSource as _};
 use xwindowlog::x11::{X11InitError, X11Source};
 
 mod adapters;
@@ -358,6 +358,31 @@ fn run_event_loop(
 
         let now_wall = clock.now_wall();
         let now_mono = clock.now_mono();
+
+        // RF-49's `--minutes N` dual-clock expiry (design §2 D-5): the monotonic deadline is
+        // derived from a WallTs comparison, never a direct WallTs->MonoInstant conversion
+        // (RF-28's own prohibition — see clock.rs::MonoInstant::checked_add's doc). A manual
+        // `resume` already clears the reactor's own `paused` flag inside `decide`
+        // (reactor.rs, Phase 14); an unattended expiry has no other path back in, hence
+        // `mark_resumed`.
+        match &event {
+            SourceEvent::Pause {
+                until: Some(target),
+            } => {
+                let delta = target
+                    .as_unix_secs()
+                    .saturating_sub(now_wall.as_unix_secs())
+                    .max(0) as u64;
+                if let Some(deadline) = now_mono.checked_add(std::time::Duration::from_secs(delta))
+                {
+                    reactor.arm_timer(Timer::PauseExpiry, deadline);
+                }
+            }
+            SourceEvent::Resume => reactor.cancel_timer(Timer::PauseExpiry),
+            SourceEvent::DeadlineElapsed(Timer::PauseExpiry) => reactor.mark_resumed(),
+            _ => {}
+        }
+
         let effects = tracker.on_event(event, now_wall, now_mono);
         apply_effects(effects, store, reactor)?;
 

@@ -407,6 +407,15 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     pub fn logind_mut(&mut self) -> &mut L {
         &mut self.logind
     }
+
+    /// Marks this module's own `paused` bookkeeping resumed (task 15.11). A manual `resume`
+    /// request already updates it internally (`decide`, driven through `service_clients`), but
+    /// an unattended `PauseExpiry` deadline firing has no other path back into this module —
+    /// `self.paused`'s own doc says it is "expected to move in lockstep with the `PauseExpiry`
+    /// deadline once Phase 15 arms/cancels it"; this is that lockstep's other half.
+    pub fn mark_resumed(&mut self) {
+        self.paused = false;
+    }
 }
 
 /// One `accept()` per wakeup at most (design §2 D-6: "bounds the cost of a connect storm
@@ -1241,5 +1250,41 @@ mod tests {
 
         let event = reactor.next_event(None).expect("next_event must not error");
         assert_eq!(event, Some(SourceEvent::PrepareForSleep(true)));
+    }
+
+    // --- 15.11: `mark_resumed` is the automatic-`PauseExpiry` half of the `paused`
+    // bookkeeping's lockstep (the manual `resume` half is already covered by
+    // `pause_while_paused_and_resume_while_not_paused_return_state_errors` in control.rs) ---
+
+    #[test]
+    fn mark_resumed_lets_a_new_pause_request_succeed_instead_of_already_paused() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer, _logind_writer, socket_path) =
+            make_reactor_source("mark-resumed");
+
+        let mut first_client = UnixStream::connect(&socket_path).expect("connect must succeed");
+        first_client
+            .write_all(b"{\"v\":1,\"cmd\":\"pause\"}\n")
+            .expect("write must succeed");
+        let first = reactor.next_event(None).expect("next_event must not error");
+        assert!(
+            matches!(first, Some(SourceEvent::Pause { .. })),
+            "the first pause request must succeed: {first:?}"
+        );
+
+        // Simulates task 15.11's own automatic-expiry path (`main.rs`'s event loop calling
+        // this on `SourceEvent::DeadlineElapsed(Timer::PauseExpiry)`), not a real deadline.
+        reactor.mark_resumed();
+
+        let mut second_client = UnixStream::connect(&socket_path).expect("connect must succeed");
+        second_client
+            .write_all(b"{\"v\":1,\"cmd\":\"pause\"}\n")
+            .expect("write must succeed");
+        let second = reactor.next_event(None).expect("next_event must not error");
+        assert!(
+            matches!(second, Some(SourceEvent::Pause { .. })),
+            "mark_resumed must clear the paused bookkeeping so a fresh pause request succeeds \
+             instead of answering AlreadyPaused: {second:?}"
+        );
     }
 }

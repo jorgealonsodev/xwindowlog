@@ -711,3 +711,69 @@ fn sigkill_then_restart_recovers_to_a_consistent_state() {
     let status = second.0.wait().expect("wait");
     assert_eq!(status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------------------------
+// 15.11: the control-socket Pause/Resume wiring reaches tracker.rs/store.rs end to end.
+// (The `pause`/`resume` CLI subcommands themselves are Phase 17 — this drives the same wire
+// protocol `xwindowlog::control::send_pause`/`send_resume` directly, as any future CLI client
+// will, exercising exactly this phase's reactor -> tracker -> store composition.)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn control_socket_pause_then_resume_reaches_the_store() {
+    let env = DaemonEnv::new("pause-resume-wiring");
+    let wm = FakeWm::connect(env.xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let mut daemon = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(&env, &wm, "app-c", "Doc C", Duration::from_secs(10));
+
+    let socket_path = xwindowlog::control::socket_path(env.runtime_dir.path());
+    let response =
+        xwindowlog::control::send_pause(&socket_path, None).expect("send_pause must succeed");
+    assert!(
+        matches!(response, xwindowlog::control::Response::Ok { .. }),
+        "pause against an active daemon must succeed: {response:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(row) = most_recent_interval(&env.db_path()) {
+            if row.state == "paused" && row.end.is_none() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no open `paused` interval appeared within 5s of a successful pause request"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let response =
+        xwindowlog::control::send_resume(&socket_path).expect("send_resume must succeed");
+    assert!(
+        matches!(response, xwindowlog::control::Response::Ok { .. }),
+        "resume against a paused daemon must succeed: {response:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(row) = most_recent_interval(&env.db_path()) {
+            if row.state == "unknown" && row.end.is_none() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resume must transition to an open `unknown` interval within 5s \
+             (tracker.rs::on_event_paused's Resume arm)"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    send_signal(daemon.0.id(), nix::sys::signal::Signal::SIGTERM);
+    let status = daemon.0.wait().expect("wait");
+    assert_eq!(status.code(), Some(0));
+}

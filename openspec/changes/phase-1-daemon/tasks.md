@@ -961,7 +961,7 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
       by restart recovers to a consistent state").
 - [x] 15.10 GREEN: fix whatever full-process composition gaps 15.9 surfaces
       (this is the RNF-6/RF-36 end-to-end proof, not new logic).
-- [ ] 15.11 GREEN: wire the control-socket `Pause`/`Resume` requests (Phase
+- [x] 15.11 GREEN: wire the control-socket `Pause`/`Resume` requests (Phase
       13) through `tracker.rs`'s `Pause{until}`/`Resume` events to
       `store.rs`, including the `PauseExpiry` deadline (monotonic + wall-
       clock target per design's dual-clock rationale) — RED tests for full

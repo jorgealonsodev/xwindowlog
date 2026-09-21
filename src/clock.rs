@@ -45,6 +45,20 @@ impl WallTs {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct MonoInstant(pub(crate) Instant);
 
+impl MonoInstant {
+    /// Adds `dur` to this instant, `None` only on an unrepresentable overflow (never observed
+    /// for any deadline this crate computes). Phase 15's composition (task 15.11) needs to
+    /// derive a monotonic `PauseExpiry` deadline from a wall-clock `--minutes N` target without
+    /// ever converting a `WallTs` into a `MonoInstant` directly (RF-28's own prohibition — see
+    /// the module doc, "there is deliberately no `From` in either direction"): the caller
+    /// compares two `WallTs` values to get a plain `Duration` first, the same "compare wall,
+    /// arm mono" shape `close_at`/`backdated_close` already use, and only adds that `Duration`
+    /// here.
+    pub fn checked_add(self, dur: Duration) -> Option<Self> {
+        self.0.checked_add(dur).map(MonoInstant)
+    }
+}
+
 /// Result of clamping a computed `end` against an interval's `start` (RF-28).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Close {
@@ -229,6 +243,18 @@ mod tests {
                 to: start
             }
         );
+    }
+
+    #[test]
+    fn mono_instant_checked_add_advances_by_the_given_duration() {
+        let clock = FakeClock::new(WallTs(0));
+        let start = clock.now_mono();
+
+        let deadline = start
+            .checked_add(Duration::from_secs(30))
+            .expect("a 30s addition must not overflow");
+
+        assert!(deadline.0 >= start.0 + Duration::from_secs(30));
     }
 
     #[test]
