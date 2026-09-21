@@ -925,12 +925,12 @@ Changes rationale for splitting this module out).
 instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
 (wiring), RNF-6 (E2E).
 
-- [ ] 15.1 GREEN (proven by the E2E tests below, which need the whole daemon
+- [x] 15.1 GREEN (proven by the E2E tests below, which need the whole daemon
       wired): implement the `clap` CLI skeleton recognizing `daemon`,
       `status`, `today`, `pause`, `resume`, `prune`, `forget`, `completions`
       (RF-19 partial — argument parsing and dispatch only; subcommand
       behavior is Phases 16-17).
-- [ ] 15.2 GREEN: implement config load/validate from
+- [x] 15.2 GREEN: implement config load/validate from
       `$XDG_CONFIG_HOME/xwindowlog/config.toml` (or defaults if absent),
       wiring `afk_threshold_seconds`, `title_debounce_ms`, `mode`,
       `sanitize_secrets`, `status_show_title`, `retention_days`,
