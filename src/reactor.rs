@@ -10,7 +10,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -192,6 +192,40 @@ where
     }
 }
 
+/// Design §2 D-6 / daemon-lifecycle's own attribution requirement: every wakeup is
+/// attributable to a real monitored source having data ready or a real armed deadline having
+/// elapsed, never an unconditional periodic re-check. Recorded once per `poll(2)` return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WakeupCause {
+    pub x11_ready: bool,
+    pub logind_ready: bool,
+    pub signals_ready: bool,
+    pub listener_ready: bool,
+    pub client_ready: bool,
+    /// A named `Timer` (design §2 D-2) fired.
+    pub deadline_due: bool,
+    /// The caller's own `WindowSource::next_event` `deadline` parameter elapsed.
+    pub external_deadline_elapsed: bool,
+    /// A budgeted drain hit its cap last iteration, forcing a `PollTimeout::ZERO` re-check of
+    /// a source already known to have more buffered work (design §2 D-6) — attributable to
+    /// that known backlog, not an unconditional re-check.
+    pub forced_by_backlog: bool,
+}
+
+impl WakeupCause {
+    /// Whether at least one real cause explains this wakeup.
+    pub fn is_attributable(&self) -> bool {
+        self.x11_ready
+            || self.logind_ready
+            || self.signals_ready
+            || self.listener_ready
+            || self.client_ready
+            || self.deadline_due
+            || self.external_deadline_elapsed
+            || self.forced_by_backlog
+    }
+}
+
 /// A budgeted, userspace-buffered event source (design §2 D-6): X11's event queue and the
 /// logind bridge channel both drain multiple buffered items off one `POLLIN` notification, so
 /// a single read is not enough — the fd can be empty while the source's own queue is not. This
@@ -270,6 +304,9 @@ pub struct ReactorSource<X, L, C> {
     /// read it without owning `self`, including while `next_event` is blocked inside `poll()`
     /// on another thread.
     wakeups: Arc<AtomicU64>,
+    /// Task 14.10/D-12's attribution record: one [`WakeupCause`] pushed per `poll(2)` return,
+    /// behind the same `Arc` pattern as `wakeups` for cross-thread test observability.
+    wakeup_causes: Arc<Mutex<Vec<WakeupCause>>>,
     /// Events already drained but not yet handed to the caller (design §2 D-6's
     /// per-wakeup drain can find more than one item; `WindowSource::next_event` hands them out
     /// one at a time without polling again while this is non-empty).
@@ -291,6 +328,11 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
         own_uid: Uid,
         clock: C,
     ) -> Self {
+        // Defense in depth: `accept_one` is only ever called after `poll(2)` reports the
+        // listener readable, so this should never block either way — but a spurious `POLLIN`
+        // (or a future refactor that calls it from elsewhere) must return `WouldBlock` rather
+        // than stall the whole reactor on the daemon's single thread.
+        let _ = listener.set_nonblocking(true);
         ReactorSource {
             x11,
             logind,
@@ -301,6 +343,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
             deadlines: Deadlines::new(),
             clock,
             wakeups: Arc::new(AtomicU64::new(0)),
+            wakeup_causes: Arc::new(Mutex::new(Vec::new())),
             pending: VecDeque::new(),
             paused: false,
         }
@@ -317,6 +360,12 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     /// reactor thread itself).
     pub fn wakeups_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.wakeups)
+    }
+
+    /// A shared, clonable handle onto the per-wakeup attribution record (task 14.10), readable
+    /// independently of `self` for the same reason as [`Self::wakeups_handle`].
+    pub fn wakeup_causes_handle(&self) -> Arc<Mutex<Vec<WakeupCause>>> {
+        Arc::clone(&self.wakeup_causes)
     }
 
     /// Arms one of the five deadline kinds (design §2 D-2), for both this module's own
@@ -477,7 +526,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
             // Nothing anywhere is immediately available: this is the one branch that actually
             // calls `poll(2)` (RNF-2's "zero wakeups" is this branch never being reached while
             // idle, not a fast loop around it).
-            let listener_ready = {
+            let (listener_ready, mut cause) = {
                 // Safety: `x11`/`logind`/`signals` only expose a `RawFd`, not `AsFd`; each
                 // fd is kept alive by its owning field for this entire block, and no fd is
                 // closed before `pfds` (and the `BorrowedFd`s it holds) are dropped at the end
@@ -511,7 +560,16 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                 )
                 .map_err(|e| SourceError(format!("poll(2) failed: {e}")))?;
 
-                pfds[3].any().unwrap_or(false)
+                let cause = WakeupCause {
+                    x11_ready: pfds[0].any().unwrap_or(false),
+                    logind_ready: pfds[1].any().unwrap_or(false),
+                    signals_ready: pfds[2].any().unwrap_or(false),
+                    listener_ready: pfds[3].any().unwrap_or(false),
+                    client_ready: pfds[4..].iter().any(|p| p.any().unwrap_or(false)),
+                    forced_by_backlog: x11_backlog || dbus_backlog,
+                    ..WakeupCause::default()
+                };
+                (cause.listener_ready, cause)
             };
             self.wakeups.fetch_add(1, Ordering::Relaxed);
 
@@ -520,16 +578,24 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
             }
 
             let now = self.clock.now_mono();
-            for timer in self.deadlines.take_due(now) {
+            let due = self.deadlines.take_due(now);
+            cause.deadline_due = !due.is_empty();
+            for timer in due {
                 self.pending.push_back(SourceEvent::DeadlineElapsed(timer));
             }
 
-            if self.pending.is_empty() {
-                if let Some(at) = deadline {
-                    if now.0 >= at.0 {
-                        return Ok(None);
-                    }
+            if let Some(at) = deadline {
+                if now.0 >= at.0 {
+                    cause.external_deadline_elapsed = true;
                 }
+            }
+            self.wakeup_causes
+                .lock()
+                .expect("wakeup_causes lock poisoned")
+                .push(cause);
+
+            if self.pending.is_empty() && cause.external_deadline_elapsed {
+                return Ok(None);
             }
         }
     }
@@ -739,6 +805,126 @@ mod tests {
 
         x11_delay.join().expect("writer thread must not panic");
         dribble.join().expect("dribble thread must not panic");
+    }
+
+    // --- 14.8: control-socket accept() is limited to one per wakeup (bounds a connect-storm
+    // without a rate limiter, D-6) -----------------------------------------------------------
+
+    #[test]
+    fn accept_is_limited_to_one_connection_per_wakeup() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+
+        // A real `SystemClock`, not `FakeClock`: this test lets `poll(2)` actually block on a
+        // real wall-clock deadline, so the deadline-elapsed check inside `next_event` (which
+        // reads `self.clock.now_mono()`) must observe real time passing too, or it can never
+        // see the external deadline as reached.
+        let (x11, _x11_writer) = SyntheticSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, socket_path) = bind_test_listener("connect-storm");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+
+        // Three connections queued in the listener's backlog before the reactor ever polls —
+        // a connect storm. None of them ever sends a byte, so no `SourceEvent` is ever
+        // produced; the reactor keeps waking up (each wakeup finding the listener still
+        // backlogged) until the external deadline elapses.
+        let _clients: Vec<UnixStream> = (0..3)
+            .map(|_| UnixStream::connect(&socket_path).expect("connect must succeed"))
+            .collect();
+
+        let deadline = MonoInstant(Instant::now() + Duration::from_millis(200));
+        let event = reactor
+            .next_event(Some(deadline))
+            .expect("next_event must not error");
+
+        assert_eq!(event, None, "no client ever completed a request line");
+        assert_eq!(
+            reactor.clients.len(),
+            3,
+            "all three connections must eventually be accepted"
+        );
+        assert!(
+            reactor.wakeups() >= 3,
+            "accepting three connections one per wakeup costs at least three poll(2) wakeups \
+             (observed {}); a lower count means the listener was drained in a single wakeup's \
+             accept loop instead of being throttled to one accept() per wakeup",
+            reactor.wakeups()
+        );
+    }
+
+    // --- 14.10: a wakeup is always attributable to a real monitored source or a real armed
+    // deadline, never an unconditional periodic re-check (daemon-lifecycle "A wakeup is
+    // attributable to a real event or a real deadline") ---------------------------------------
+
+    #[test]
+    fn every_recorded_wakeup_is_attributable_to_a_real_source_or_deadline() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+
+        // A real `SystemClock` (see `accept_is_limited_to_one_connection_per_wakeup`'s doc):
+        // the second scripted wakeup relies on a real external deadline actually elapsing.
+        let (mut x11, x11_writer) = SyntheticSource::pair();
+        x11.push_event(SourceEvent::UserActive);
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("attribution");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+        let causes = reactor.wakeup_causes_handle();
+
+        // Scripted run: one real fd-readiness wakeup (the synthetic X11 change) followed by
+        // one real external-deadline wakeup (`next_event`'s own `deadline` parameter expiring
+        // with nothing else pending).
+        let mut writer = x11_writer;
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            writer
+                .write_all(b"x")
+                .expect("write to the synthetic x11 fd must succeed");
+        });
+        let first = reactor.next_event(None).expect("next_event must not error");
+        handle.join().expect("writer thread must not panic");
+        assert_eq!(first, Some(SourceEvent::UserActive));
+
+        let deadline = MonoInstant(Instant::now() + Duration::from_millis(100));
+        let second = reactor
+            .next_event(Some(deadline))
+            .expect("next_event must not error");
+        assert_eq!(second, None);
+
+        let recorded = causes.lock().unwrap();
+        assert!(
+            recorded.len() >= 2,
+            "the scripted run must have produced at least two wakeups"
+        );
+        for (i, cause) in recorded.iter().enumerate() {
+            assert!(
+                cause.is_attributable(),
+                "wakeup #{i} ({cause:?}) was recorded with no attributable cause at all — an \
+                 unconditional periodic re-check, exactly what daemon-lifecycle's scenario \
+                 forbids"
+            );
+        }
+        assert!(
+            recorded.iter().any(|c| c.x11_ready),
+            "the first wakeup must be attributable to the synthetic X11 fd"
+        );
+        assert!(
+            recorded.iter().any(|c| c.external_deadline_elapsed),
+            "the second wakeup must be attributable to the external deadline elapsing"
+        );
     }
 
     // --- 14.3: budget exhaustion yields PollTimeout::ZERO, never a sleep -------------------
