@@ -795,19 +795,19 @@ against the code as it stood, never by reverting a fix afterwards.
       `locked`, opens `unknown` (RF-5, all three scenarios).
 - [x] 12.3 GREEN: implement `LockedHint`-as-source-of-truth surfacing
       `SourceEvent::SessionLocked`/`SessionUnlocked`.
-- [ ] 12.4 RED: session resolves via `GetSessionByPID(<own PID>)`, never
+- [x] 12.4 RED: session resolves via `GetSessionByPID(<own PID>)`, never
       `$XDG_SESSION_ID`; a failed resolution logs, continues without
       lock/suspend awareness, and retries later rather than failing startup
       (RF-26, both scenarios).
-- [ ] 12.5 GREEN: implement `resolve_session` and the retry-needed signal
+- [x] 12.5 GREEN: implement `resolve_session` and the retry-needed signal
       consumed by Phase 14's `SessionReresolve` deadline.
-- [ ] 12.6 RED: the daemon takes a `delay` inhibitor at startup;
+- [x] 12.6 RED: the daemon takes a `delay` inhibitor at startup;
       `PrepareForSleep(true)` closes and commits the current interval
       (recorded as `locked`) before releasing the inhibitor;
       `PrepareForSleep(false)` opens `unknown` and re-acquires the inhibitor;
       a refused `Inhibit()` logs a warning and continues without blocking
       startup (RF-27, all three scenarios).
-- [ ] 12.7 GREEN: implement inhibitor acquisition/release and the
+- [x] 12.7 GREEN: implement inhibitor acquisition/release and the
       `PrepareForSleep` handlers.
 - [ ] 12.8 RED: no D-Bus session bus reachable at startup → a warning is
       logged, session-state features are unavailable, window capture

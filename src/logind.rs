@@ -1,11 +1,12 @@
 //! `SessionMonitor` trait (D-13) and `FakeSessionMonitor`, its test double.
 //!
-//! **Phase 12, tasks 12.1-12.3 (RF-5).** `SessionMonitor` is the in-house trait D-13
-//! specifies; `FakeSessionMonitor` drives every degraded path with no D-Bus at all.
-//! `LockedHintTracker` turns raw `LockedHint` samples into the
+//! **Phase 12, tasks 12.1-12.7 (RF-5, RF-26, RF-27).** `SessionMonitor` is the in-house
+//! trait D-13 specifies; `FakeSessionMonitor` drives every degraded path with no D-Bus at
+//! all. `LockedHintTracker` turns raw `LockedHint` samples into the
 //! `SourceEvent::SessionLocked`/`SessionUnlocked` edges `tracker.rs` already knows how to
 //! apply (RF-5) — a `Lock()` D-Bus signal is not even a variant this type accepts, so it
-//! cannot, by construction, produce a transition.
+//! cannot, by construction, produce a transition. `resolve_session_at_startup` and
+//! `SuspendInhibitor` cover RF-26/RF-27's retry-and-degrade paths.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -140,6 +141,76 @@ impl LockedHintTracker {
     }
 }
 
+/// Whether Phase 14's `SessionReresolve` deadline needs arming after a startup resolution
+/// attempt (RF-26, task 12.4/12.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionResolution {
+    Resolved,
+    /// Carries a ready-to-log diagnostic; resolution failure is never fatal.
+    RetryNeeded(String),
+}
+
+/// RF-26: resolves via `SessionMonitor::resolve_session` (which is `GetSessionByPID` in the
+/// real impl, never `$XDG_SESSION_ID`), and reports whether a retry is owed instead of
+/// treating failure as fatal.
+pub fn resolve_session_at_startup(monitor: &mut dyn SessionMonitor, pid: u32) -> SessionResolution {
+    match monitor.resolve_session(pid) {
+        Ok(()) => SessionResolution::Resolved,
+        Err(err) => SessionResolution::RetryNeeded(format!(
+            "session resolution failed, continuing without lock/suspend awareness, retrying later: {err:?}"
+        )),
+    }
+}
+
+/// Coordinates the RF-27 `delay` sleep inhibitor across `PrepareForSleep` transitions (tasks
+/// 12.6/12.7). Sequencing the inhibitor release *after* the interval closure is committed is
+/// the reactor's job (Phase 14, not built yet); this type only performs the acquire/release
+/// and reports whether the inhibitor is currently held.
+#[derive(Debug, Default)]
+pub struct SuspendInhibitor {
+    held: bool,
+}
+
+impl SuspendInhibitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Attempts to take the inhibitor. A refusal (e.g. restrictive polkit) logs — returns a
+    /// diagnostic, never panics or blocks — and startup continues regardless (RF-27 scenario
+    /// 3).
+    pub fn acquire(&mut self, monitor: &mut dyn SessionMonitor) -> Option<String> {
+        match monitor.take_sleep_inhibitor() {
+            Ok(()) => {
+                self.held = true;
+                None
+            }
+            Err(err) => {
+                self.held = false;
+                Some(format!(
+                    "sleep inhibitor refused, continuing best-effort: {err:?}"
+                ))
+            }
+        }
+    }
+
+    /// `PrepareForSleep(true)`: the caller has already committed the closing interval; this
+    /// releases the descriptor so suspend may proceed.
+    pub fn release_for_suspend(&mut self, monitor: &mut dyn SessionMonitor) {
+        monitor.release_sleep_inhibitor();
+        self.held = false;
+    }
+
+    /// `PrepareForSleep(false)`: resume re-acquires the inhibitor.
+    pub fn reacquire_after_resume(&mut self, monitor: &mut dyn SessionMonitor) -> Option<String> {
+        self.acquire(monitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +331,77 @@ mod tests {
                 }
             }]
         );
+    }
+
+    // --- 12.4/12.5: session resolution + retry signal (RF-26) --------------------------
+
+    #[test]
+    fn resolve_session_at_startup_succeeds_via_the_pid_path() {
+        let mut fake = FakeSessionMonitor::new();
+        fake.push_resolve_session(Ok(()));
+
+        let result = resolve_session_at_startup(&mut fake, 999);
+
+        assert_eq!(result, SessionResolution::Resolved);
+        assert_eq!(fake.resolved_pids, vec![999]);
+    }
+
+    #[test]
+    fn resolve_session_at_startup_failure_requests_a_retry_without_failing() {
+        let mut fake = FakeSessionMonitor::new();
+        fake.push_resolve_session(Err(SessionError("no session yet".to_string())));
+
+        let result = resolve_session_at_startup(&mut fake, 999);
+
+        match result {
+            SessionResolution::RetryNeeded(diagnostic) => {
+                assert!(diagnostic.contains("retrying later"));
+            }
+            SessionResolution::Resolved => panic!("expected RetryNeeded, got Resolved"),
+        }
+    }
+
+    // --- 12.6/12.7: suspend inhibitor (RF-27, all three scenarios) ----------------------
+
+    #[test]
+    fn suspend_inhibitor_close_then_release_on_prepare_for_sleep_true() {
+        let mut fake = FakeSessionMonitor::new();
+        fake.push_take_inhibitor(Ok(()));
+        let mut inhibitor = SuspendInhibitor::new();
+        assert_eq!(inhibitor.acquire(&mut fake), None);
+        assert!(inhibitor.is_held());
+
+        inhibitor.release_for_suspend(&mut fake);
+
+        assert!(!inhibitor.is_held());
+        assert_eq!(fake.release_calls, 1);
+    }
+
+    #[test]
+    fn suspend_inhibitor_reacquires_on_resume() {
+        let mut fake = FakeSessionMonitor::new();
+        fake.push_take_inhibitor(Ok(()));
+        fake.push_take_inhibitor(Ok(()));
+        let mut inhibitor = SuspendInhibitor::new();
+        inhibitor.acquire(&mut fake);
+        inhibitor.release_for_suspend(&mut fake);
+
+        let diagnostic = inhibitor.reacquire_after_resume(&mut fake);
+
+        assert_eq!(diagnostic, None);
+        assert!(inhibitor.is_held());
+    }
+
+    #[test]
+    fn suspend_inhibitor_refused_warns_and_continues() {
+        let mut fake = FakeSessionMonitor::new();
+        fake.push_take_inhibitor(Err(SessionError("polkit refused".to_string())));
+        let mut inhibitor = SuspendInhibitor::new();
+
+        let diagnostic = inhibitor.acquire(&mut fake);
+
+        assert!(!inhibitor.is_held());
+        let message = diagnostic.expect("refusal must produce a diagnostic");
+        assert!(message.contains("refused"));
     }
 }
