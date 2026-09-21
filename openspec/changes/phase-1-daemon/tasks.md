@@ -853,14 +853,14 @@ Threat-matrix rows: "Process integration — control socket" (design §7).
       `Response`/`Envelope`/`ErrCode` types (design §5), `SO_PEERCRED`
       check-before-read, the 4-concurrent-client cap with 1s per-client
       deadline, and stale-socket `unlink()`-before-bind.
-- [ ] 13.6 RED: the `pause`/`resume` CLI client code never writes to
+- [x] 13.6 RED: the `pause`/`resume` CLI client code never writes to
       `intervals` — a module-boundary check that `control.rs`'s client-side
       helper has no dependency on `store` (daemon-lifecycle "pause/resume
       clients never write intervals directly").
-- [ ] 13.7 GREEN: implement the CLI-side `pause`/`resume` request senders
+- [x] 13.7 GREEN: implement the CLI-side `pause`/`resume` request senders
       (used by Phase 17's subcommands) as a thin client with no `store`
       dependency.
-- [ ] 13.8 REFACTOR: confirm `signals.rs`/`control.rs` unit-test in isolation
+- [x] 13.8 REFACTOR: confirm `signals.rs`/`control.rs` unit-test in isolation
       from `reactor.rs` — they expose raw fds/event sources; `reactor.rs`
       (Phase 14) is what polls them.
 

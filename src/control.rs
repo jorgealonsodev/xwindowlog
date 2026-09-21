@@ -314,6 +314,39 @@ pub fn service_connection<W: Write>(
     Ok(Serviced::Responded(response))
 }
 
+// ---------------------------------------------------------------------------------------------
+// CLI client (RF-49; tasks 13.6, 13.7). The pause/resume CLI processes only send a request and
+// read the daemon's reply over this socket (daemon-lifecycle scenario: pause/resume clients
+// never write intervals directly). This section's module boundary is enforced below by a
+// textual scan of this exact block for any dependency on the interval-persistence module.
+// ---------------------------------------------------------------------------------------------
+
+/// Sends `Pause` to the daemon listening at `socket_path` and returns its decoded reply.
+pub fn send_pause(socket_path: &Path, minutes: Option<u32>) -> io::Result<Response> {
+    send_request(socket_path, Request::Pause { minutes })
+}
+
+/// Sends `Resume` to the daemon listening at `socket_path` and returns its decoded reply.
+pub fn send_resume(socket_path: &Path) -> io::Result<Response> {
+    send_request(socket_path, Request::Resume)
+}
+
+fn send_request(socket_path: &Path, req: Request) -> io::Result<Response> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    let envelope = Envelope {
+        v: PROTOCOL_VERSION,
+        req,
+    };
+    let mut body = serde_json::to_vec(&envelope).map_err(io::Error::other)?;
+    body.push(b'\n');
+    stream.write_all(&body)?;
+
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    let response: Response = serde_json::from_str(reply.trim_end()).map_err(io::Error::other)?;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +584,32 @@ mod tests {
             })
         ));
         let _ = std::fs::remove_file(&path2);
+    }
+
+    // --- 13.6: the CLI client section above never depends on `store` -----------------------
+
+    #[test]
+    fn cli_client_never_depends_on_store() {
+        let source = include_str!("control.rs");
+        let block_start = source
+            .find("// CLI client (RF-49; tasks 13.6, 13.7)")
+            .expect("control.rs defines the CLI client section (task 13.7)");
+        let section_end = source[block_start..]
+            .find("#[cfg(test)]")
+            .expect("the CLI client section is followed by the test module");
+        let block = &source[block_start..block_start + section_end];
+        assert!(
+            !block.to_ascii_lowercase().contains("store"),
+            "the pause/resume CLI client must never depend on crate::store \
+             (daemon-lifecycle: pause/resume clients never write intervals directly)"
+        );
+        assert!(
+            block.contains("fn send_pause"),
+            "the client section must define send_pause"
+        );
+        assert!(
+            block.contains("fn send_resume"),
+            "the client section must define send_resume"
+        );
     }
 }
