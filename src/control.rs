@@ -259,12 +259,21 @@ struct VersionOnly {
 /// Parses `v` before the internally-tagged `cmd` body, so a future-version request answers
 /// `UnsupportedVersion` even when its body isn't valid v1 grammar (R3) — `{"v":2}` and
 /// `{"v":2,"cmd":"<future>"}` never reach the full `Envelope` decode below.
-/// One non-blocking attempt to advance a request line, for a future poll-driven reactor
-/// (Phase 14) to call between servicing other fds instead of blocking this thread on one
-/// connection (R4). Chosen over further shrinking `CLIENT_DEADLINE`, which would still block
-/// the caller, just for less time. Residual bound: this call itself never blocks, but the
-/// caller still owns re-polling before its own deadline elapses — `reactor.rs` (Phase 14),
-/// unwritten, is what will drive that loop.
+/// One non-blocking attempt to advance a request line, for the poll-driven reactor (Phase 14,
+/// `reactor.rs`'s `service_clients`) to call between servicing other fds instead of blocking
+/// this thread on one connection (R4). Chosen over further shrinking `CLIENT_DEADLINE`, which
+/// would still block the caller, just for less time. Residual bound: this call itself never
+/// blocks, but the caller still owns re-polling before its own deadline elapses.
+///
+/// **Non-blocking mode is a permanent property of any stream passed here, not restored on
+/// return.** `set_nonblocking(true)` is never undone, deliberately: the alternative (restoring
+/// the previous mode on every return path) invites exactly the mixed-mode bug this note exists
+/// to prevent — a caller that alternates this call with a blocking read on the *same* stream
+/// would see `WouldBlock` instead of waiting. Every connection this reactor accepts is driven
+/// exclusively through this function for its entire lifetime; [`service_connection`] (and the
+/// blocking [`read_request_line`] it wraps) is a separate, mutually exclusive path for a
+/// stream that has never been handed to this function. Never call `service_connection` on a
+/// stream that has passed through `try_read_request_line`, or vice versa.
 pub fn try_read_request_line(
     stream: &mut UnixStream,
     partial: &mut Vec<u8>,
@@ -316,6 +325,14 @@ pub enum Serviced {
 /// Services one connection [`accept`] already credential-checked: read the bounded request
 /// line, decide against `state`, and reply. Never touches `store`; the caller (`reactor.rs`)
 /// owns the actual `intervals` write once it accepts the decided [`Response`].
+///
+/// **Dead in production as of Phase 14.** `reactor.rs`'s `service_clients` drives
+/// [`try_read_request_line`] exclusively (its doc explains why the two paths cannot mix on one
+/// stream), so this function's only remaining callers are its own tests below, which is what
+/// keeps [`read_request_line`]'s blocking behavior covered. Kept as public API rather than
+/// deleted: Phases 15-17 may still want a synchronous one-shot client-side helper built on the
+/// same shape, and this function's tests are the only proof `read_request_line`'s bounded
+/// timeout/oversize/deadline behavior is correct.
 pub fn service_connection<W: Write>(
     mut stream: UnixStream,
     state: PauseState,
