@@ -966,10 +966,10 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
       `store.rs`, including the `PauseExpiry` deadline (monotonic + wall-
       clock target per design's dual-clock rationale) — RED tests for full
       pause/resume behavior live in Phase 17 with the CLI client.
-- [ ] 15.12 REFACTOR: confirm `main.rs` contains only composition (clap,
+- [x] 15.12 REFACTOR: confirm `main.rs` contains only composition (clap,
       flock, config, reactor construction, effect application) with no
       state-machine or storage logic duplicated from `tracker.rs`/`store.rs`.
-- [ ] 15.13 REFACTOR (**final interim-debt sweep, added by the orchestrator
+- [x] 15.13 REFACTOR (**final interim-debt sweep, added by the orchestrator
       after PR 5**): once `main.rs` wires the daemon together, every module
       has real consumers, so no module-level `#![allow(dead_code)]` is
       justified any more. Remove every one of them — `tracker.rs` acquired

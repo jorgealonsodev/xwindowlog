@@ -10,7 +10,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::Uid;
@@ -19,8 +19,18 @@ use serde::{Deserialize, Serialize};
 /// Wire protocol version this daemon speaks (design §5).
 const PROTOCOL_VERSION: u8 = 1;
 
-/// Request body cap; a line missing its trailing `\n` within this many bytes is rejected
-/// (design §7 threat matrix, §5 wire-protocol constraints).
+/// Request body cap (design §7 threat matrix, §5 wire-protocol constraints).
+///
+/// **Known gap, disclosed rather than silently dropped (Phase 15 task 15.13):** this bound was
+/// only enforced by the blocking `read_request_line`/`service_connection` pair, which the
+/// dead-code sweep below removes because `reactor.rs`'s non-blocking `try_read_request_line`
+/// (task 14's CRITICAL fix) is the only production reader and does not itself apply it — its
+/// `partial: Vec<u8>` grows unbounded until a `\n` arrives or `ControlClient`'s 1s
+/// `CLIENT_DEADLINE` reaps the connection. Design §5's own threat-model rationale ("the control
+/// socket does not widen the threat model" — a same-uid peer already has full read access, and
+/// the exposure is bounded to one second of local, same-uid byte-feeding) is why this is
+/// recorded as a disclosed gap rather than fixed under this sweep: applying it belongs with
+/// `reactor.rs`'s already-shipped, already-tested Phase 14 code, not this REFACTOR.
 pub const MAX_REQUEST_BYTES: usize = 4096;
 
 /// At most this many clients hold a transient fd at once; the next one is accepted and
@@ -160,7 +170,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 /// Outcome of accepting one connection off the listener.
 #[derive(Debug)]
 pub enum Accepted {
-    /// Accepted and credential-checked; ready for [`service_connection`].
+    /// Accepted and credential-checked; ready for `reactor.rs`'s non-blocking
+    /// [`try_read_request_line`].
     Client(UnixStream),
     /// The peer's `SO_PEERCRED` uid did not match; closed without reading any bytes.
     RejectedUid,
@@ -201,64 +212,14 @@ fn peer_uid(stream: &UnixStream) -> io::Result<Uid> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Bounded read + request handling (tasks 13.4a, 13.4b, 13.4e, 13.4f, 13.5)
+// Request handling (tasks 13.4b, 13.4f, 13.5)
 // ---------------------------------------------------------------------------------------------
-
-enum RequestError {
-    /// No trailing `\n` arrived within `CLIENT_DEADLINE`.
-    Timeout,
-    /// More than `MAX_REQUEST_BYTES` arrived without a trailing `\n`.
-    Oversized,
-    Io(io::Error),
-}
-
-/// Reads one `\n`-terminated line, bounded by both size and total elapsed time. The deadline is
-/// tracked against a single [`Instant`] and re-applied on every `read()` call, so a peer that
-/// trickles bytes in slowly cannot extend the 1s budget by resetting a per-call timeout
-/// (rust-testing skill: every blocking read on this socket must be covered, not just the
-/// first).
-fn read_request_line(stream: &mut UnixStream, deadline: Duration) -> Result<Vec<u8>, RequestError> {
-    let start = Instant::now();
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed >= deadline {
-            return Err(RequestError::Timeout);
-        }
-        stream
-            .set_read_timeout(Some(deadline - elapsed))
-            .map_err(RequestError::Io)?;
-        match stream.read(&mut byte) {
-            Ok(0) => return Err(RequestError::Timeout),
-            Ok(_) if byte[0] == b'\n' => return Ok(line),
-            Ok(_) => {
-                line.push(byte[0]);
-                if line.len() > MAX_REQUEST_BYTES {
-                    return Err(RequestError::Oversized);
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(RequestError::Timeout)
-            }
-            Err(e) => return Err(RequestError::Io(e)),
-        }
-    }
-}
 
 #[derive(Deserialize)]
 struct VersionOnly {
     v: u8,
 }
 
-/// Parses `v` before the internally-tagged `cmd` body, so a future-version request answers
-/// `UnsupportedVersion` even when its body isn't valid v1 grammar (R3) — `{"v":2}` and
-/// `{"v":2,"cmd":"<future>"}` never reach the full `Envelope` decode below.
 /// One non-blocking attempt to advance a request line, for the poll-driven reactor (Phase 14,
 /// `reactor.rs`'s `service_clients`) to call between servicing other fds instead of blocking
 /// this thread on one connection (R4). Chosen over further shrinking `CLIENT_DEADLINE`, which
@@ -270,10 +231,10 @@ struct VersionOnly {
 /// the previous mode on every return path) invites exactly the mixed-mode bug this note exists
 /// to prevent — a caller that alternates this call with a blocking read on the *same* stream
 /// would see `WouldBlock` instead of waiting. Every connection this reactor accepts is driven
-/// exclusively through this function for its entire lifetime; [`service_connection`] (and the
-/// blocking [`read_request_line`] it wraps) is a separate, mutually exclusive path for a
-/// stream that has never been handed to this function. Never call `service_connection` on a
-/// stream that has passed through `try_read_request_line`, or vice versa.
+/// exclusively through this function for its entire lifetime — it is the ONLY request-reading
+/// path in the crate (task 15.13's sweep removed the blocking `service_connection`/
+/// `read_request_line` pair once `main.rs`'s composition confirmed neither had a production
+/// caller left).
 pub fn try_read_request_line(
     stream: &mut UnixStream,
     partial: &mut Vec<u8>,
@@ -291,9 +252,12 @@ pub fn try_read_request_line(
     }
 }
 
-/// `pub(crate)` so `reactor.rs` (Phase 14) can reuse this already-tested version-before-body
-/// decode when it drives `try_read_request_line` itself, instead of re-implementing R3's
-/// ordering (task 14's CRITICAL fix).
+/// Parses `v` before the internally-tagged `cmd` body, so a future-version request answers
+/// `UnsupportedVersion` even when its body isn't valid v1 grammar (R3) — `{"v":2}` and
+/// `{"v":2,"cmd":"<future>"}` never reach the full `Envelope` decode below. `pub(crate)` so
+/// `reactor.rs`'s `decide` (Phase 14) can reuse this already-tested version-before-body decode
+/// when it drives [`try_read_request_line`] itself, instead of re-implementing R3's ordering
+/// (task 14's CRITICAL fix).
 pub(crate) fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
     let VersionOnly { v } = serde_json::from_slice(line)
         .map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))?;
@@ -304,65 +268,6 @@ pub(crate) fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
         ));
     }
     serde_json::from_slice(line).map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))
-}
-
-fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
-    let mut body = serde_json::to_vec(response).map_err(io::Error::other)?;
-    body.push(b'\n');
-    stream.write_all(&body)
-}
-
-/// The outcome of servicing one already-accepted connection end to end.
-#[derive(Debug)]
-pub enum Serviced {
-    /// A request line arrived, was decided, and the client got a reply.
-    Responded(Response),
-    /// The peer never produced a bounded, `\n`-terminated request; closed with no reply
-    /// (oversized/unterminated body, or the 1s deadline).
-    ClosedWithoutReply,
-}
-
-/// Services one connection [`accept`] already credential-checked: read the bounded request
-/// line, decide against `state`, and reply. Never touches `store`; the caller (`reactor.rs`)
-/// owns the actual `intervals` write once it accepts the decided [`Response`].
-///
-/// **Dead in production as of Phase 14.** `reactor.rs`'s `service_clients` drives
-/// [`try_read_request_line`] exclusively (its doc explains why the two paths cannot mix on one
-/// stream), so this function's only remaining callers are its own tests below, which is what
-/// keeps [`read_request_line`]'s blocking behavior covered. Kept as public API rather than
-/// deleted: Phases 15-17 may still want a synchronous one-shot client-side helper built on the
-/// same shape, and this function's tests are the only proof `read_request_line`'s bounded
-/// timeout/oversize/deadline behavior is correct.
-pub fn service_connection<W: Write>(
-    mut stream: UnixStream,
-    state: PauseState,
-    log: &mut W,
-) -> io::Result<Serviced> {
-    let line = match read_request_line(&mut stream, CLIENT_DEADLINE) {
-        Ok(line) => line,
-        Err(RequestError::Timeout) => {
-            writeln!(
-                log,
-                "xwindowlog: control client sent no request within 1s; dropping"
-            )?;
-            return Ok(Serviced::ClosedWithoutReply);
-        }
-        Err(RequestError::Oversized) => {
-            writeln!(
-                log,
-                "xwindowlog: control client's request exceeded {MAX_REQUEST_BYTES} bytes without a newline; dropping"
-            )?;
-            return Ok(Serviced::ClosedWithoutReply);
-        }
-        Err(RequestError::Io(e)) => return Err(e),
-    };
-
-    let response = match parse_envelope(&line) {
-        Ok(envelope) => handle_request(&envelope.req, state),
-        Err(response) => response,
-    };
-    write_response(&mut stream, &response)?;
-    Ok(Serviced::Responded(response))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -407,6 +312,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+    use std::time::Instant;
 
     fn unique_socket_path(case: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -437,65 +343,20 @@ mod tests {
         reply
     }
 
-    // --- 13.4a: oversized / no-trailing-newline body is rejected ---------------------------
-
-    #[test]
-    fn oversized_request_without_trailing_newline_is_rejected() {
-        let (listener, path) = spawn_test_listener("oversized");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut log = Vec::new();
-            let outcome = service_connection(stream, PauseState::Active, &mut log).unwrap();
-            (outcome, log)
-        });
-
-        let mut client = UnixStream::connect(&path).unwrap();
-        let payload = vec![b'x'; MAX_REQUEST_BYTES + 100];
-        client.write_all(&payload).unwrap();
-
-        let reply = read_reply_tolerant_of_reset(&mut client);
-        assert!(
-            reply.is_empty(),
-            "an oversized/unterminated request must get no reply"
-        );
-        let (outcome, log) = server.join().unwrap();
-        assert!(matches!(outcome, Serviced::ClosedWithoutReply));
-        // Distinguishes this from the 13.4e timeout path, which would also close without a
-        // reply but logs a different message — proving the size cap itself fired, not the
-        // 1s deadline racing it.
-        let log_text = String::from_utf8(log).unwrap();
-        assert!(
-            log_text.contains("exceeded") && log_text.contains("bytes"),
-            "the oversized cap specifically must be what rejected this request: {log_text}"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
     // --- 13.4b: `v != 1` returns `UnsupportedVersion` ---------------------------------------
 
     #[test]
     fn unsupported_protocol_version_returns_unsupported_version() {
-        let (listener, path) = spawn_test_listener("badversion");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
-        });
+        let response = parse_envelope(b"{\"v\":2,\"cmd\":\"resume\"}");
 
-        let mut client = UnixStream::connect(&path).unwrap();
-        client.write_all(b"{\"v\":2,\"cmd\":\"resume\"}\n").unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
-        assert_eq!(parsed["error"], "unsupported_version");
-        assert_eq!(parsed["ok"], false);
         assert!(matches!(
-            server.join().unwrap(),
-            Serviced::Responded(Response::Err {
+            response,
+            Err(Response::Err {
                 error: ErrCode::UnsupportedVersion,
+                ok: false,
                 ..
             })
         ));
-        let _ = std::fs::remove_file(&path);
     }
 
     // --- R4: a non-blocking, resumable read path a future poll-driven reactor can drive -----
@@ -538,48 +399,28 @@ mod tests {
 
     #[test]
     fn unsupported_version_wins_over_a_missing_cmd_field() {
-        let (listener, path) = spawn_test_listener("v2-nocmd");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
-        });
-        let mut client = UnixStream::connect(&path).unwrap();
-        client.write_all(b"{\"v\":2}\n").unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
-        assert_eq!(parsed["error"], "unsupported_version");
+        let response = parse_envelope(b"{\"v\":2}");
+
         assert!(matches!(
-            server.join().unwrap(),
-            Serviced::Responded(Response::Err {
+            response,
+            Err(Response::Err {
                 error: ErrCode::UnsupportedVersion,
                 ..
             })
         ));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn unsupported_version_wins_over_an_unrecognized_future_cmd() {
-        let (listener, path) = spawn_test_listener("v2-futurecmd");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
-        });
-        let mut client = UnixStream::connect(&path).unwrap();
-        client.write_all(b"{\"v\":2,\"cmd\":\"snooze\"}\n").unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
-        assert_eq!(parsed["error"], "unsupported_version");
+        let response = parse_envelope(b"{\"v\":2,\"cmd\":\"snooze\"}");
+
         assert!(matches!(
-            server.join().unwrap(),
-            Serviced::Responded(Response::Err {
+            response,
+            Err(Response::Err {
                 error: ErrCode::UnsupportedVersion,
                 ..
             })
         ));
-        let _ = std::fs::remove_file(&path);
     }
 
     // --- 13.4c: a connecting peer whose uid differs is closed without being read -----------
@@ -650,79 +491,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // --- 13.4e: a client sending no line within 1s is dropped ------------------------------
-
-    #[test]
-    fn client_sending_no_line_within_one_second_is_dropped() {
-        let (listener, path) = spawn_test_listener("timeout");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
-        });
-
-        let client = UnixStream::connect(&path).unwrap();
-        let start = Instant::now();
-        let outcome = server.join().unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(matches!(outcome, Serviced::ClosedWithoutReply));
-        assert!(
-            elapsed >= Duration::from_millis(900),
-            "the deadline fired too early: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "the deadline must be roughly 1s, not unbounded"
-        );
-        drop(client);
-        let _ = std::fs::remove_file(&path);
-    }
-
     // --- 13.4f: Pause-while-paused / Resume-while-not-paused return state errors -----------
 
     #[test]
     fn pause_while_paused_and_resume_while_not_paused_return_state_errors() {
-        let (listener, path) = spawn_test_listener("statecheck-pause");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            service_connection(stream, PauseState::Paused, &mut io::sink()).unwrap()
-        });
-        let mut client = UnixStream::connect(&path).unwrap();
-        client.write_all(b"{\"v\":1,\"cmd\":\"pause\"}\n").unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
-        assert_eq!(parsed["error"], "already_paused");
+        let pause_response = handle_request(&Request::Pause { minutes: None }, PauseState::Paused);
         assert!(matches!(
-            server.join().unwrap(),
-            Serviced::Responded(Response::Err {
+            pause_response,
+            Response::Err {
                 error: ErrCode::AlreadyPaused,
                 ..
-            })
+            }
         ));
-        let _ = std::fs::remove_file(&path);
 
-        let (listener2, path2) = spawn_test_listener("statecheck-resume");
-        let server2 = thread::spawn(move || {
-            let (stream, _) = listener2.accept().unwrap();
-            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
-        });
-        let mut client2 = UnixStream::connect(&path2).unwrap();
-        client2
-            .write_all(b"{\"v\":1,\"cmd\":\"resume\"}\n")
-            .unwrap();
-        let mut reply2 = String::new();
-        client2.read_to_string(&mut reply2).unwrap();
-        let parsed2: serde_json::Value = serde_json::from_str(reply2.trim_end()).unwrap();
-        assert_eq!(parsed2["error"], "not_paused");
+        let resume_response = handle_request(&Request::Resume, PauseState::Active);
         assert!(matches!(
-            server2.join().unwrap(),
-            Serviced::Responded(Response::Err {
+            resume_response,
+            Response::Err {
                 error: ErrCode::NotPaused,
                 ..
-            })
+            }
         ));
-        let _ = std::fs::remove_file(&path2);
     }
 
     // --- R4: the CLI client bounds its own wait; a silent peer cannot hold it indefinitely --

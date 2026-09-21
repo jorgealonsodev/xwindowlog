@@ -407,6 +407,14 @@ fn run_event_loop(
             if let LogindSource::Real(adapter) = reactor.logind_mut() {
                 suspend_inhibitor.release_for_suspend(adapter.monitor_mut());
             }
+            // D-12's in-process wakeup counter, "logged on shutdown" (task 14.11's tail,
+            // deferred to this phase's real shutdown hook). This crate has no structured
+            // logging framework, so it uses the same plain stderr diagnostic convention as
+            // every other line in this module rather than inventing a log-level distinction.
+            eprintln!(
+                "xwindowlog: reactor recorded {} poll(2) wakeup(s) over its lifetime",
+                reactor.wakeups()
+            );
             return Ok(());
         }
     }
@@ -421,7 +429,6 @@ fn apply_effects(
     store: &mut Store,
     reactor: &mut Reactor,
 ) -> Result<(), StartupError> {
-    use xwindowlog::store::IntervalStore as _;
     use xwindowlog::tracker::Effect;
 
     for effect in effects {

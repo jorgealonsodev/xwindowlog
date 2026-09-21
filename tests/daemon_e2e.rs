@@ -556,6 +556,20 @@ fn assert_signal_closes_the_open_interval_and_exits_zero(
         row.end.is_some(),
         "the open interval must be closed (end IS NOT NULL) on a clean signal shutdown"
     );
+
+    // D-12's in-process wakeup counter, "logged on shutdown" (task 14.11's tail).
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .expect("stderr must be piped")
+        .read_to_string(&mut stderr)
+        .expect("reading stderr must succeed");
+    assert!(
+        stderr.contains("poll(2) wakeup"),
+        "the reactor's wakeup counter must be logged on shutdown, got: {stderr:?}"
+    );
 }
 
 #[test]
