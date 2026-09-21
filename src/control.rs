@@ -1,4 +1,555 @@
 //! Unix listener, `SO_PEERCRED` check, request/response JSON, transient-client lifecycle (D-5).
+//!
+//! RF-49's `pause`/`resume` control channel: a `SOCK_STREAM` listener in `$XDG_RUNTIME_DIR`, one
+//! request per connection, `SO_PEERCRED`-checked before any read (design §2 D-5, §5). This
+//! module owns the raw fd-level building blocks — bind, accept, credential check, bounded read,
+//! wire types — and the thin CLI-side sender. `reactor.rs` (Phase 14) is what polls the listener
+//! and transient client fds; this module is unit-tested against a real `UnixListener`, entirely
+//! independent of that poll loop (task 13.8).
+
+use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::Uid;
+use serde::{Deserialize, Serialize};
+
+/// Wire protocol version this daemon speaks (design §5).
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Request body cap; a line missing its trailing `\n` within this many bytes is rejected
+/// (design §7 threat matrix, §5 wire-protocol constraints).
+pub const MAX_REQUEST_BYTES: usize = 4096;
+
+/// At most this many clients hold a transient fd at once; the next one is accepted and
+/// immediately closed (design §5, D-5).
+pub const MAX_CONCURRENT_CLIENTS: usize = 4;
+
+/// A client that sends no complete line within this deadline is dropped (design §5).
+pub const CLIENT_DEADLINE: Duration = Duration::from_secs(1);
+
+// ---------------------------------------------------------------------------------------------
+// Wire types (design §5)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "cmd", rename_all = "lowercase")]
+pub enum Request {
+    Pause {
+        #[serde(default)]
+        minutes: Option<u32>,
+    },
+    Resume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Envelope {
+    pub v: u8,
+    #[serde(flatten)]
+    pub req: Request,
+}
+
+// `Response` also derives `Deserialize` (beyond design §5's literal snippet, which only shows
+// the daemon's own encode path) because the CLI client below decodes exactly this type from
+// the daemon's reply; the wire shape is unchanged.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Response {
+    Ok {
+        v: u8,
+        ok: bool,
+        state: String,
+        until: Option<String>,
+    },
+    Err {
+        v: u8,
+        ok: bool,
+        error: ErrCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrCode {
+    UnsupportedVersion,
+    Malformed,
+    AlreadyPaused,
+    NotPaused,
+    Internal,
+}
+
+impl Response {
+    fn err(error: ErrCode, message: impl Into<String>) -> Self {
+        Response::Err {
+            v: PROTOCOL_VERSION,
+            ok: false,
+            error,
+            message: message.into(),
+        }
+    }
+}
+
+/// Whether the daemon currently has an open `paused` interval (design §5's `AlreadyPaused`/
+/// `NotPaused` distinction). Owned by whichever caller tracks real state; Phase 13 exposes only
+/// the pure decision in [`handle_request`], not the tracker/store wiring (task 13.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseState {
+    Active,
+    Paused,
+}
+
+/// Pure decision: given the current [`PauseState`], what does this [`Request`] answer with.
+/// Carries no I/O and no `store` dependency — the actual `intervals` write happens in
+/// `reactor.rs` once it has decided to accept the request (design §2 D-1: the daemon is the
+/// sole writer of `intervals`).
+pub fn handle_request(req: &Request, state: PauseState) -> Response {
+    match (req, state) {
+        (Request::Pause { .. }, PauseState::Paused) => {
+            Response::err(ErrCode::AlreadyPaused, "daemon is already paused")
+        }
+        (Request::Pause { .. }, PauseState::Active) => Response::Ok {
+            v: PROTOCOL_VERSION,
+            ok: true,
+            state: "paused".to_string(),
+            // The wall-clock `until` deadline is computed once `Deadlines::PauseExpiry`
+            // (Phase 14) exists; Phase 13 only decides pause/not-paused, never the expiry.
+            until: None,
+        },
+        (Request::Resume, PauseState::Active) => {
+            Response::err(ErrCode::NotPaused, "daemon is not paused")
+        }
+        (Request::Resume, PauseState::Paused) => Response::Ok {
+            v: PROTOCOL_VERSION,
+            ok: true,
+            state: "active".to_string(),
+            until: None,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Listener lifecycle (task 13.5)
+// ---------------------------------------------------------------------------------------------
+
+/// Joins the socket file name onto a caller-supplied runtime directory. The caller resolves
+/// `$XDG_RUNTIME_DIR` (Phase 15+); this module never reads the environment itself.
+pub fn socket_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("xwindowlog.sock")
+}
+
+/// Binds the control socket, unlinking a stale path first. Safe to call unconditionally
+/// because the caller only reaches this after `flock` on the lock file has already proved no
+/// live instance holds it (design §2 D-5 "Lifecycle") — a `SIGKILL`ed predecessor's leftover
+/// socket inode is not a live listener.
+pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    UnixListener::bind(path)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Accept + credential + capacity (tasks 13.4c, 13.4d, 13.5)
+// ---------------------------------------------------------------------------------------------
+
+/// Outcome of accepting one connection off the listener.
+#[derive(Debug)]
+pub enum Accepted {
+    /// Accepted and credential-checked; ready for [`service_connection`].
+    Client(UnixStream),
+    /// The peer's `SO_PEERCRED` uid did not match; closed without reading any bytes.
+    RejectedUid,
+    /// The `MAX_CONCURRENT_CLIENTS`-th+1 concurrent client; accepted and immediately closed.
+    RejectedCapacity,
+}
+
+/// Accepts one connection and applies D-5's two independent bounds: capacity, then the
+/// credential check. `active_clients` is the caller's own count of fds it currently holds open
+/// for other clients — this module does not track it, since that bookkeeping belongs to
+/// whichever caller owns the fd table (`reactor.rs`, Phase 14).
+pub fn accept<W: Write>(
+    listener: &UnixListener,
+    active_clients: usize,
+    own_uid: Uid,
+    log: &mut W,
+) -> io::Result<Accepted> {
+    let (stream, _addr) = listener.accept()?;
+    if active_clients >= MAX_CONCURRENT_CLIENTS {
+        return Ok(Accepted::RejectedCapacity);
+    }
+    let peer_uid = peer_uid(&stream)?;
+    if peer_uid != own_uid {
+        writeln!(
+            log,
+            "xwindowlog: rejected control connection from uid {} (expected {}); closed without reading",
+            peer_uid.as_raw(),
+            own_uid.as_raw()
+        )?;
+        return Ok(Accepted::RejectedUid);
+    }
+    Ok(Accepted::Client(stream))
+}
+
+fn peer_uid(stream: &UnixStream) -> io::Result<Uid> {
+    let creds = getsockopt(stream, PeerCredentials).map_err(io::Error::from)?;
+    Ok(Uid::from_raw(creds.uid()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded read + request handling (tasks 13.4a, 13.4b, 13.4e, 13.4f, 13.5)
+// ---------------------------------------------------------------------------------------------
+
+enum RequestError {
+    /// No trailing `\n` arrived within `CLIENT_DEADLINE`.
+    Timeout,
+    /// More than `MAX_REQUEST_BYTES` arrived without a trailing `\n`.
+    Oversized,
+    Io(io::Error),
+}
+
+/// Reads one `\n`-terminated line, bounded by both size and total elapsed time. The deadline is
+/// tracked against a single [`Instant`] and re-applied on every `read()` call, so a peer that
+/// trickles bytes in slowly cannot extend the 1s budget by resetting a per-call timeout
+/// (rust-testing skill: every blocking read on this socket must be covered, not just the
+/// first).
+fn read_request_line(stream: &mut UnixStream, deadline: Duration) -> Result<Vec<u8>, RequestError> {
+    let start = Instant::now();
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return Err(RequestError::Timeout);
+        }
+        stream
+            .set_read_timeout(Some(deadline - elapsed))
+            .map_err(RequestError::Io)?;
+        match stream.read(&mut byte) {
+            Ok(0) => return Err(RequestError::Timeout),
+            Ok(_) if byte[0] == b'\n' => return Ok(line),
+            Ok(_) => {
+                line.push(byte[0]);
+                if line.len() > MAX_REQUEST_BYTES {
+                    return Err(RequestError::Oversized);
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(RequestError::Timeout)
+            }
+            Err(e) => return Err(RequestError::Io(e)),
+        }
+    }
+}
+
+fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
+    let envelope: Envelope = serde_json::from_slice(line)
+        .map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))?;
+    if envelope.v != PROTOCOL_VERSION {
+        return Err(Response::err(
+            ErrCode::UnsupportedVersion,
+            format!("unsupported protocol version {}", envelope.v),
+        ));
+    }
+    Ok(envelope)
+}
+
+fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    let mut body = serde_json::to_vec(response).map_err(io::Error::other)?;
+    body.push(b'\n');
+    stream.write_all(&body)
+}
+
+/// The outcome of servicing one already-accepted connection end to end.
+#[derive(Debug)]
+pub enum Serviced {
+    /// A request line arrived, was decided, and the client got a reply.
+    Responded(Response),
+    /// The peer never produced a bounded, `\n`-terminated request; closed with no reply
+    /// (oversized/unterminated body, or the 1s deadline).
+    ClosedWithoutReply,
+}
+
+/// Services one connection [`accept`] already credential-checked: read the bounded request
+/// line, decide against `state`, and reply. Never touches `store`; the caller (`reactor.rs`)
+/// owns the actual `intervals` write once it accepts the decided [`Response`].
+pub fn service_connection<W: Write>(
+    mut stream: UnixStream,
+    state: PauseState,
+    log: &mut W,
+) -> io::Result<Serviced> {
+    let line = match read_request_line(&mut stream, CLIENT_DEADLINE) {
+        Ok(line) => line,
+        Err(RequestError::Timeout) => {
+            writeln!(
+                log,
+                "xwindowlog: control client sent no request within 1s; dropping"
+            )?;
+            return Ok(Serviced::ClosedWithoutReply);
+        }
+        Err(RequestError::Oversized) => {
+            writeln!(
+                log,
+                "xwindowlog: control client's request exceeded {MAX_REQUEST_BYTES} bytes without a newline; dropping"
+            )?;
+            return Ok(Serviced::ClosedWithoutReply);
+        }
+        Err(RequestError::Io(e)) => return Err(e),
+    };
+
+    let response = match parse_envelope(&line) {
+        Ok(envelope) => handle_request(&envelope.req, state),
+        Err(response) => response,
+    };
+    write_response(&mut stream, &response)?;
+    Ok(Serviced::Responded(response))
+}
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    fn unique_socket_path(case: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "xwindowlog-test-control-{case}-{}-{n}.sock",
+            std::process::id()
+        ))
+    }
+
+    fn spawn_test_listener(case: &str) -> (UnixListener, PathBuf) {
+        let path = unique_socket_path(case);
+        let listener = bind(&path).expect("bind must succeed on a fresh path");
+        (listener, path)
+    }
+
+    /// Reads whatever the peer sends until it closes. A server that closes a connection while
+    /// unread bytes are still queued (e.g. the client's own oversized payload it never fully
+    /// consumed) makes Linux send `RST` instead of a graceful `FIN`; both are valid ways to
+    /// observe "no reply arrived", so this treats `ConnectionReset` the same as a clean EOF.
+    fn read_reply_tolerant_of_reset(stream: &mut UnixStream) -> Vec<u8> {
+        let mut reply = Vec::new();
+        match stream.read_to_end(&mut reply) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+        reply
+    }
+
+    // --- 13.4a: oversized / no-trailing-newline body is rejected ---------------------------
+
+    #[test]
+    fn oversized_request_without_trailing_newline_is_rejected() {
+        let (listener, path) = spawn_test_listener("oversized");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut log = Vec::new();
+            let outcome = service_connection(stream, PauseState::Active, &mut log).unwrap();
+            (outcome, log)
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        let payload = vec![b'x'; MAX_REQUEST_BYTES + 100];
+        client.write_all(&payload).unwrap();
+
+        let reply = read_reply_tolerant_of_reset(&mut client);
+        assert!(
+            reply.is_empty(),
+            "an oversized/unterminated request must get no reply"
+        );
+        let (outcome, log) = server.join().unwrap();
+        assert!(matches!(outcome, Serviced::ClosedWithoutReply));
+        // Distinguishes this from the 13.4e timeout path, which would also close without a
+        // reply but logs a different message — proving the size cap itself fired, not the
+        // 1s deadline racing it.
+        let log_text = String::from_utf8(log).unwrap();
+        assert!(
+            log_text.contains("exceeded") && log_text.contains("bytes"),
+            "the oversized cap specifically must be what rejected this request: {log_text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4b: `v != 1` returns `UnsupportedVersion` ---------------------------------------
+
+    #[test]
+    fn unsupported_protocol_version_returns_unsupported_version() {
+        let (listener, path) = spawn_test_listener("badversion");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"{\"v\":2,\"cmd\":\"resume\"}\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
+        assert_eq!(parsed["error"], "unsupported_version");
+        assert_eq!(parsed["ok"], false);
+        assert!(matches!(
+            server.join().unwrap(),
+            Serviced::Responded(Response::Err {
+                error: ErrCode::UnsupportedVersion,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4c: a connecting peer whose uid differs is closed without being read -----------
+
+    #[test]
+    fn different_uid_peer_is_rejected_without_reading_and_logged() {
+        let (listener, path) = spawn_test_listener("uidmismatch");
+        // A uid that cannot be this test process's own effective uid.
+        let wrong_uid = Uid::from_raw(Uid::effective().as_raw().wrapping_add(1));
+
+        let server = thread::spawn(move || {
+            let mut log = Vec::new();
+            let outcome = accept(&listener, 0, wrong_uid, &mut log).unwrap();
+            (outcome, log)
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        // Even a well-formed request must get no reply: the rejection happens before any read.
+        client.write_all(b"{\"v\":1,\"cmd\":\"resume\"}\n").unwrap();
+        let reply = read_reply_tolerant_of_reset(&mut client);
+        assert!(
+            reply.is_empty(),
+            "a uid-mismatched peer must get no reply at all"
+        );
+
+        let (outcome, log) = server.join().unwrap();
+        assert!(matches!(outcome, Accepted::RejectedUid));
+        let log_text = String::from_utf8(log).unwrap();
+        assert!(
+            log_text.contains("rejected"),
+            "the rejection must be logged: {log_text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4d: a 5th concurrent client is accepted and immediately closed -----------------
+
+    #[test]
+    fn fifth_concurrent_client_is_accepted_and_immediately_closed() {
+        let (listener, path) = spawn_test_listener("fifthclient");
+        let own_uid = Uid::effective();
+        let mut log = io::sink();
+
+        // Four real clients connect and stay open before any accept() runs, so every accept()
+        // below has a pending connection queued and never blocks.
+        let _clients: Vec<UnixStream> = (0..MAX_CONCURRENT_CLIENTS)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+
+        for i in 0..MAX_CONCURRENT_CLIENTS {
+            let outcome = accept(&listener, i, own_uid, &mut log).unwrap();
+            assert!(
+                matches!(outcome, Accepted::Client(_)),
+                "client #{i} must be accepted under the concurrency cap"
+            );
+        }
+
+        let mut fifth_client = UnixStream::connect(&path).unwrap();
+        let fifth_outcome = accept(&listener, MAX_CONCURRENT_CLIENTS, own_uid, &mut log).unwrap();
+        assert!(matches!(fifth_outcome, Accepted::RejectedCapacity));
+
+        let mut reply = Vec::new();
+        fifth_client.read_to_end(&mut reply).unwrap();
+        assert!(
+            reply.is_empty(),
+            "the 5th client must be closed with no reply"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4e: a client sending no line within 1s is dropped ------------------------------
+
+    #[test]
+    fn client_sending_no_line_within_one_second_is_dropped() {
+        let (listener, path) = spawn_test_listener("timeout");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
+        });
+
+        let client = UnixStream::connect(&path).unwrap();
+        let start = Instant::now();
+        let outcome = server.join().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(matches!(outcome, Serviced::ClosedWithoutReply));
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the deadline fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the deadline must be roughly 1s, not unbounded"
+        );
+        drop(client);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4f: Pause-while-paused / Resume-while-not-paused return state errors -----------
+
+    #[test]
+    fn pause_while_paused_and_resume_while_not_paused_return_state_errors() {
+        let (listener, path) = spawn_test_listener("statecheck-pause");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            service_connection(stream, PauseState::Paused, &mut io::sink()).unwrap()
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"{\"v\":1,\"cmd\":\"pause\"}\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
+        assert_eq!(parsed["error"], "already_paused");
+        assert!(matches!(
+            server.join().unwrap(),
+            Serviced::Responded(Response::Err {
+                error: ErrCode::AlreadyPaused,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let (listener2, path2) = spawn_test_listener("statecheck-resume");
+        let server2 = thread::spawn(move || {
+            let (stream, _) = listener2.accept().unwrap();
+            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
+        });
+        let mut client2 = UnixStream::connect(&path2).unwrap();
+        client2
+            .write_all(b"{\"v\":1,\"cmd\":\"resume\"}\n")
+            .unwrap();
+        let mut reply2 = String::new();
+        client2.read_to_string(&mut reply2).unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(reply2.trim_end()).unwrap();
+        assert_eq!(parsed2["error"], "not_paused");
+        assert!(matches!(
+            server2.join().unwrap(),
+            Serviced::Responded(Response::Err {
+                error: ErrCode::NotPaused,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(&path2);
+    }
+}

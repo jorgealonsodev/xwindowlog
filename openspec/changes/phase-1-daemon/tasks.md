@@ -837,7 +837,7 @@ Threat-matrix rows: "Process integration — control socket" (design §7).
       succession is observed correctly as both flags set, with the pipe
       drained to empty (D-4's "levels, not edges" correctness).
 - [x] 13.3 GREEN: implement flag-read-and-clear plus pipe-drain-to-empty.
-- [ ] 13.4 RED, one task per threat-matrix control-socket case (design §7,
+- [x] 13.4 RED, one task per threat-matrix control-socket case (design §7,
       §5 wire-protocol constraints): 13.4a a request over 4096 bytes or
       missing a trailing `\n` is rejected; 13.4b `v != 1` returns
       `UnsupportedVersion`; 13.4c a connecting peer whose `SO_PEERCRED` uid
@@ -847,7 +847,7 @@ Threat-matrix rows: "Process integration — control socket" (design §7).
       accepted and immediately closed; 13.4e a client sending no line within
       1s is dropped; 13.4f `Pause` against an already-paused daemon and
       `Resume` against a non-paused daemon return `AlreadyPaused`/`NotPaused`.
-- [ ] 13.5 GREEN: implement the `UnixListener` on
+- [x] 13.5 GREEN: implement the `UnixListener` on
       `$XDG_RUNTIME_DIR/xwindowlog.sock` (bound after `flock` succeeds — the
       actual `flock` wiring is Phase 15's task 15.4), the `Request`/
       `Response`/`Envelope`/`ErrCode` types (design §5), `SO_PEERCRED`
