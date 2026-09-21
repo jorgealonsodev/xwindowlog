@@ -421,6 +421,7 @@ fn a_sigkilled_instances_lock_is_released_automatically() {
 struct IntervalRow {
     end: Option<i64>,
     app: String,
+    title: String,
     state: String,
 }
 
@@ -430,9 +431,10 @@ struct IntervalRow {
 fn most_recent_interval(db_path: &std::path::Path) -> rusqlite::Result<IntervalRow> {
     let conn = rusqlite::Connection::open(db_path)?;
     conn.query_row(
-        "SELECT intervals.\"end\", apps.app_id, intervals.state \
+        "SELECT intervals.\"end\", apps.app_id, titles.title, intervals.state \
          FROM intervals \
          JOIN apps ON apps.id = intervals.app \
+         JOIN titles ON titles.id = intervals.title \
          ORDER BY intervals.start DESC, intervals.id DESC \
          LIMIT 1",
         [],
@@ -440,16 +442,33 @@ fn most_recent_interval(db_path: &std::path::Path) -> rusqlite::Result<IntervalR
             Ok(IntervalRow {
                 end: r.get(0)?,
                 app: r.get(1)?,
-                state: r.get(2)?,
+                title: r.get(2)?,
+                state: r.get(3)?,
             })
         },
     )
 }
 
-/// Polls the database until the most recent interval matches `(app, state)`, bounded so a
-/// genuine capture failure fails the test instead of hanging it. The database may not exist
-/// yet, be mid-WAL-checkpoint, or briefly lag the X11 property change — all tolerated as "not
-/// yet", never as a hard failure, until the deadline.
+/// Whether ANY interval row (not only the most recent) matches `(app, title)` exactly — used to
+/// prove a historical row survives untouched (RF-9: "without affecting already-recorded
+/// intervals").
+fn any_interval_matches(
+    db_path: &std::path::Path,
+    app: &str,
+    title: &str,
+) -> rusqlite::Result<bool> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM intervals \
+         JOIN apps ON apps.id = intervals.app \
+         JOIN titles ON titles.id = intervals.title \
+         WHERE apps.app_id = ?1 AND titles.title = ?2",
+        rusqlite::params![app, title],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Creates one titled, classed window and repeatedly (re-)asserts it as
 /// `_NET_ACTIVE_WINDOW` until the daemon's own database shows the resulting `active` interval,
 /// bounded by `timeout`. The daemon is a separate process started slightly before this call
@@ -475,7 +494,7 @@ fn activate_window_until_observed(
         wm.set_active_window(window);
         std::thread::sleep(Duration::from_millis(100));
         if let Ok(row) = most_recent_interval(&env.db_path()) {
-            if row.app == app_id && row.state == "active" {
+            if row.app == app_id && row.title == title && row.state == "active" {
                 return window;
             }
         }
@@ -553,4 +572,72 @@ fn sigint_behaves_identically_to_sigterm() {
         "sigint-clean-shutdown",
         nix::sys::signal::Signal::SIGINT,
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 15.7/15.8: editing config.toml and sending SIGHUP applies new exclusion rules to subsequent
+// captures without altering already-recorded intervals (RF-9)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn sighup_applies_new_exclusion_rules_without_altering_past_intervals() {
+    let env = DaemonEnv::new("sighup-reload");
+    let wm = FakeWm::connect(env.xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let mut daemon = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
+
+    // 1. Captured with the empty (no-exclusion) startup config: recorded in the clear.
+    activate_window_until_observed(
+        &env,
+        &wm,
+        "secret-app",
+        "Before Hup",
+        Duration::from_secs(10),
+    );
+
+    // 2. Edit config.toml to exclude `secret-app`, then SIGHUP.
+    let config_dir = env.config_home.path().join("xwindowlog");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[[exclude]]\napp = \"secret-app\"\nhide_app = true\n",
+    )
+    .expect("write config.toml");
+    send_signal(daemon.0.id(), nix::sys::signal::Signal::SIGHUP);
+
+    // 3. A NEW window from the same app, activated after the reload, must be captured hidden —
+    // retried because SIGHUP's own delivery/reload is not synchronous from this process's view.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let window = wm.create_window();
+    wm.map_window(window);
+    wm.set_wm_class(window, "secret-app", "secret-app");
+    wm.set_title(window, "After Hup");
+    loop {
+        wm.set_active_window(window);
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(row) = most_recent_interval(&env.db_path()) {
+            if row.app == "[hidden]" && row.title == "[hidden]" && row.state == "active" {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no hidden active interval appeared within 10s of sending SIGHUP with an updated \
+             exclusion rule"
+        );
+    }
+
+    // 4. The pre-SIGHUP interval must survive untouched — RF-9's "without affecting
+    // already-recorded intervals".
+    assert!(
+        any_interval_matches(&env.db_path(), "secret-app", "Before Hup")
+            .expect("query must succeed"),
+        "the interval recorded before the config reload must not be rewritten or removed"
+    );
+
+    send_signal(daemon.0.id(), nix::sys::signal::Signal::SIGTERM);
+    let status = daemon.0.wait().expect("wait");
+    assert_eq!(status.code(), Some(0));
 }

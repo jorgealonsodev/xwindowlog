@@ -949,11 +949,11 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
       identically (RF-33, both scenarios).
 - [x] 15.6 GREEN: wire `signals.rs`'s `Shutdown` event through `tracker.rs`'s
       `CloseOnly` effect to `store.rs`, then lock/inhibitor release and exit.
-- [ ] 15.7 RED (E2E): editing `config.toml` and sending `SIGHUP` causes
+- [x] 15.7 RED (E2E): editing `config.toml` and sending `SIGHUP` causes
       subsequent captures to use the updated exclusion rules without
       affecting already-recorded intervals (RF-9, completing Phase 7's
       unit-level `Excluder`-swap test end to end).
-- [ ] 15.8 GREEN: wire `SourceEvent::ReloadConfig` to the `Excluder`
+- [x] 15.8 GREEN: wire `SourceEvent::ReloadConfig` to the `Excluder`
       hot-swap inside `ReactorSource`, invisible to the tracker.
 - [ ] 15.9 RED (E2E, `SIGKILL` + restart): killing the daemon mid-run and
       restarting it recovers to a consistent, uncorrupted database, Phase 3's
