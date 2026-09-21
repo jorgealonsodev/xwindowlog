@@ -15,6 +15,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 
 use xwindowlog::exclude::Excluder;
+use xwindowlog::logind::{LockedHintTracker, LogindEvent, ZbusSessionMonitor};
 use xwindowlog::reactor::BudgetedSource;
 use xwindowlog::tracker::{SourceError, SourceEvent, WindowInfo};
 use xwindowlog::x11::{RawEvent, X11Source};
@@ -96,6 +97,145 @@ impl BudgetedSource for X11Adapter {
             .map_err(|e| SourceError(format!("x11 poll_for_event failed: {e}")))?;
         Ok(raw
             .map(|raw| translate_x11_event(&self.excluder.borrow(), &mut self.current_app_id, raw)))
+    }
+}
+
+/// Runs one `LogindEvent` through `locked_hint` (RF-5's edge-detection, `logind.rs`'s own
+/// `LockedHintTracker`) and produces the `SourceEvent` the tracker should see, or `None` when
+/// the event carries no transition (a `LockedHint` sample that did not cross an edge, or a
+/// bridge thread dying — logged by the caller, not itself a tracker-visible event).
+fn translate_logind_event(
+    locked_hint: &mut LockedHintTracker,
+    event: LogindEvent,
+) -> Option<SourceEvent> {
+    match event {
+        LogindEvent::LockedHintChanged(locked) => locked_hint.observe(locked),
+        LogindEvent::PrepareForSleep(going_to_sleep) => {
+            Some(SourceEvent::PrepareForSleep(going_to_sleep))
+        }
+        LogindEvent::BridgeDied => {
+            eprintln!(
+                "xwindowlog: a logind bridge thread exited; lock/suspend awareness may be stale"
+            );
+            None
+        }
+    }
+}
+
+/// `reactor::BudgetedSource` over the real `logind.rs` bridge (design §2 D-2 fd1), or a
+/// permanently-idle placeholder when D-Bus is unreachable at startup (RF-65: "window capture,
+/// exclusion and storage all start up regardless"). One `enum` so `main.rs` can hand
+/// `ReactorSource::new` a single concrete `L` type regardless of which branch startup took.
+pub enum LogindSource {
+    Real(Box<LogindAdapter>),
+    Absent(NullFd),
+}
+
+impl BudgetedSource for LogindSource {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            LogindSource::Real(adapter) => adapter.as_raw_fd(),
+            LogindSource::Absent(null) => null.as_raw_fd(),
+        }
+    }
+
+    fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError> {
+        match self {
+            LogindSource::Real(adapter) => adapter.try_next(),
+            LogindSource::Absent(_) => Ok(None),
+        }
+    }
+}
+
+/// The real, D-Bus-backed half of [`LogindSource`].
+pub struct LogindAdapter {
+    monitor: ZbusSessionMonitor,
+    locked_hint: LockedHintTracker,
+    /// Events already drained off `monitor` for this wakeup but not yet translated/returned —
+    /// `drain_events` hands back a batch, `BudgetedSource::try_next` hands out one at a time.
+    pending: std::collections::VecDeque<LogindEvent>,
+}
+
+impl LogindAdapter {
+    pub fn new(monitor: ZbusSessionMonitor, locked_hint: LockedHintTracker) -> Self {
+        LogindAdapter {
+            monitor,
+            locked_hint,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Reaches the owned monitor for suspend-inhibitor coordination (`main.rs`'s event loop,
+    /// task 15.10's RF-27 wiring) — sequencing the release strictly after the interval closure
+    /// is committed is the caller's job, not this adapter's (`SuspendInhibitor`'s own doc).
+    pub fn monitor_mut(&mut self) -> &mut ZbusSessionMonitor {
+        &mut self.monitor
+    }
+}
+
+impl BudgetedSource for LogindAdapter {
+    fn as_raw_fd(&self) -> RawFd {
+        self.monitor.event_fd()
+    }
+
+    fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError> {
+        loop {
+            while let Some(event) = self.pending.pop_front() {
+                if let Some(source_event) = translate_logind_event(&mut self.locked_hint, event) {
+                    return Ok(Some(source_event));
+                }
+            }
+
+            // Consumes the eventfd's counter (design §2 D-3's wakeup signal) before asking for
+            // the events it was signaling — a level-triggered eventfd left unread would report
+            // `POLLIN` forever even once every event is drained.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.monitor.event_fd()) };
+            let mut buf = [0u8; 8];
+            match nix::unistd::read(fd, &mut buf) {
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+                Err(e) => return Err(SourceError(format!("logind eventfd read failed: {e}"))),
+            }
+
+            let (events, lagged) = self.monitor.drain_events();
+            if lagged {
+                eprintln!(
+                    "xwindowlog: logind event queue overflowed; forcing a LockedHint re-read"
+                );
+                // A dropped event could have been the very edge `locked_hint` needed to see;
+                // the safe recovery is to force the NEXT real sample through as an
+                // unconditional re-observation rather than trust a possibly-stale baseline.
+                self.locked_hint = LockedHintTracker::new();
+            }
+            if events.is_empty() {
+                return Ok(None);
+            }
+            self.pending.extend(events);
+        }
+    }
+}
+
+/// A permanently-idle `BudgetedSource`: a `pipe(2)` pair kept open with nothing ever written to
+/// it, so its read end is a valid, always-pollable fd that never reports `POLLIN` and never
+/// hits EOF (both ends stay alive for this value's whole lifetime). Used when `logind.rs`'s
+/// `init_session_monitor` degrades (RF-65) and there is no real eventfd to poll.
+pub struct NullFd {
+    _reader: std::os::unix::net::UnixStream,
+    _writer: std::os::unix::net::UnixStream,
+}
+
+impl NullFd {
+    pub fn new() -> std::io::Result<Self> {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        Ok(NullFd {
+            _reader: reader,
+            _writer: writer,
+        })
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd as _;
+        self._reader.as_raw_fd()
     }
 }
 
@@ -273,5 +413,87 @@ mod tests {
             translate_x11_event(&excluder, &mut current_app_id, RawEvent::DisplayRestored),
             SourceEvent::DisplayRestored
         );
+    }
+
+    // --- logind translation -------------------------------------------------------------------
+
+    #[test]
+    fn locked_hint_changed_defers_to_locked_hint_tracker_edge_detection() {
+        let mut tracker = LockedHintTracker::new();
+        tracker.seed(false);
+
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::LockedHintChanged(true)),
+            Some(SourceEvent::SessionLocked)
+        );
+        // No edge the second time: already locked.
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::LockedHintChanged(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn locked_hint_negative_edge_translates_to_session_unlocked() {
+        let mut tracker = LockedHintTracker::new();
+        tracker.seed(true);
+
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::LockedHintChanged(false)),
+            Some(SourceEvent::SessionUnlocked)
+        );
+    }
+
+    #[test]
+    fn prepare_for_sleep_always_translates_regardless_of_locked_hint_state() {
+        let mut tracker = LockedHintTracker::new();
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::PrepareForSleep(true)),
+            Some(SourceEvent::PrepareForSleep(true))
+        );
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::PrepareForSleep(false)),
+            Some(SourceEvent::PrepareForSleep(false))
+        );
+    }
+
+    #[test]
+    fn bridge_died_translates_to_no_source_event() {
+        let mut tracker = LockedHintTracker::new();
+        assert_eq!(
+            translate_logind_event(&mut tracker, LogindEvent::BridgeDied),
+            None
+        );
+    }
+
+    // --- NullFd: a permanently idle placeholder never reports readiness or EOF -------------
+
+    #[test]
+    fn null_fd_never_reports_data_ready_and_stays_a_valid_fd() {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::fd::BorrowedFd;
+
+        let null = NullFd::new().expect("NullFd::new must succeed");
+        let fd = unsafe { BorrowedFd::borrow_raw(null.as_raw_fd()) };
+        let mut pfds = [PollFd::new(fd, PollFlags::POLLIN)];
+
+        poll(&mut pfds, PollTimeout::ZERO).expect("poll must not error on a valid fd");
+
+        assert_eq!(
+            pfds[0].any(),
+            Some(false),
+            "a NullFd must never report POLLIN — it exists only to occupy a permanent poll(2) \
+             slot when logind is unreachable (RF-65)"
+        );
+    }
+
+    // --- LogindSource::Absent never yields a SourceEvent ------------------------------------
+
+    #[test]
+    fn absent_logind_source_try_next_is_always_none() {
+        let null = NullFd::new().expect("NullFd::new must succeed");
+        let mut source = LogindSource::Absent(null);
+
+        assert_eq!(source.try_next().expect("must not error"), None);
     }
 }
