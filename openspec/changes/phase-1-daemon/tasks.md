@@ -828,15 +828,15 @@ against the code as it stood, never by reverting a fix afterwards.
 **Traces:** RF-9 (signal half), RF-33 (signal half), RF-49, design §2 D-4, D-5.
 Threat-matrix rows: "Process integration — control socket" (design §7).
 
-- [ ] 13.1 GREEN (registration is infrastructure, no isolated RED — validates
+- [x] 13.1 GREEN (registration is infrastructure, no isolated RED — validates
       assumption A-3 for real): register `SIGTERM`/`SIGINT`/`SIGHUP` with
       both `signal_hook::flag::register` (`Arc<AtomicBool>`) and
       `signal_hook::low_level::pipe::register` onto the same self-pipe
       (design §2 D-4).
-- [ ] 13.2 RED: a coalesced burst of `SIGTERM`+`SIGHUP` sent in quick
+- [x] 13.2 RED: a coalesced burst of `SIGTERM`+`SIGHUP` sent in quick
       succession is observed correctly as both flags set, with the pipe
       drained to empty (D-4's "levels, not edges" correctness).
-- [ ] 13.3 GREEN: implement flag-read-and-clear plus pipe-drain-to-empty.
+- [x] 13.3 GREEN: implement flag-read-and-clear plus pipe-drain-to-empty.
 - [ ] 13.4 RED, one task per threat-matrix control-socket case (design §7,
       §5 wire-protocol constraints): 13.4a a request over 4096 bytes or
       missing a trailing `\n` is rejected; 13.4b `v != 1` returns
