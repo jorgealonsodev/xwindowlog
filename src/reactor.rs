@@ -110,11 +110,148 @@ impl Deadlines {
     }
 }
 
+/// Per-wakeup drain cap for X11's userspace event queue (design §2 D-6). The fd can be empty
+/// while `x11rb`'s internal queue is not; draining fully before polling again is what avoids
+/// the classic xcb reactor hang. A budget bounds the cost of a burst so one source can never
+/// starve the others.
+pub const X11_BUDGET: u32 = 64;
+
+/// Per-wakeup drain cap for the logind bridge channel (design §2 D-6), the `dbus_backlog` half
+/// of the same fairness rule.
+pub const DBUS_BUDGET: u32 = 32;
+
+/// The timeout to hand `poll(2)` this wakeup (design §2 D-6). If a budgeted drain hit its cap
+/// there is known work left over: sleeping on it would defer already-ready data, so the
+/// timeout collapses to `PollTimeout::ZERO` regardless of what `deadlines` would otherwise
+/// compute — a busy source is serviced again immediately, never starved by a distant deadline.
+pub fn timeout_for_wakeup(
+    deadlines: &Deadlines,
+    now: MonoInstant,
+    x11_backlog: bool,
+    dbus_backlog: bool,
+) -> PollTimeout {
+    if x11_backlog || dbus_backlog {
+        PollTimeout::ZERO
+    } else {
+        deadlines.poll_timeout(now)
+    }
+}
+
+/// Calls `poll_once` with a timeout freshly recomputed from `deadlines`/`clock` on every
+/// attempt, retrying on `EINTR` (design §2 D-6: `Err(Errno::EINTR) => continue`, looping back
+/// to the top of the reactor's own loop rather than re-issuing the same syscall argument). A
+/// signal landing mid-`poll()` must never let an already-armed deadline's *effective* wait
+/// grow — that only holds if the timeout is recomputed against the current `now`, not reused
+/// from before the interruption.
+pub fn poll_retrying<F>(
+    deadlines: &Deadlines,
+    clock: &dyn crate::clock::Clock,
+    mut poll_once: F,
+) -> nix::Result<i32>
+where
+    F: FnMut(PollTimeout) -> nix::Result<i32>,
+{
+    loop {
+        let timeout = deadlines.poll_timeout(clock.now_mono());
+        match poll_once(timeout) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::{Clock, FakeClock, WallTs};
     use std::time::Duration;
+
+    // --- 14.3: budget exhaustion yields PollTimeout::ZERO, never a sleep -------------------
+
+    #[test]
+    fn x11_budget_exhaustion_forces_a_zero_timeout_even_with_a_distant_deadline() {
+        let clock = FakeClock::new(WallTs(0));
+        let mut deadlines = Deadlines::new();
+        let far_future = MonoInstant(clock.now_mono().0 + Duration::from_secs(60));
+        deadlines.arm(Timer::ReconnectBackoff, far_future);
+
+        let timeout = timeout_for_wakeup(&deadlines, clock.now_mono(), true, false);
+
+        assert_eq!(
+            timeout,
+            PollTimeout::ZERO,
+            "an exhausted X11 drain budget means known work is left; sleeping on a distant \
+             deadline instead would defer it, which is exactly the buffered-queue hang D-6 \
+             exists to prevent"
+        );
+    }
+
+    #[test]
+    fn dbus_budget_exhaustion_also_forces_a_zero_timeout() {
+        let clock = FakeClock::new(WallTs(0));
+        let deadlines = Deadlines::new();
+
+        let timeout = timeout_for_wakeup(&deadlines, clock.now_mono(), false, true);
+
+        assert_eq!(timeout, PollTimeout::ZERO);
+    }
+
+    #[test]
+    fn no_backlog_falls_through_to_the_ordinary_deadline_computation() {
+        let clock = FakeClock::new(WallTs(0));
+        let deadlines = Deadlines::new();
+
+        let timeout = timeout_for_wakeup(&deadlines, clock.now_mono(), false, false);
+
+        assert_eq!(timeout, PollTimeout::NONE);
+    }
+
+    // --- 14.3: EINTR retries with a freshly recomputed timeout, never a stale one ----------
+
+    #[test]
+    fn eintr_retry_recomputes_the_timeout_instead_of_reusing_the_pre_interruption_value() {
+        let clock = FakeClock::new(WallTs(0));
+        let mut deadlines = Deadlines::new();
+        let target = MonoInstant(clock.now_mono().0 + Duration::from_secs(10));
+        deadlines.arm(Timer::PauseExpiry, target);
+
+        let mut seen_timeouts = Vec::new();
+        let mut call = 0;
+        let result = poll_retrying(&deadlines, &clock, |timeout| {
+            seen_timeouts.push(timeout);
+            call += 1;
+            if call == 1 {
+                // Simulate real time elapsing inside the interrupted `poll(2)` call before a
+                // signal landed self-pipe-side.
+                clock.advance(Duration::from_secs(4));
+                Err(nix::errno::Errno::EINTR)
+            } else {
+                Ok(0)
+            }
+        });
+
+        assert!(
+            result.is_ok(),
+            "the retry must eventually surface poll()'s real result"
+        );
+        assert_eq!(
+            seen_timeouts.len(),
+            2,
+            "EINTR must cause exactly one retry here"
+        );
+        let first_ms = seen_timeouts[0]
+            .as_millis()
+            .expect("armed deadline is not NONE");
+        let second_ms = seen_timeouts[1]
+            .as_millis()
+            .expect("armed deadline is not NONE");
+        assert!(
+            second_ms < first_ms,
+            "the retry's timeout ({second_ms}ms) must reflect the 4s that already elapsed, \
+             not reuse the pre-interruption {first_ms}ms — an unarmed-looking-armed deadline \
+             whose remaining time silently grows on every signal never actually fires"
+        );
+    }
 
     // --- 14.1: `poll_timeout` rounds a 250.4ms deadline UP to 251ms, never truncates -------
 
