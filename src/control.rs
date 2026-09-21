@@ -282,7 +282,10 @@ pub fn try_read_request_line(
     }
 }
 
-fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
+/// `pub(crate)` so `reactor.rs` (Phase 14) can reuse this already-tested version-before-body
+/// decode when it drives `try_read_request_line` itself, instead of re-implementing R3's
+/// ordering (task 14's CRITICAL fix).
+pub(crate) fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
     let VersionOnly { v } = serde_json::from_slice(line)
         .map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))?;
     if v != PROTOCOL_VERSION {

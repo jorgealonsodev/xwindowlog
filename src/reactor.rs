@@ -5,10 +5,32 @@
 //! fd readiness and deadline expiry into `tracker::SourceEvent`s; state-transition decisions
 //! stay in `tracker.rs` (task 14.12).
 
-use nix::poll::PollTimeout;
+// `ReactorSource`'s own fields, `accept_one`, `service_clients` and `min_timeout` have no
+// consumer yet: `impl WindowSource for ReactorSource` (task 14.7, the next commit of this same
+// phase) is what reads them. This mirrors the same landing-ahead-of-its-consumer pattern
+// `clock.rs`/`tracker.rs` carried through their own early phases (design §8's ordering);
+// removed once a real consumer exists, same as task 15.13's final sweep expects of any allow
+// left over past its reason.
+#![allow(
+    dead_code,
+    reason = "consumed by WindowSource::next_event, landing in the next commit of this phase"
+)]
 
-use crate::clock::MonoInstant;
-use crate::tracker::Timer;
+use std::collections::VecDeque;
+use std::io;
+use std::os::fd::RawFd;
+use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use nix::poll::PollTimeout;
+use nix::unistd::Uid;
+
+use crate::clock::{Clock, MonoInstant};
+use crate::control::{self, Accepted, PauseState, CLIENT_DEADLINE};
+use crate::signals::SelfPipe;
+use crate::tracker::{SourceError, SourceEvent, Timer};
 
 /// The reactor's own deadline set (design §2 D-2): one optional monotonic `Instant` per
 /// `Timer` kind, `arm`ed either by this module itself (`ReconnectBackoff`, `PauseExpiry`,
@@ -76,14 +98,7 @@ impl Deadlines {
     pub fn poll_timeout(&self, now: MonoInstant) -> PollTimeout {
         match self.earliest() {
             None => PollTimeout::NONE,
-            Some((_, at)) => {
-                let left = at.0.saturating_duration_since(now.0);
-                if left.is_zero() {
-                    return PollTimeout::ZERO;
-                }
-                let ms = left.as_millis() + u128::from(left.subsec_nanos() % 1_000_000 != 0);
-                PollTimeout::try_from(ms).unwrap_or(PollTimeout::MAX)
-            }
+            Some((_, at)) => timeout_until(now, at),
         }
     }
 
@@ -107,6 +122,37 @@ impl Deadlines {
             }
         }
         due
+    }
+}
+
+/// Shared rounding logic (design §12 V-3) between [`Deadlines::poll_timeout`] and the
+/// external-deadline merge `ReactorSource::next_event` performs against its `WindowSource`
+/// caller's own `deadline` parameter — both must round a sub-millisecond remainder UP the
+/// same way.
+fn timeout_until(now: MonoInstant, at: MonoInstant) -> PollTimeout {
+    let left = at.0.saturating_duration_since(now.0);
+    if left.is_zero() {
+        return PollTimeout::ZERO;
+    }
+    let ms = left.as_millis() + u128::from(!left.subsec_nanos().is_multiple_of(1_000_000));
+    PollTimeout::try_from(ms).unwrap_or(PollTimeout::MAX)
+}
+
+/// The smaller of two timeouts, treating [`PollTimeout::NONE`] (infinite) as larger than any
+/// finite value — the opposite of what `PollTimeout`'s own derived `Ord` would say, since its
+/// `NONE` is internally `-1`.
+fn min_timeout(a: PollTimeout, b: PollTimeout) -> PollTimeout {
+    match (a.is_none(), b.is_none()) {
+        (true, true) => PollTimeout::NONE,
+        (true, false) => b,
+        (false, true) => a,
+        (false, false) => {
+            if a.as_millis() <= b.as_millis() {
+                a
+            } else {
+                b
+            }
+        }
     }
 }
 
@@ -137,27 +183,264 @@ pub fn timeout_for_wakeup(
     }
 }
 
-/// Calls `poll_once` with a timeout freshly recomputed from `deadlines`/`clock` on every
-/// attempt, retrying on `EINTR` (design §2 D-6: `Err(Errno::EINTR) => continue`, looping back
-/// to the top of the reactor's own loop rather than re-issuing the same syscall argument). A
-/// signal landing mid-`poll()` must never let an already-armed deadline's *effective* wait
-/// grow — that only holds if the timeout is recomputed against the current `now`, not reused
-/// from before the interruption.
-pub fn poll_retrying<F>(
-    deadlines: &Deadlines,
-    clock: &dyn crate::clock::Clock,
-    mut poll_once: F,
-) -> nix::Result<i32>
+/// Calls `poll_once` with a timeout freshly recomputed by `timeout_for` on every attempt,
+/// retrying on `EINTR` (design §2 D-6: `Err(Errno::EINTR) => continue`, looping back to the
+/// top of the reactor's own loop rather than re-issuing the same syscall argument). A signal
+/// landing mid-`poll()` must never let an already-armed deadline's *effective* wait grow —
+/// that only holds if the timeout is recomputed against the current `now` on every retry, not
+/// reused from before the interruption.
+pub fn poll_retrying<T, F>(mut timeout_for: T, mut poll_once: F) -> nix::Result<i32>
 where
+    T: FnMut() -> PollTimeout,
     F: FnMut(PollTimeout) -> nix::Result<i32>,
 {
     loop {
-        let timeout = deadlines.poll_timeout(clock.now_mono());
+        let timeout = timeout_for();
         match poll_once(timeout) {
             Err(nix::errno::Errno::EINTR) => continue,
             other => return other,
         }
     }
+}
+
+/// A budgeted, userspace-buffered event source (design §2 D-6): X11's event queue and the
+/// logind bridge channel both drain multiple buffered items off one `POLLIN` notification, so
+/// a single read is not enough — the fd can be empty while the source's own queue is not. This
+/// trait is the generic shape `ReactorSource` polls fd0/fd1 through; Phase 15's `main.rs`
+/// composition instantiates it with adapters over the real `X11Source`/logind bridge. This
+/// phase's own tests use synthetic pipe-backed doubles (tasks.md PR 14 Work Unit: "no real
+/// X11/D-Bus needed here"), so no `x11rb`/`zbus` type is named anywhere in this module
+/// (task 14.12).
+pub trait BudgetedSource {
+    /// The raw fd whose `POLLIN` means "at least one item may be ready to drain."
+    fn as_raw_fd(&self) -> RawFd;
+
+    /// Flushes any outbound requests before this wakeup's drain. A no-op default covers
+    /// sources with nothing to flush (design §2 D-6: "outbound requests must actually leave").
+    fn flush(&mut self) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// One non-blocking attempt to pull the next already-buffered item, already translated
+    /// into a `SourceEvent`. `Ok(None)` means genuinely empty right now — the drain-before-poll
+    /// stopping condition.
+    fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError>;
+}
+
+/// Drains `source` up to `budget` items into `out`, per D-6's fairness rule (service every
+/// ready source once per wakeup, never one to exhaustion while others wait). Returns whether
+/// the budget was exhausted — the caller's signal that known work is left over and the next
+/// `poll()` timeout must collapse to `PollTimeout::ZERO` rather than sleep on it.
+fn drain_budget<S: BudgetedSource>(
+    source: &mut S,
+    budget: u32,
+    out: &mut VecDeque<SourceEvent>,
+) -> Result<bool, SourceError> {
+    let mut drained = 0;
+    while drained < budget {
+        match source.try_next()? {
+            Some(event) => {
+                out.push_back(event);
+                drained += 1;
+            }
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// An already-accepted, credential-checked control-client fd (design §2 D-5). Kept
+/// non-blocking end to end (task 14's CRITICAL fix): the reactor drives
+/// `control::try_read_request_line` across as many wakeups as it takes, never
+/// `control::service_connection`'s blocking read, so a peer that trickles bytes in slowly
+/// cannot stall any other fd in the poll set. `deadline` is a single `Instant` captured at
+/// `accept()` time and re-checked on every wakeup, never reset per read — the same 1s budget
+/// `CLIENT_DEADLINE` names, enforced here instead of inside a blocking read loop.
+struct ControlClient {
+    stream: std::os::unix::net::UnixStream,
+    partial: Vec<u8>,
+    deadline: Instant,
+}
+
+/// Translates fd readiness and deadline expiry into `tracker::SourceEvent`s (design §2 D-8).
+/// Owns the permanent fd table (design §2 D-2): fd0 `x11` (a `BudgetedSource`), fd1 `logind` (a
+/// `BudgetedSource`), fd2 the signal self-pipe, fd3 the control-socket listener, plus up to
+/// [`control::MAX_CONCURRENT_CLIENTS`] transient accepted control-client fds. Contains no domain
+/// logic — state-transition decisions stay in `tracker.rs` (task 14.12).
+pub struct ReactorSource<X, L, C> {
+    x11: X,
+    logind: L,
+    signals: SelfPipe,
+    listener: UnixListener,
+    clients: Vec<ControlClient>,
+    own_uid: Uid,
+    deadlines: Deadlines,
+    clock: C,
+    /// Design §2 D-12's in-process counter half, behind an `Arc` so an observer (a shutdown
+    /// logger in production; a test asserting "zero wakeups over an idle window" here) can
+    /// read it without owning `self`, including while `next_event` is blocked inside `poll()`
+    /// on another thread.
+    wakeups: Arc<AtomicU64>,
+    /// Events already drained but not yet handed to the caller (design §2 D-6's
+    /// per-wakeup drain can find more than one item; `WindowSource::next_event` hands them out
+    /// one at a time without polling again while this is non-empty).
+    pending: VecDeque<SourceEvent>,
+    /// Whether the control protocol currently believes the daemon is paused, purely to answer
+    /// `AlreadyPaused`/`NotPaused` synchronously per design §5 — the real pause/resume ->
+    /// `tracker`/`store` wiring is task 15.11's job; this flag only tracks what this module
+    /// itself has already told a client, and is expected to move in lockstep with the
+    /// `PauseExpiry` deadline once Phase 15 arms/cancels it through [`Self::arm_timer`].
+    paused: bool,
+}
+
+impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
+    pub fn new(
+        x11: X,
+        logind: L,
+        signals: SelfPipe,
+        listener: UnixListener,
+        own_uid: Uid,
+        clock: C,
+    ) -> Self {
+        ReactorSource {
+            x11,
+            logind,
+            signals,
+            listener,
+            clients: Vec::new(),
+            own_uid,
+            deadlines: Deadlines::new(),
+            clock,
+            wakeups: Arc::new(AtomicU64::new(0)),
+            pending: VecDeque::new(),
+            paused: false,
+        }
+    }
+
+    /// How many times the underlying `poll(2)` call has returned (design §2 D-12's in-process
+    /// counter half). Never incremented for anything except an actual `poll()` return.
+    pub fn wakeups(&self) -> u64 {
+        self.wakeups.load(Ordering::Relaxed)
+    }
+
+    /// A shared, clonable handle onto the wakeup counter, readable independently of `self`
+    /// (design §2 D-12: "logged on shutdown" from wherever shutdown runs, not necessarily the
+    /// reactor thread itself).
+    pub fn wakeups_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.wakeups)
+    }
+
+    /// Arms one of the five deadline kinds (design §2 D-2), for both this module's own
+    /// internal timers (`ReconnectBackoff`, `PauseExpiry`, `SessionReresolve`) and the
+    /// tracker-owned ones (`TitleDebounce`, `DestroyGrace`) applied here by Phase 15's
+    /// composition when it processes a `tracker::Effect::ArmTimer`.
+    pub fn arm_timer(&mut self, timer: Timer, at: MonoInstant) {
+        self.deadlines.arm(timer, at);
+    }
+
+    /// Cancels a previously armed deadline (`tracker::Effect::CancelTimer`).
+    pub fn cancel_timer(&mut self, timer: Timer) {
+        self.deadlines.cancel(timer);
+    }
+}
+
+/// One `accept()` per wakeup at most (design §2 D-6: "bounds the cost of a connect storm
+/// without needing a rate limiter"). Only called when the listener itself reported `POLLIN`;
+/// a queued backlog beyond one connection waits for the next wakeup rather than being drained
+/// here, unlike the budgeted sources above. A free function (not a `ReactorSource` method) so
+/// `WindowSource::next_event` can call it while a `PollFd` slice still holds other fields of
+/// `self` borrowed (task 14.9).
+fn accept_one(listener: &UnixListener, clients: &mut Vec<ControlClient>, own_uid: Uid) {
+    let mut stderr = io::stderr();
+    match control::accept(listener, clients.len(), own_uid, &mut stderr) {
+        Ok(Accepted::Client(stream)) => {
+            let _ = stream.set_nonblocking(true);
+            clients.push(ControlClient {
+                stream,
+                partial: Vec::new(),
+                deadline: Instant::now() + CLIENT_DEADLINE,
+            });
+        }
+        Ok(Accepted::RejectedUid) | Ok(Accepted::RejectedCapacity) => {}
+        Err(_) => {}
+    }
+}
+
+/// Services every already-accepted client fd once: a completed request line is decided and
+/// replied to immediately (translated into a `Pause`/`Resume` `SourceEvent` for the caller); a
+/// client past its own deadline is dropped without a reply (design §5's 1s budget); everyone
+/// else keeps their partial buffer for the next wakeup. Never blocks — this drives
+/// `control::try_read_request_line` exclusively, never `control::service_connection`'s
+/// blocking read (task 14's CRITICAL fix). A free function for the same disjoint-borrow reason
+/// as [`accept_one`].
+fn service_clients(
+    clients: &mut Vec<ControlClient>,
+    paused: &mut bool,
+    now_wall: crate::clock::WallTs,
+    out: &mut VecDeque<SourceEvent>,
+) {
+    let now = Instant::now();
+    clients.retain_mut(|client| {
+        if now >= client.deadline {
+            return false;
+        }
+        match control::try_read_request_line(&mut client.stream, &mut client.partial) {
+            Ok(Some(line)) => {
+                if let Some(event) = decide(&line, paused, now_wall, &mut client.stream) {
+                    out.push_back(event);
+                }
+                false
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    });
+}
+
+/// Decodes one complete request line, decides the reply against `paused` (the wire-protocol's
+/// own `AlreadyPaused`/`NotPaused` bookkeeping — see [`ReactorSource::paused`]'s doc), writes
+/// the reply, and returns the `Pause`/`Resume` `SourceEvent` a caller should feed to the
+/// tracker. Reuses `control::parse_envelope`'s already-tested version-before-body decode (R3)
+/// rather than re-implementing it here.
+fn decide(
+    line: &[u8],
+    paused: &mut bool,
+    now_wall: crate::clock::WallTs,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Option<SourceEvent> {
+    use crate::control::{Request, Response};
+    use std::io::Write as _;
+
+    let (response, event) = match control::parse_envelope(line) {
+        Ok(envelope) => {
+            let state = if *paused {
+                PauseState::Paused
+            } else {
+                PauseState::Active
+            };
+            let response = control::handle_request(&envelope.req, state);
+            let event = match (&envelope.req, &response) {
+                (Request::Pause { minutes }, Response::Ok { .. }) => {
+                    *paused = true;
+                    let until = minutes.map(|m| {
+                        crate::clock::WallTs::new(now_wall.as_unix_secs() + i64::from(m) * 60)
+                    });
+                    Some(SourceEvent::Pause { until })
+                }
+                (Request::Resume, Response::Ok { .. }) => {
+                    *paused = false;
+                    Some(SourceEvent::Resume)
+                }
+                _ => None,
+            };
+            (response, event)
+        }
+        Err(response) => (response, None),
+    };
+    let mut body = serde_json::to_vec(&response).unwrap_or_default();
+    body.push(b'\n');
+    let _ = stream.write_all(&body);
+    event
 }
 
 #[cfg(test)]
@@ -217,18 +500,21 @@ mod tests {
 
         let mut seen_timeouts = Vec::new();
         let mut call = 0;
-        let result = poll_retrying(&deadlines, &clock, |timeout| {
-            seen_timeouts.push(timeout);
-            call += 1;
-            if call == 1 {
-                // Simulate real time elapsing inside the interrupted `poll(2)` call before a
-                // signal landed self-pipe-side.
-                clock.advance(Duration::from_secs(4));
-                Err(nix::errno::Errno::EINTR)
-            } else {
-                Ok(0)
-            }
-        });
+        let result = poll_retrying(
+            || deadlines.poll_timeout(clock.now_mono()),
+            |timeout| {
+                seen_timeouts.push(timeout);
+                call += 1;
+                if call == 1 {
+                    // Simulate real time elapsing inside the interrupted `poll(2)` call before
+                    // a signal landed self-pipe-side.
+                    clock.advance(Duration::from_secs(4));
+                    Err(nix::errno::Errno::EINTR)
+                } else {
+                    Ok(0)
+                }
+            },
+        );
 
         assert!(
             result.is_ok(),
