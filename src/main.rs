@@ -5,11 +5,16 @@
 //! application (task 15.12). No state-machine or storage logic is duplicated here; it all stays
 //! in `tracker.rs`/`store.rs`, reached only through their existing public API.
 
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use nix::fcntl::{Flock, FlockArg};
 
 mod config;
+
+use config::{ConfigError, DaemonConfig};
 
 /// RF-19 (partial): the subset of Annex B's full subcommand list this phase delivers.
 /// `mcp`/`install` land in Phase 2, `export`/`doctor` in Phase 3 (proposal *Scope adjustments*).
@@ -70,15 +75,7 @@ enum Command {
 enum ExitStatus {
     Ok = 0,
     Failure = 1,
-    #[allow(
-        dead_code,
-        reason = "wired by the flock/daemon work unit landing right after this one"
-    )]
     State = 2,
-    #[allow(
-        dead_code,
-        reason = "wired by the flock/daemon work unit landing right after this one"
-    )]
     Environment = 3,
 }
 
@@ -91,9 +88,8 @@ impl From<ExitStatus> for ExitCode {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Daemon => run_daemon(),
         Command::Completions { shell } => print_completions(shell),
-        // `Daemon`'s real behavior (config load, flock, reactor composition) lands in the next
-        // work unit of this phase; argument parsing/dispatch is task 15.1's whole scope.
         _ => not_yet_implemented(),
     }
 }
@@ -114,4 +110,95 @@ fn print_completions(shell: clap_complete::Shell) -> ExitCode {
         &mut std::io::stdout(),
     );
     ExitStatus::Ok.into()
+}
+
+/// The lock-file name inside `$XDG_RUNTIME_DIR` (design §2 D-2 fd table, daemon-lifecycle
+/// "Single instance via flock").
+const LOCK_FILE_NAME: &str = "xwindowlog.lock";
+
+#[derive(Debug)]
+enum StartupError {
+    Config(ConfigError),
+    NoRuntimeDir,
+    AlreadyRunning,
+    Lock(std::io::Error),
+}
+
+impl StartupError {
+    fn exit_status(&self) -> ExitStatus {
+        match self {
+            StartupError::Config(_) | StartupError::NoRuntimeDir | StartupError::Lock(_) => {
+                ExitStatus::Environment
+            }
+            StartupError::AlreadyRunning => ExitStatus::State,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            StartupError::Config(e) => format!("xwindowlog: {e}"),
+            StartupError::NoRuntimeDir => {
+                "xwindowlog: $XDG_RUNTIME_DIR is not set; cannot locate the lock/control socket"
+                    .to_string()
+            }
+            StartupError::AlreadyRunning => {
+                "xwindowlog: another instance is already running (lock held on the runtime lock \
+                 file)"
+                    .to_string()
+            }
+            StartupError::Lock(e) => format!("xwindowlog: failed to open the lock file: {e}"),
+        }
+    }
+}
+
+/// Resolves `$XDG_RUNTIME_DIR`, the same directory RF-49's control socket and RF-34's lock file
+/// both live in (design §2 D-5: "no new trust boundary").
+fn runtime_dir() -> Result<PathBuf, StartupError> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or(StartupError::NoRuntimeDir)
+}
+
+/// Acquires `flock(2)` `LOCK_EX | LOCK_NB` on `$XDG_RUNTIME_DIR/xwindowlog.lock` (RF-21, RF-34).
+/// A `SIGKILL`ed predecessor's lock is released by the kernel before this ever runs, so opening
+/// (never truncating) the same path always finds either no lock or a live holder — never a
+/// stale one (daemon-lifecycle "A crashed instance's lock is released automatically").
+fn acquire_lock(runtime_dir: &Path) -> Result<Flock<File>, StartupError> {
+    let path = runtime_dir.join(LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(StartupError::Lock)?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_file, errno)| {
+        if errno == nix::errno::Errno::EWOULDBLOCK {
+            StartupError::AlreadyRunning
+        } else {
+            StartupError::Lock(std::io::Error::from(errno))
+        }
+    })
+}
+
+fn run_daemon() -> ExitCode {
+    match try_run_daemon() {
+        Ok(()) => ExitStatus::Ok.into(),
+        Err(err) => {
+            eprintln!("{}", err.message());
+            err.exit_status().into()
+        }
+    }
+}
+
+fn try_run_daemon() -> Result<(), StartupError> {
+    let _config = DaemonConfig::load_default().map_err(StartupError::Config)?;
+    let runtime_dir = runtime_dir()?;
+    let _lock = acquire_lock(&runtime_dir)?;
+
+    // Composition beyond the lock (reactor construction, X11/logind/store wiring, signal
+    // handling) lands in later work units of this phase; holding the lock is this unit's whole
+    // observable contract (task 15.3/15.4).
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }

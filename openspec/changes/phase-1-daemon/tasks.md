@@ -935,12 +935,12 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
       wiring `afk_threshold_seconds`, `title_debounce_ms`, `mode`,
       `sanitize_secrets`, `status_show_title`, `retention_days`,
       `disable_default_excludes` into the constructed `Excluder`/`Tracker`.
-- [ ] 15.3 RED (E2E, real process): `flock(2)` `LOCK_EX|LOCK_NB` on
+- [x] 15.3 RED (E2E, real process): `flock(2)` `LOCK_EX|LOCK_NB` on
       `$XDG_RUNTIME_DIR/xwindowlog.lock`; a second instance exits non-zero
       with a clear message without killing/interrupting the first; a
       `SIGKILL`ed previous instance releases the lock automatically and the
       next instance starts normally (RF-21/RF-34, both scenarios).
-- [ ] 15.4 GREEN: implement the `flock` acquisition and the "another
+- [x] 15.4 GREEN: implement the `flock` acquisition and the "another
       instance" exit path — this is also `status`'s "is the daemon running"
       mechanism (a non-blocking `flock` attempt), consumed by Phase 16.
 - [ ] 15.5 RED (E2E): `SIGTERM` closes the currently open interval with
