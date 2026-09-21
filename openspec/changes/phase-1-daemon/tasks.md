@@ -872,48 +872,48 @@ Threat-matrix rows: "Process integration — control socket" (design §7).
 (in-process counter half). Design's own "highest-risk logic" (§4 File
 Changes rationale for splitting this module out).
 
-- [ ] 14.1 RED: `poll_timeout` rounds a 250.4 ms deadline **up** to 251ms,
+- [x] 14.1 RED: `poll_timeout` rounds a 250.4 ms deadline **up** to 251ms,
       not truncated down to 250 (the D-2 spin-bug regression test, exercising
       the verified truncating behavior of `TryFrom<Duration> for
       PollTimeout`, design §12 V-3); an empty deadline set yields
       `PollTimeout::NONE`.
-- [ ] 14.2 GREEN: implement `Deadlines` (`DestroyGrace`, `TitleDebounce`,
+- [x] 14.2 GREEN: implement `Deadlines` (`DestroyGrace`, `TitleDebounce`,
       `ReconnectBackoff`, `PauseExpiry`, `SessionReresolve`) and
       `poll_timeout` with explicit round-up, driven by `FakeClock` — no real
       fds in this test.
-- [ ] 14.3 RED: `EINTR` from `poll(2)` retries without losing an
+- [x] 14.3 RED: `EINTR` from `poll(2)` retries without losing an
       already-armed deadline; budget exhaustion (`X11_BUDGET=64`/
       `DBUS_BUDGET=32`) yields `PollTimeout::ZERO`, not a sleep (D-6's
       fairness rule).
-- [ ] 14.4 GREEN: implement the main reactor loop per design §2 D-6 — flush
+- [x] 14.4 GREEN: implement the main reactor loop per design §2 D-6 — flush
       outbound X11 requests, drain X11's userspace event queue up to budget
       before polling, drain the logind channel up to budget, apply effects,
       compute the timeout, `poll()`, handle `EINTR` by looping, and fire due
       deadlines **on every wakeup, not only on `Ok(0)`**.
-- [ ] 14.5 GREEN: assemble the permanent fd table (design §2 D-2): fd0 X11
+- [x] 14.5 GREEN: assemble the permanent fd table (design §2 D-2): fd0 X11
       connection (Phase 9-11), fd1 logind bridge `eventfd` (Phase 12), fd2
       signal self-pipe (Phase 13), fd3 control-socket listener (Phase 13),
       plus up to 4 transient accepted control-client fds.
-- [ ] 14.6 RED: `ReactorSource` (`impl WindowSource for ReactorSource`) wakes
+- [x] 14.6 RED: `ReactorSource` (`impl WindowSource for ReactorSource`) wakes
       exactly once for a synthetic X11 change with no prior read, and issues
       zero wakeups over a synthetic 60s idle window with nothing pending
       anywhere (window-capture "No busy-waiting between changes";
       daemon-lifecycle "Zero wakeups over an idle window") — the first place
       both scenarios are provable end to end, using synthetic fds.
-- [ ] 14.7 GREEN: implement `impl WindowSource for ReactorSource`
+- [x] 14.7 GREEN: implement `impl WindowSource for ReactorSource`
       translating fd readiness/deadline expiry into `SourceEvent`s.
-- [ ] 14.8 RED: control-socket `accept()` is limited to one per wakeup
+- [x] 14.8 RED: control-socket `accept()` is limited to one per wakeup
       (bounds a connect-storm without a rate limiter, D-6).
-- [ ] 14.9 GREEN: implement accept-throttling.
-- [ ] 14.10 RED: a wakeup is always attributable to a real monitored source
+- [x] 14.9 GREEN: implement accept-throttling.
+- [x] 14.10 RED: a wakeup is always attributable to a real monitored source
       or a real armed deadline, never an unconditional periodic re-check
       (daemon-lifecycle "A wakeup is attributable to a real event or a real
       deadline") — an instrumentation test recording the cause of each
       observed wakeup during a scripted synthetic run.
-- [ ] 14.11 GREEN: implement the in-process `wakeups: u64` counter (D-12),
+- [x] 14.11 GREEN: implement the in-process `wakeups: u64` counter (D-12),
       incremented on every `poll()` return, logged at `debug` on shutdown —
       completed by Phase 19's per-thread `schedstat` half.
-- [ ] 14.12 REFACTOR: confirm `reactor.rs` contains no domain logic — it
+- [x] 14.12 REFACTOR: confirm `reactor.rs` contains no domain logic — it
       translates fd/deadline events into `SourceEvent`s and applies
       `Effect`s; state-transition decisions stay in `tracker.rs`.
 
