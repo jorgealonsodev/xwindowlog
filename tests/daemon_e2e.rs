@@ -641,3 +641,73 @@ fn sighup_applies_new_exclusion_rules_without_altering_past_intervals() {
     let status = daemon.0.wait().expect("wait");
     assert_eq!(status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------------------------
+// 15.9/15.10: SIGKILL mid-run, then restart, recovers to a consistent state (RNF-6)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn sigkill_then_restart_recovers_to_a_consistent_state() {
+    let env = DaemonEnv::new("sigkill-restart-recovery");
+    let wm = FakeWm::connect(env.xvfb.display());
+    wm.declare_ewmh_supported();
+
+    // 1. First instance: capture one active interval, then SIGKILL it mid-run — no chance to
+    // run its own CloseOnly/lock-release path at all.
+    {
+        let mut first = spawn_daemon(&env);
+        wait_for_file(&env.lock_path(), Duration::from_secs(5));
+        activate_window_until_observed(&env, &wm, "app-a", "Doc A", Duration::from_secs(10));
+        first.0.kill().expect("SIGKILL must succeed");
+        first.0.wait().expect("wait on the killed instance");
+    }
+    let stale_row = most_recent_interval(&env.db_path()).expect("a stale row must exist");
+    assert_eq!(
+        stale_row.end, None,
+        "the killed instance never closed its own interval"
+    );
+
+    // 2. Restart against the SAME database and lock path: must start cleanly (no
+    // idx_intervals_one_open violation, no crash) and RF-36 must close the stale row.
+    let mut second = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(row) = most_recent_interval(&env.db_path()) {
+            if row.state == "unknown" && row.end.is_none() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "RF-36 recovery never opened its own `unknown` interval within 10s of restart"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        any_interval_matches(&env.db_path(), "app-a", "Doc A").expect("query must succeed"),
+        "the stale interval survives, closed rather than rewritten"
+    );
+    let recovered_row = most_recent_interval(&env.db_path()).expect("recovered row must exist");
+    assert_ne!(
+        recovered_row.app, "app-a",
+        "recovery's own unknown row must be a NEW row, not a mutation of the stale one"
+    );
+
+    // 3. A real event after restart must TRANSITION cleanly — the regression
+    // `resuming_after_recovery` (tracker.rs) exists to prevent is a live
+    // idx_intervals_one_open violation exactly here, which would surface as the daemon
+    // crashing (StoreError) instead of a second interval ever being observed.
+    activate_window_until_observed(&env, &wm, "app-b", "Doc B", Duration::from_secs(10));
+    let status_check = second.0.try_wait().expect("try_wait must not error");
+    assert_eq!(
+        status_check, None,
+        "the restarted daemon must still be alive after a post-recovery transition, not have \
+         crashed on a storage invariant violation"
+    );
+
+    send_signal(second.0.id(), nix::sys::signal::Signal::SIGTERM);
+    let status = second.0.wait().expect("wait");
+    assert_eq!(status.code(), Some(0));
+}

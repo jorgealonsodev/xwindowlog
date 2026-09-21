@@ -955,11 +955,11 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
       unit-level `Excluder`-swap test end to end).
 - [x] 15.8 GREEN: wire `SourceEvent::ReloadConfig` to the `Excluder`
       hot-swap inside `ReactorSource`, invisible to the tracker.
-- [ ] 15.9 RED (E2E, `SIGKILL` + restart): killing the daemon mid-run and
+- [x] 15.9 RED (E2E, `SIGKILL` + restart): killing the daemon mid-run and
       restarting it recovers to a consistent, uncorrupted database, Phase 3's
       startup recovery closing the stale interval (RNF-6, "SIGKILL followed
       by restart recovers to a consistent state").
-- [ ] 15.10 GREEN: fix whatever full-process composition gaps 15.9 surfaces
+- [x] 15.10 GREEN: fix whatever full-process composition gaps 15.9 surfaces
       (this is the RNF-6/RF-36 end-to-end proof, not new logic).
 - [ ] 15.11 GREEN: wire the control-socket `Pause`/`Resume` requests (Phase
       13) through `tracker.rs`'s `Pause{until}`/`Resume` events to
