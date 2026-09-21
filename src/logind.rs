@@ -301,6 +301,8 @@ pub fn init_session_monitor() -> (Option<ZbusSessionMonitor>, Option<String>) {
 pub enum LogindEvent {
     LockedHintChanged(bool),
     PrepareForSleep(bool),
+    /// A bridge thread's signal iterator ended (bus restart/drop); no longer silent.
+    BridgeDied,
 }
 
 /// Bridge-to-reactor event queue (design §2 D-3): bounded, drop-oldest-on-full with a
@@ -329,6 +331,43 @@ impl EventQueue {
         let events = queue.drain(..).collect();
         let lagged = self.lagged.swap(false, Ordering::Relaxed);
         (events, lagged)
+    }
+}
+
+/// Runs `handle` per item; once `iter` ends, pushes `BridgeDied` so exit is observable.
+fn run_bridge_loop<T>(
+    iter: impl Iterator<Item = T>,
+    events: &EventQueue,
+    event_fd: &EventFd,
+    mut handle: impl FnMut(T, &EventQueue, &EventFd),
+) {
+    for item in iter {
+        handle(item, events, event_fd);
+    }
+    events.push(LogindEvent::BridgeDied);
+    let _ = event_fd.write(1);
+}
+
+/// How long a steady-state D-Bus round trip may block before it's treated as a failure.
+const DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Generalizes `connect_bounded`'s throwaway-thread pattern to any steady-state D-Bus call.
+fn call_bounded<T: Send + 'static>(
+    f: impl FnOnce() -> zbus::Result<T> + Send + 'static,
+    timeout: Duration,
+) -> Result<T, SessionError> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("xwl-logind-call".to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| SessionError(format!("failed to spawn D-Bus call thread: {e}")))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(SessionError(e.to_string())),
+        Err(_) => Err(SessionError("D-Bus call timed out".to_string())),
     }
 }
 
@@ -365,6 +404,8 @@ pub struct ZbusSessionMonitor {
     // Kept alive for the daemon's lifetime; never joined (the process owns these threads
     // until it exits, matching D-3's transports).
     bridge_threads: Vec<thread::JoinHandle<()>>,
+    /// Refuse-second-spawn guard: set once the `lockedhint` bridge thread exists.
+    lockedhint_bridge_spawned: bool,
 }
 
 impl ZbusSessionMonitor {
@@ -403,12 +444,17 @@ impl ZbusSessionMonitor {
             events.clone(),
             event_fd.clone(),
             move |events, event_fd| {
-                for msg in sleep_signals {
-                    if let Ok(going_to_sleep) = msg.body().deserialize::<bool>() {
-                        events.push(LogindEvent::PrepareForSleep(going_to_sleep));
-                        let _ = event_fd.write(1);
-                    }
-                }
+                run_bridge_loop(
+                    sleep_signals,
+                    &events,
+                    &event_fd,
+                    |msg, events, event_fd| {
+                        if let Ok(going_to_sleep) = msg.body().deserialize::<bool>() {
+                            events.push(LogindEvent::PrepareForSleep(going_to_sleep));
+                            let _ = event_fd.write(1);
+                        }
+                    },
+                );
             },
         )?;
 
@@ -420,6 +466,7 @@ impl ZbusSessionMonitor {
             events,
             event_fd,
             bridge_threads: vec![sleep_thread],
+            lockedhint_bridge_spawned: false,
         })
     }
 
@@ -432,6 +479,11 @@ impl ZbusSessionMonitor {
     /// overflowed (design §2 D-3's `lagged`).
     pub fn drain_events(&self) -> (Vec<LogindEvent>, bool) {
         self.events.drain()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bridge_thread_count(&self) -> usize {
+        self.bridge_threads.len()
     }
 }
 
@@ -450,19 +502,23 @@ impl SessionMonitor for ZbusSessionMonitor {
         )
         .map_err(|e| SessionError(e.to_string()))?;
 
-        session
-            .get_property::<bool>("LockedHint")
-            .map_err(|e| SessionError(e.to_string()))
+        call_bounded(
+            move || session.get_property::<bool>("LockedHint"),
+            DBUS_CALL_TIMEOUT,
+        )
     }
 
     fn take_sleep_inhibitor(&mut self) -> Result<(), SessionError> {
-        let fd: zbus::zvariant::OwnedFd = self
-            .manager
-            .call(
-                "Inhibit",
-                &("sleep", "xwindowlog", "Recording session activity", "delay"),
-            )
-            .map_err(|e| SessionError(e.to_string()))?;
+        let manager = self.manager.clone();
+        let fd: zbus::zvariant::OwnedFd = call_bounded(
+            move || {
+                manager.call(
+                    "Inhibit",
+                    &("sleep", "xwindowlog", "Recording session activity", "delay"),
+                )
+            },
+            DBUS_CALL_TIMEOUT,
+        )?;
         self.inhibit_fd = Some(fd.into());
         Ok(())
     }
@@ -472,10 +528,17 @@ impl SessionMonitor for ZbusSessionMonitor {
     }
 
     fn resolve_session(&mut self, pid: u32) -> Result<(), SessionError> {
-        let path: zbus::zvariant::OwnedObjectPath = self
-            .manager
-            .call("GetSessionByPID", &(pid,))
-            .map_err(|e| SessionError(e.to_string()))?;
+        let manager = self.manager.clone();
+        let path: zbus::zvariant::OwnedObjectPath = call_bounded(
+            move || manager.call("GetSessionByPID", &(pid,)),
+            DBUS_CALL_TIMEOUT,
+        )?;
+
+        // Refuse-second-spawn: RF-26 re-resolution updates `session_path` only, past the first.
+        if self.lockedhint_bridge_spawned {
+            self.session_path = Some(path);
+            return Ok(());
+        }
 
         let properties = zbus::blocking::Proxy::new(
             &self.connection,
@@ -499,25 +562,32 @@ impl SessionMonitor for ZbusSessionMonitor {
             self.events.clone(),
             self.event_fd.clone(),
             move |events, event_fd| {
-                for msg in locked_hint_signals {
-                    let Ok((_iface, changed, _invalidated)) = msg.body().deserialize::<(
-                        String,
-                        HashMap<String, zbus::zvariant::OwnedValue>,
-                        Vec<String>,
-                    )>() else {
-                        continue;
-                    };
-                    let Some(value) = changed.get("LockedHint") else {
-                        continue;
-                    };
-                    if let Ok(locked) = bool::try_from(value.clone()) {
-                        events.push(LogindEvent::LockedHintChanged(locked));
-                        let _ = event_fd.write(1);
-                    }
-                }
+                run_bridge_loop(
+                    locked_hint_signals,
+                    &events,
+                    &event_fd,
+                    |msg, events, event_fd| {
+                        let Ok((_iface, changed, _invalidated)) = msg.body().deserialize::<(
+                            String,
+                            HashMap<String, zbus::zvariant::OwnedValue>,
+                            Vec<String>,
+                        )>(
+                        ) else {
+                            return;
+                        };
+                        let Some(value) = changed.get("LockedHint") else {
+                            return;
+                        };
+                        if let Ok(locked) = bool::try_from(value.clone()) {
+                            events.push(LogindEvent::LockedHintChanged(locked));
+                            let _ = event_fd.write(1);
+                        }
+                    },
+                );
             },
         )?;
         self.bridge_threads.push(thread);
+        self.lockedhint_bridge_spawned = true;
 
         self.session_path = Some(path);
         Ok(())
@@ -807,5 +877,53 @@ mod tests {
         monitor.release_sleep_inhibitor();
         // No further assertion: releasing drops the `OwnedFd`, which closes it on `Drop`.
         // Definition of done requires no leaked fd across the whole suite, checked externally.
+    }
+
+    #[test]
+    fn real_bus_resolve_session_twice_spawns_only_one_lockedhint_bridge() {
+        if !require_real_bus() {
+            return;
+        }
+
+        let mut monitor = ZbusSessionMonitor::connect().expect("system bus must be reachable");
+        monitor
+            .resolve_session(std::process::id())
+            .expect("first resolve must succeed");
+        let after_first = monitor.bridge_thread_count();
+
+        monitor
+            .resolve_session(std::process::id())
+            .expect("second resolve must succeed");
+
+        assert_eq!(
+            monitor.bridge_thread_count(),
+            after_first,
+            "a repeat resolve_session call must not spawn another bridge thread"
+        );
+    }
+
+    #[test]
+    fn bridge_loop_end_pushes_bridge_died_so_it_is_visible_to_the_reactor() {
+        let events = EventQueue::default();
+        let event_fd = EventFd::from_flags(EfdFlags::EFD_NONBLOCK).unwrap();
+
+        run_bridge_loop(std::iter::empty::<()>(), &events, &event_fd, |_, _, _| {});
+
+        let (drained, _lagged) = events.drain();
+        assert_eq!(drained, vec![LogindEvent::BridgeDied]);
+    }
+
+    #[test]
+    fn bounded_call_times_out_against_a_call_that_never_returns() {
+        let result: Result<(), SessionError> = call_bounded(
+            || {
+                thread::sleep(Duration::from_secs(2));
+                Ok(())
+            },
+            Duration::from_millis(50),
+        );
+
+        let SessionError(message) = result.expect_err("expected the call to time out");
+        assert_eq!(message, "D-Bus call timed out");
     }
 }
