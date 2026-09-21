@@ -1,31 +1,258 @@
 //! Phase 15 `main.rs` composition E2E tests: a real compiled `xwindowlog` binary, real
-//! processes, real signals (tasks.md Phase 15's Work Units row). Focused command for this
-//! slice: `cargo test --test daemon_e2e -- flock`.
+//! processes, real signals, a real `Xvfb` (tasks.md Phase 15's Work Units row). Focused
+//! command for this slice: `cargo test --test daemon_e2e -- flock`.
 //!
-//! Each test gets its own `$XDG_RUNTIME_DIR` (a fresh scratch directory) so daemon instances
-//! from different tests never contend on the same lock file, matching `x11_integration.rs`'s
-//! own per-test-isolation precedent for `$DISPLAY`.
+//! Each test gets its own `$XDG_RUNTIME_DIR`/`$XDG_DATA_HOME`/`$XDG_CONFIG_HOME` (fresh scratch
+//! directories) and its own `Xvfb` display, so daemon instances from different tests never
+//! contend on the same lock file or window server — matching `x11_integration.rs`'s own
+//! per-test-isolation precedent, and reusing its `openbox`-absence rationale (this file's
+//! module doc for the deviation, `x11_integration.rs`'s for the full history): a second,
+//! plain `x11rb` connection performs exactly the requests a real EWMH window manager would.
+#![allow(
+    dead_code,
+    reason = "the FakeWm harness and DaemonEnv::db_path are consumed by the SIGTERM/SIGHUP/ \
+              SIGKILL E2E tests landing in the very next work units of this phase; this allow \
+              does not survive past them"
+)]
 
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// A scratch `$XDG_RUNTIME_DIR`, removed on drop. Real `pam_systemd`-provided runtime
-/// directories are mode `0700`; this one does not need to be, since RF-21/RF-34's `flock`
-/// mechanism (not directory permissions) is what this test file exercises.
-struct ScratchRuntimeDir(PathBuf);
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{
+    AtomEnum, ConnectionExt as _, CreateWindowAux, PropMode, Window, WindowClass,
+};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
-impl ScratchRuntimeDir {
+// ---------------------------------------------------------------------------------------------
+// Xvfb + FakeWm harness (mirrors tests/x11_integration.rs's own, trimmed to what this file's
+// daemon-level tests need: one window, EWMH declared, an active window, and a title).
+// ---------------------------------------------------------------------------------------------
+
+static NEXT_DISPLAY_OFFSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Kept well clear of `x11_integration.rs`'s own `DISPLAY_BASE` (213+) and any developer
+/// desktop session, so the two test binaries never collide even when run concurrently.
+const DISPLAY_BASE: u32 = 313;
+
+struct XvfbGuard {
+    child: Child,
+    display: String,
+    /// Kept alive for the guard's whole lifetime — see `x11_integration.rs`'s `XvfbGuard` doc
+    /// for why dropping the readiness-probe connection risks a close-down-reset race.
+    _keepalive: RustConnection,
+}
+
+impl XvfbGuard {
+    fn display(&self) -> &str {
+        &self.display
+    }
+}
+
+impl Drop for XvfbGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_display_number() -> u32 {
+    loop {
+        let n =
+            DISPLAY_BASE + NEXT_DISPLAY_OFFSET.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if x11rb::connect(Some(&format!(":{n}"))).is_err() {
+            return n;
+        }
+    }
+}
+
+fn spawn_xvfb() -> XvfbGuard {
+    let display = format!(":{}", free_display_number());
+    let child = Command::new("Xvfb")
+        .arg(&display)
+        .args(["-screen", "0", "320x240x24", "-nolisten", "tcp"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Xvfb must be installed for tests/daemon_e2e.rs");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let keepalive = loop {
+        if let Ok((conn, _screen_num)) = x11rb::connect(Some(&display)) {
+            break conn;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Xvfb on {display} did not become ready within 10s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    XvfbGuard {
+        child,
+        display,
+        _keepalive: keepalive,
+    }
+}
+
+fn intern(conn: &RustConnection, name: &[u8]) -> u32 {
+    conn.intern_atom(false, name)
+        .expect("intern_atom request")
+        .reply()
+        .expect("intern_atom reply")
+        .atom
+}
+
+/// A minimal stand-in for a real EWMH window manager — see this file's module doc.
+struct FakeWm {
+    conn: RustConnection,
+    root: Window,
+    net_supported: u32,
+    net_supporting_wm_check: u32,
+    net_active_window: u32,
+    net_wm_name: u32,
+    utf8_string: u32,
+}
+
+impl FakeWm {
+    fn connect(display: &str) -> Self {
+        let (conn, screen_num) = x11rb::connect(Some(display)).expect("fake WM connect");
+        let root = conn.setup().roots[screen_num].root;
+        FakeWm {
+            net_supported: intern(&conn, b"_NET_SUPPORTED"),
+            net_supporting_wm_check: intern(&conn, b"_NET_SUPPORTING_WM_CHECK"),
+            net_active_window: intern(&conn, b"_NET_ACTIVE_WINDOW"),
+            net_wm_name: intern(&conn, b"_NET_WM_NAME"),
+            utf8_string: intern(&conn, b"UTF8_STRING"),
+            conn,
+            root,
+        }
+    }
+
+    fn declare_ewmh_supported(&self) {
+        let check_window = self.create_window();
+        for target in [self.root, check_window] {
+            self.conn
+                .change_property32(
+                    PropMode::REPLACE,
+                    target,
+                    self.net_supporting_wm_check,
+                    AtomEnum::WINDOW,
+                    &[check_window],
+                )
+                .expect("set _NET_SUPPORTING_WM_CHECK request")
+                .check()
+                .expect("set _NET_SUPPORTING_WM_CHECK reply");
+        }
+        self.conn
+            .change_property32(
+                PropMode::REPLACE,
+                self.root,
+                self.net_supported,
+                AtomEnum::ATOM,
+                &[self.net_active_window, self.net_supporting_wm_check],
+            )
+            .expect("set _NET_SUPPORTED request")
+            .check()
+            .expect("set _NET_SUPPORTED reply");
+        self.conn.flush().expect("flush");
+    }
+
+    fn create_window(&self) -> Window {
+        let win = self.conn.generate_id().expect("generate_id");
+        self.conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                self.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::COPY_FROM_PARENT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .expect("create_window request")
+            .check()
+            .expect("create_window reply");
+        self.conn.flush().expect("flush");
+        win
+    }
+
+    fn map_window(&self, window: Window) {
+        self.conn
+            .map_window(window)
+            .expect("map_window request")
+            .check()
+            .expect("map_window reply");
+        self.conn.flush().expect("flush");
+    }
+
+    fn set_active_window(&self, window: Window) {
+        self.conn
+            .change_property32(
+                PropMode::REPLACE,
+                self.root,
+                self.net_active_window,
+                AtomEnum::WINDOW,
+                &[window],
+            )
+            .expect("set _NET_ACTIVE_WINDOW request")
+            .check()
+            .expect("set _NET_ACTIVE_WINDOW reply");
+        self.conn.flush().expect("flush");
+    }
+
+    fn set_title(&self, window: Window, title: &str) {
+        self.conn
+            .change_property8(
+                PropMode::REPLACE,
+                window,
+                self.net_wm_name,
+                self.utf8_string,
+                title.as_bytes(),
+            )
+            .expect("set _NET_WM_NAME request")
+            .check()
+            .expect("set _NET_WM_NAME reply");
+        self.conn.flush().expect("flush");
+    }
+}
+
+/// Creates, maps, declares EWMH-active, and titles one application window in one call — every
+/// daemon-level test in this file needs exactly this and nothing more granular.
+fn spawn_focused_window(wm: &FakeWm, title: &str) -> Window {
+    wm.declare_ewmh_supported();
+    let window = wm.create_window();
+    wm.map_window(window);
+    wm.set_title(window, title);
+    wm.set_active_window(window);
+    window
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scratch XDG directories and daemon process management
+// ---------------------------------------------------------------------------------------------
+
+/// A scratch directory, removed on drop. Used for `$XDG_RUNTIME_DIR`, `$XDG_CONFIG_HOME` and
+/// `$XDG_DATA_HOME` alike — none of the tests in this file depend on real `pam_systemd`-style
+/// permissions, only on each daemon instance getting its own isolated set of paths.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
     fn new(label: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "xwindowlog-test-runtime-{label}-{}-{n}",
+            "xwindowlog-test-scratch-{label}-{}-{n}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).expect("create scratch XDG_RUNTIME_DIR must succeed");
-        ScratchRuntimeDir(dir)
+        std::fs::create_dir_all(&dir).expect("create scratch directory must succeed");
+        ScratchDir(dir)
     }
 
     fn path(&self) -> &std::path::Path {
@@ -33,14 +260,45 @@ impl ScratchRuntimeDir {
     }
 }
 
-impl Drop for ScratchRuntimeDir {
+impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Every scratch directory + display a spawned daemon needs, held together so each test only
+/// tracks one value; also fixes the display each daemon connects to.
+struct DaemonEnv {
+    runtime_dir: ScratchDir,
+    config_home: ScratchDir,
+    data_home: ScratchDir,
+    xvfb: XvfbGuard,
+}
+
+impl DaemonEnv {
+    fn new(label: &str) -> Self {
+        DaemonEnv {
+            runtime_dir: ScratchDir::new(&format!("{label}-runtime")),
+            config_home: ScratchDir::new(&format!("{label}-config")),
+            data_home: ScratchDir::new(&format!("{label}-data")),
+            xvfb: spawn_xvfb(),
+        }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.runtime_dir.path().join("xwindowlog.lock")
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.data_home
+            .path()
+            .join("xwindowlog")
+            .join("xwindowlog.db")
+    }
+}
+
 /// A running `xwindowlog daemon` child, killed on drop so a failing assertion never leaks a
-/// process holding a flock into the next test.
+/// process holding a flock (or an Xvfb connection) into the next test.
 struct DaemonChild(Child);
 
 impl Drop for DaemonChild {
@@ -50,11 +308,13 @@ impl Drop for DaemonChild {
     }
 }
 
-fn spawn_daemon(runtime_dir: &std::path::Path, config_home: &std::path::Path) -> DaemonChild {
+fn spawn_daemon(env: &DaemonEnv) -> DaemonChild {
     let child = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
         .arg("daemon")
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("XDG_CONFIG_HOME", env.config_home.path())
+        .env("XDG_DATA_HOME", env.data_home.path())
+        .env("DISPLAY", env.xvfb.display())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -80,19 +340,15 @@ fn wait_for_file(path: &std::path::Path, timeout: Duration) {
 
 #[test]
 fn second_daemon_instance_exits_nonzero_while_the_first_holds_the_lock() {
-    let runtime_dir = ScratchRuntimeDir::new("second-instance");
-    let config_home = ScratchRuntimeDir::new("second-instance-config");
-    let _first = spawn_daemon(runtime_dir.path(), config_home.path());
-    wait_for_file(
-        &runtime_dir.path().join("xwindowlog.lock"),
-        Duration::from_secs(5),
-    );
+    let env = DaemonEnv::new("second-instance");
+    let _first = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
     // The first instance holds an exclusive, non-blocking lock the instant the file exists
     // (`acquire_lock` creates then immediately locks it), so a short settle is enough to avoid
     // a race against the open()-then-flock() gap.
     std::thread::sleep(Duration::from_millis(100));
 
-    let mut second = spawn_daemon(runtime_dir.path(), config_home.path());
+    let mut second = spawn_daemon(&env);
     let status = second
         .0
         .wait()
@@ -126,13 +382,11 @@ fn second_daemon_instance_exits_nonzero_while_the_first_holds_the_lock() {
 
 #[test]
 fn a_sigkilled_instances_lock_is_released_automatically() {
-    let runtime_dir = ScratchRuntimeDir::new("sigkill-lock-release");
-    let config_home = ScratchRuntimeDir::new("sigkill-lock-release-config");
-    let lock_path = runtime_dir.path().join("xwindowlog.lock");
+    let env = DaemonEnv::new("sigkill-lock-release");
 
     {
-        let mut first = spawn_daemon(runtime_dir.path(), config_home.path());
-        wait_for_file(&lock_path, Duration::from_secs(5));
+        let mut first = spawn_daemon(&env);
+        wait_for_file(&env.lock_path(), Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(100));
         // SIGKILL, not a graceful terminate: the kernel — not this process's own cleanup —
         // must be what releases the flock (daemon-lifecycle "A crashed instance's lock is
@@ -144,8 +398,8 @@ fn a_sigkilled_instances_lock_is_released_automatically() {
             .expect("waiting on the killed instance must succeed");
     }
 
-    let mut second = spawn_daemon(runtime_dir.path(), config_home.path());
-    wait_for_file(&lock_path, Duration::from_secs(5));
+    let mut second = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
     std::thread::sleep(Duration::from_millis(200));
     let status = second.0.try_wait().expect("try_wait must not error");
     assert_eq!(
