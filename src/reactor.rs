@@ -955,6 +955,66 @@ mod tests {
         );
     }
 
+    // --- 13.4a (regression, Phase 15+16): an oversized/unterminated request must be rejected
+    // through the real production caller, not only the unit-level `try_read_request_line` ----
+
+    #[test]
+    fn an_oversized_request_without_a_newline_is_rejected_and_frees_its_slot() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+
+        let (x11, _x11_writer) = SyntheticSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, socket_path) = bind_test_listener("oversized-request");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+
+        let mut client = UnixStream::connect(&socket_path).expect("connect must succeed");
+        // No trailing `\n` anywhere: only the byte cap can end this, never a completed line.
+        let payload = vec![b'x'; control::MAX_REQUEST_BYTES + 100];
+        client.write_all(&payload).expect("write must succeed");
+
+        let start = Instant::now();
+        // Well short of CLIENT_DEADLINE's 1s: if this only passed because the idle-client
+        // timeout fired instead of the byte cap, it would still be waiting past this deadline.
+        let deadline = MonoInstant(Instant::now() + Duration::from_millis(400));
+        let event = reactor
+            .next_event(Some(deadline))
+            .expect("next_event must not error");
+
+        assert_eq!(
+            event, None,
+            "an oversized, unterminated request must never produce a SourceEvent"
+        );
+        assert_eq!(
+            reactor.clients.len(),
+            0,
+            "a client whose request exceeded MAX_REQUEST_BYTES must be evicted, freeing its \
+             MAX_CONCURRENT_CLIENTS slot"
+        );
+        assert!(
+            start.elapsed() < CLIENT_DEADLINE,
+            "the oversized request must be rejected well before CLIENT_DEADLINE's 1s idle \
+             timeout, proving the byte cap itself fired, not the unrelated deadline"
+        );
+
+        // Matches the reject/close semantics `service_clients` already applies to every other
+        // rejected client (deadline expiry, I/O error): no reply, connection just closes.
+        let mut reply = Vec::new();
+        match client.read_to_end(&mut reply) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+        assert!(reply.is_empty(), "an oversized request must get no reply");
+    }
+
     // --- R3-accept-failure-spin: a persistent accept() failure must back off, never spin ----
 
     #[test]

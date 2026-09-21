@@ -21,16 +21,11 @@ const PROTOCOL_VERSION: u8 = 1;
 
 /// Request body cap (design §7 threat matrix, §5 wire-protocol constraints).
 ///
-/// **Known gap, disclosed rather than silently dropped (Phase 15 task 15.13):** this bound was
-/// only enforced by the blocking `read_request_line`/`service_connection` pair, which the
-/// dead-code sweep below removes because `reactor.rs`'s non-blocking `try_read_request_line`
-/// (task 14's CRITICAL fix) is the only production reader and does not itself apply it — its
-/// `partial: Vec<u8>` grows unbounded until a `\n` arrives or `ControlClient`'s 1s
-/// `CLIENT_DEADLINE` reaps the connection. Design §5's own threat-model rationale ("the control
-/// socket does not widen the threat model" — a same-uid peer already has full read access, and
-/// the exposure is bounded to one second of local, same-uid byte-feeding) is why this is
-/// recorded as a disclosed gap rather than fixed under this sweep: applying it belongs with
-/// `reactor.rs`'s already-shipped, already-tested Phase 14 code, not this REFACTOR.
+/// Enforced directly inside [`try_read_request_line`], the only request-reading path left in
+/// the crate: a body that grows past this bound without a trailing `\n` is rejected there
+/// (task 13.4a). Restored as a regression fix after Phase 15's dead-code sweep removed the
+/// blocking `read_request_line`/`service_connection` pair — the only place this bound was
+/// previously enforced — without moving the check into the non-blocking path that replaced it.
 pub const MAX_REQUEST_BYTES: usize = 4096;
 
 /// At most this many clients hold a transient fd at once; the next one is accepted and
@@ -245,7 +240,23 @@ pub fn try_read_request_line(
         match stream.read(&mut byte) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed")),
             Ok(_) if byte[0] == b'\n' => return Ok(Some(std::mem::take(partial))),
-            Ok(_) => partial.push(byte[0]),
+            Ok(_) => {
+                partial.push(byte[0]);
+                // 13.4a (regression, Phase 15+16): this is the ONLY request-reading path left
+                // in the crate (see this fn's doc), so MAX_REQUEST_BYTES must be enforced right
+                // here or it is enforced nowhere. Checked after the push, matching the
+                // pre-Phase-15 blocking `read_request_line`'s `> MAX_REQUEST_BYTES` boundary: a
+                // body of exactly MAX_REQUEST_BYTES followed by `\n` still succeeds.
+                if partial.len() > MAX_REQUEST_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "control request exceeded {MAX_REQUEST_BYTES} bytes without a \
+                             trailing newline"
+                        ),
+                    ));
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e),
         }
@@ -392,6 +403,60 @@ mod tests {
             .unwrap()
             .expect("a complete line must be returned once the newline arrives");
         assert_eq!(line, b"abc");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- 13.4a (regression, Phase 15+16): a request over MAX_REQUEST_BYTES without a
+    // trailing `\n` must be rejected by the live non-blocking path, not merely by the removed
+    // blocking `read_request_line` ---------------------------------------------------------
+
+    #[test]
+    fn try_read_request_line_rejects_a_request_over_the_byte_cap() {
+        let (listener, path) = spawn_test_listener("oversized-nonblocking");
+        let mut client = UnixStream::connect(&path).unwrap();
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut partial = Vec::new();
+
+        // No trailing `\n` anywhere in this payload: a correct cap must reject it outright
+        // rather than let `partial` grow past MAX_REQUEST_BYTES waiting for one.
+        let payload = vec![b'x'; MAX_REQUEST_BYTES + 100];
+        client.write_all(&payload).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let result = try_read_request_line(&mut server_stream, &mut partial);
+        assert!(
+            result.is_err(),
+            "a request exceeding MAX_REQUEST_BYTES without a newline must be rejected, not \
+             buffered forever in `partial`"
+        );
+        assert!(
+            partial.len() <= MAX_REQUEST_BYTES + 1,
+            "partial must be rejected at most one byte past MAX_REQUEST_BYTES, not left to \
+             grow toward the full oversized payload (observed {})",
+            partial.len()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_read_request_line_accepts_a_request_exactly_at_the_byte_cap() {
+        let (listener, path) = spawn_test_listener("cap-boundary");
+        let mut client = UnixStream::connect(&path).unwrap();
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut partial = Vec::new();
+
+        let mut payload = vec![b'x'; MAX_REQUEST_BYTES];
+        payload.push(b'\n');
+        client.write_all(&payload).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let line = try_read_request_line(&mut server_stream, &mut partial)
+            .expect(
+                "a request whose body is exactly MAX_REQUEST_BYTES, newline-terminated, \
+                     must still succeed",
+            )
+            .expect("a complete line must be returned once the newline arrives");
+        assert_eq!(line.len(), MAX_REQUEST_BYTES);
         let _ = std::fs::remove_file(&path);
     }
 
