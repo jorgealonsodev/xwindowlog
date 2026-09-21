@@ -290,6 +290,23 @@ impl Tracker {
         }
     }
 
+    /// Phase 15 composition (task 15.10): `store.rs`'s own `recover_on_startup` (RF-36) always
+    /// leaves exactly one `unknown` interval open, from `since`, before the daemon's first real
+    /// event runs — regardless of whether this is a fresh database or a crash recovery. Without
+    /// telling a freshly-constructed tracker that an interval is already open, its first real
+    /// event would emit `Effect::OpenOnly` instead of `Effect::Transition` (see
+    /// `open_or_transition`'s `has_opened_interval` branch below), which leaves that recovered
+    /// row open forever alongside the newly-opened one — a live `idx_intervals_one_open`
+    /// violation the moment any real window event arrives after a restart. This is exactly the
+    /// "full-process composition gap" task 15.10 exists to fix, not new state-machine logic:
+    /// it only seeds bookkeeping the tracker already carries.
+    #[must_use]
+    pub fn resuming_after_recovery(mut self, since: WallTs) -> Self {
+        self.has_opened_interval = true;
+        self.interval_start = since;
+        self
+    }
+
     /// Applies one event and returns the effects the caller must perform.
     /// `now_mono` is only consulted by events that arm a monotonic deadline
     /// (`TitleChanged`, `ActiveWindowDestroyed`) — see the module-level
@@ -706,6 +723,45 @@ mod tests {
             pid: None,
             state,
         }
+    }
+
+    // --- 15.10: `resuming_after_recovery` makes the first post-restart event a Transition,
+    // never an OpenOnly that would leave RF-36's recovered `unknown` row open forever --------
+
+    #[test]
+    fn fresh_tracker_first_event_opens_only_no_prior_interval_to_close() {
+        let clock = FakeClock::new(WallTs(1_000));
+        let mut tracker = Tracker::new();
+
+        let effects = send(
+            &mut tracker,
+            SourceEvent::ActiveWindow(Some(window("firefox", "GitHub", None))),
+            &clock,
+        );
+
+        assert!(
+            matches!(effects.as_slice(), [Effect::OpenOnly { .. }]),
+            "a genuinely fresh tracker has nothing open yet: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn recovered_tracker_first_event_transitions_instead_of_opening_a_second_interval() {
+        let clock = FakeClock::new(WallTs(1_000));
+        let mut tracker = Tracker::new().resuming_after_recovery(WallTs(900));
+
+        let effects = send(
+            &mut tracker,
+            SourceEvent::ActiveWindow(Some(window("firefox", "GitHub", None))),
+            &clock,
+        );
+
+        assert!(
+            matches!(effects.as_slice(), [Effect::Transition { .. }]),
+            "store.rs's RF-36 recovery already left one `unknown` interval open; the first \
+             real event after a restart must close it, not open a second one alongside it \
+             (a live idx_intervals_one_open violation): {effects:?}"
+        );
     }
 
     #[test]
