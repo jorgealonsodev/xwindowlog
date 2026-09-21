@@ -251,16 +251,47 @@ fn read_request_line(stream: &mut UnixStream, deadline: Duration) -> Result<Vec<
     }
 }
 
+#[derive(Deserialize)]
+struct VersionOnly {
+    v: u8,
+}
+
+/// Parses `v` before the internally-tagged `cmd` body, so a future-version request answers
+/// `UnsupportedVersion` even when its body isn't valid v1 grammar (R3) — `{"v":2}` and
+/// `{"v":2,"cmd":"<future>"}` never reach the full `Envelope` decode below.
+/// One non-blocking attempt to advance a request line, for a future poll-driven reactor
+/// (Phase 14) to call between servicing other fds instead of blocking this thread on one
+/// connection (R4). Chosen over further shrinking `CLIENT_DEADLINE`, which would still block
+/// the caller, just for less time. Residual bound: this call itself never blocks, but the
+/// caller still owns re-polling before its own deadline elapses — `reactor.rs` (Phase 14),
+/// unwritten, is what will drive that loop.
+pub fn try_read_request_line(
+    stream: &mut UnixStream,
+    partial: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
+    stream.set_nonblocking(true)?;
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed")),
+            Ok(_) if byte[0] == b'\n' => return Ok(Some(std::mem::take(partial))),
+            Ok(_) => partial.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn parse_envelope(line: &[u8]) -> Result<Envelope, Response> {
-    let envelope: Envelope = serde_json::from_slice(line)
+    let VersionOnly { v } = serde_json::from_slice(line)
         .map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))?;
-    if envelope.v != PROTOCOL_VERSION {
+    if v != PROTOCOL_VERSION {
         return Err(Response::err(
             ErrCode::UnsupportedVersion,
-            format!("unsupported protocol version {}", envelope.v),
+            format!("unsupported protocol version {v}"),
         ));
     }
-    Ok(envelope)
+    serde_json::from_slice(line).map_err(|e| Response::err(ErrCode::Malformed, e.to_string()))
 }
 
 fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
@@ -333,6 +364,10 @@ pub fn send_resume(socket_path: &Path) -> io::Result<Response> {
 
 fn send_request(socket_path: &Path, req: Request) -> io::Result<Response> {
     let mut stream = UnixStream::connect(socket_path)?;
+    // R4: the daemon bounds its peer at CLIENT_DEADLINE but gave this client none, so a
+    // busy-not-crashed daemon left it blocked forever; bound both directions here too.
+    stream.set_read_timeout(Some(CLIENT_DEADLINE))?;
+    stream.set_write_timeout(Some(CLIENT_DEADLINE))?;
     let envelope = Envelope {
         v: PROTOCOL_VERSION,
         req,
@@ -433,6 +468,90 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
         assert_eq!(parsed["error"], "unsupported_version");
         assert_eq!(parsed["ok"], false);
+        assert!(matches!(
+            server.join().unwrap(),
+            Serviced::Responded(Response::Err {
+                error: ErrCode::UnsupportedVersion,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- R4: a non-blocking, resumable read path a future poll-driven reactor can drive -----
+
+    #[test]
+    fn try_read_request_line_never_blocks_and_resumes_across_calls() {
+        let (listener, path) = spawn_test_listener("nonblocking");
+        let mut client = UnixStream::connect(&path).unwrap();
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut partial = Vec::new();
+
+        let start = Instant::now();
+        assert!(matches!(
+            try_read_request_line(&mut server_stream, &mut partial),
+            Ok(None)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "an attempt with no data waiting must never block on the read"
+        );
+
+        client.write_all(b"ab").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            try_read_request_line(&mut server_stream, &mut partial),
+            Ok(None)
+        ));
+        assert_eq!(partial, b"ab", "partial bytes must persist across calls");
+
+        client.write_all(b"c\n").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let line = try_read_request_line(&mut server_stream, &mut partial)
+            .unwrap()
+            .expect("a complete line must be returned once the newline arrives");
+        assert_eq!(line, b"abc");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- R3: version is checked before the body is decoded, not only when v1 grammar matches
+
+    #[test]
+    fn unsupported_version_wins_over_a_missing_cmd_field() {
+        let (listener, path) = spawn_test_listener("v2-nocmd");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"{\"v\":2}\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
+        assert_eq!(parsed["error"], "unsupported_version");
+        assert!(matches!(
+            server.join().unwrap(),
+            Serviced::Responded(Response::Err {
+                error: ErrCode::UnsupportedVersion,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unsupported_version_wins_over_an_unrecognized_future_cmd() {
+        let (listener, path) = spawn_test_listener("v2-futurecmd");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            service_connection(stream, PauseState::Active, &mut io::sink()).unwrap()
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"{\"v\":2,\"cmd\":\"snooze\"}\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(reply.trim_end()).unwrap();
+        assert_eq!(parsed["error"], "unsupported_version");
         assert!(matches!(
             server.join().unwrap(),
             Serviced::Responded(Response::Err {
@@ -586,6 +705,32 @@ mod tests {
         let _ = std::fs::remove_file(&path2);
     }
 
+    // --- R4: the CLI client bounds its own wait; a silent peer cannot hold it indefinitely --
+
+    #[test]
+    fn cli_client_read_times_out_against_a_silent_peer() {
+        let (listener, path) = spawn_test_listener("clienttimeout");
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Accepts and holds the connection open without ever replying — outlives the
+            // client's own read deadline, simulating an alive-but-not-servicing daemon.
+            thread::sleep(Duration::from_secs(3));
+        });
+        let start = Instant::now();
+        let result = send_resume(&path);
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "a silent peer must not be able to fabricate a reply"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the client must give up within its own read deadline, not wait on the peer: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        drop(server);
+    }
+
     // --- 13.6: the CLI client section above never depends on `store` -----------------------
 
     #[test]
@@ -598,9 +743,21 @@ mod tests {
             .find("#[cfg(test)]")
             .expect("the CLI client section is followed by the test module");
         let block = &source[block_start..block_start + section_end];
+        // R2: scan every `use` line in the WHOLE file, not a substring of this slice — the
+        // missed case was a `use crate::store::...;` sitting with the other imports at the top
+        // of the file, outside the old slice. Token-matched (so it can't trip on doc-comment
+        // prose elsewhere that merely mentions `store`) and independent of the banner comment
+        // text, so rewording it can't defeat this check either.
+        let mentions_store = source
+            .lines()
+            .filter(|l| l.trim_start().starts_with("use "))
+            .any(|l| {
+                l.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|tok| tok.eq_ignore_ascii_case("store"))
+            });
         assert!(
-            !block.to_ascii_lowercase().contains("store"),
-            "the pause/resume CLI client must never depend on crate::store \
+            !mentions_store,
+            "this module (including the CLI client) must never depend on crate::store \
              (daemon-lifecycle: pause/resume clients never write intervals directly)"
         );
         assert!(
