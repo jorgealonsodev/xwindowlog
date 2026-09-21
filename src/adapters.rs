@@ -4,12 +4,6 @@
 //! fd1). The translation logic itself is split into plain functions with no fd/`BudgetedSource`
 //! involved at all, so it is unit-testable the same way `reactor.rs`'s own tests use synthetic
 //! doubles instead of real X11/D-Bus (tasks.md Phase 14's precedent).
-#![allow(
-    dead_code,
-    reason = "consumed by main.rs's daemon composition landing in a later work unit of this \
-              phase; this allow does not survive past it"
-)]
-
 use std::cell::RefCell;
 use std::os::fd::RawFd;
 use std::rc::Rc;

@@ -943,11 +943,11 @@ instance half via flock config), RF-21, RF-33, RF-34, RF-36 (E2E), RF-49
 - [x] 15.4 GREEN: implement the `flock` acquisition and the "another
       instance" exit path — this is also `status`'s "is the daemon running"
       mechanism (a non-blocking `flock` attempt), consumed by Phase 16.
-- [ ] 15.5 RED (E2E): `SIGTERM` closes the currently open interval with
+- [x] 15.5 RED (E2E): `SIGTERM` closes the currently open interval with
       `end` = signal-receipt instant, commits the closure, releases the lock
       file and any held session inhibitor, exits `0`; `SIGINT` behaves
       identically (RF-33, both scenarios).
-- [ ] 15.6 GREEN: wire `signals.rs`'s `Shutdown` event through `tracker.rs`'s
+- [x] 15.6 GREEN: wire `signals.rs`'s `Shutdown` event through `tracker.rs`'s
       `CloseOnly` effect to `store.rs`, then lock/inhibitor release and exit.
 - [ ] 15.7 RED (E2E): editing `config.toml` and sending `SIGHUP` causes
       subsequent captures to use the updated exclusion rules without

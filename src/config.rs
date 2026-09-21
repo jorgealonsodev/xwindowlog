@@ -8,11 +8,6 @@
 //! own "no config.toml at all" behavior) — RF-48's default exclusion list stays active either
 //! way. A present-but-invalid file IS an error: composition must not silently start capturing
 //! under half-applied configuration.
-#![allow(
-    dead_code,
-    reason = "consumed by `main.rs`'s `daemon` subcommand landing in the very next work unit \
-              of this phase; this allow does not survive past it"
-)]
 
 use std::env;
 use std::fs;
@@ -93,17 +88,21 @@ impl std::error::Error for ConfigError {
 }
 
 /// The result of loading and validating `config.toml`, with every value already wired into the
-/// types that consume it (task 15.2).
-#[allow(
-    dead_code,
-    reason = "wired into full daemon composition by a later work unit of this phase; removed \
-              by the Phase 15 dead-code sweep (task 15.13)"
-)]
+/// types that consume it (task 15.2). `status_show_title`/`retention_days` are read by Phase
+/// 16's `status` and Phase 17's `prune` respectively — not yet, hence the narrow allow below.
 pub struct DaemonConfig {
     pub excluder: Excluder,
     pub tracker: Tracker,
     pub afk_threshold: Duration,
+    #[allow(
+        dead_code,
+        reason = "consumed by Phase 16's `status` subcommand, not yet implemented"
+    )]
     pub status_show_title: bool,
+    #[allow(
+        dead_code,
+        reason = "consumed by Phase 17's `prune` subcommand default, not yet implemented"
+    )]
     pub retention_days: u32,
 }
 
