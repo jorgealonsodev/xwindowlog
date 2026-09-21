@@ -785,15 +785,15 @@ against the code as it stood, never by reverting a fix afterwards.
 
 **Traces:** RF-5, RF-26, RF-27, RF-65, design §2 D-13.
 
-- [ ] 12.1 GREEN (trait first, no isolated RED): define `SessionMonitor`
+- [x] 12.1 GREEN (trait first, no isolated RED): define `SessionMonitor`
       (`locked_hint`, `take_sleep_inhibitor`, `release_sleep_inhibitor`,
       `resolve_session`) and `FakeSessionMonitor` per design §2 D-13.
-- [ ] 12.2 RED (driven entirely by `FakeSessionMonitor`, no real D-Bus):
+- [x] 12.2 RED (driven entirely by `FakeSessionMonitor`, no real D-Bus):
       `Lock()` observed but `LockedHint` still `false` → no transition;
       `LockedHint: false→true` → closes current interval, opens `locked` at
       the property-change instant; `LockedHint: true→false` → closes
       `locked`, opens `unknown` (RF-5, all three scenarios).
-- [ ] 12.3 GREEN: implement `LockedHint`-as-source-of-truth surfacing
+- [x] 12.3 GREEN: implement `LockedHint`-as-source-of-truth surfacing
       `SourceEvent::SessionLocked`/`SessionUnlocked`.
 - [ ] 12.4 RED: session resolves via `GetSessionByPID(<own PID>)`, never
       `$XDG_SESSION_ID`; a failed resolution logs, continues without
