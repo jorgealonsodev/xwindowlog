@@ -36,8 +36,10 @@ zbus = "5"
 rusqlite = { version = "0.32", features = ["bundled", "functions", "backup"] }
 
 # Reactor primitives: poll(2), PollFd, PollTimeout (design.md D-2, verified
-# V-1..V-5 in §12), SO_PEERCRED (V-5), umask/flock (RF-10, RF-34).
-nix = { version = "0.30", features = ["poll", "socket", "fs", "signal"] }
+# V-1..V-5 in §12), SO_PEERCRED (V-5), umask/flock (RF-10, RF-34). "event" adds
+# `nix::sys::eventfd::EventFd`, the logind bridge's wakeup fd (design.md D-3,
+# src/logind.rs, Phase 12).
+nix = { version = "0.30", features = ["poll", "socket", "fs", "signal", "event"] }
 
 # Signal self-pipe + flags (design.md D-4, assumption A-3).
 signal-hook = "0.3"

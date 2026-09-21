@@ -809,16 +809,16 @@ against the code as it stood, never by reverting a fix afterwards.
       startup (RF-27, all three scenarios).
 - [x] 12.7 GREEN: implement inhibitor acquisition/release and the
       `PrepareForSleep` handlers.
-- [ ] 12.8 RED: no D-Bus session bus reachable at startup → a warning is
+- [x] 12.8 RED: no D-Bus session bus reachable at startup → a warning is
       logged, session-state features are unavailable, window capture
       continues normally (RF-65).
-- [ ] 12.9 GREEN: implement the entirely-unreachable-D-Bus startup path.
-- [ ] 12.10 GREEN: implement `ZbusSessionMonitor` — the only file naming a
+- [x] 12.9 GREEN: implement the entirely-unreachable-D-Bus startup path.
+- [x] 12.10 GREEN: implement `ZbusSessionMonitor` — the only file naming a
       `zbus` type (T-3 mitigation) — using `zbus::blocking` plus its own
       bridge thread and `eventfd` exactly per design §2 D-3, with
       `Builder::stack_size(64 * 1024)` on the bridge thread (RNF-1
       mitigation).
-- [ ] 12.11 REFACTOR: grep the crate for any `zbus` type outside
+- [x] 12.11 REFACTOR: grep the crate for any `zbus` type outside
       `logind.rs`; confirm there is none.
 
 ---

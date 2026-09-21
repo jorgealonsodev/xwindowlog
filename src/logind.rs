@@ -1,15 +1,40 @@
-//! `SessionMonitor` trait (D-13) and `FakeSessionMonitor`, its test double.
+//! `SessionMonitor` trait (D-13), `ZbusSessionMonitor`, `FakeSessionMonitor`, the `xwl-logind`
+//! bridge threads and their `eventfd` (D-3). The only file naming a `zbus`/`zvariant` type
+//! (T-3 mitigation, task 12.11).
 //!
-//! **Phase 12, tasks 12.1-12.7 (RF-5, RF-26, RF-27).** `SessionMonitor` is the in-house
-//! trait D-13 specifies; `FakeSessionMonitor` drives every degraded path with no D-Bus at
-//! all. `LockedHintTracker` turns raw `LockedHint` samples into the
+//! **Phase 12 scope (tasks 12.1-12.11, RF-5, RF-26, RF-27, RF-65).** `SessionMonitor` is the
+//! in-house trait D-13 specifies; `FakeSessionMonitor` drives every degraded path with no
+//! D-Bus at all. `LockedHintTracker` turns raw `LockedHint` samples into the
 //! `SourceEvent::SessionLocked`/`SessionUnlocked` edges `tracker.rs` already knows how to
 //! apply (RF-5) — a `Lock()` D-Bus signal is not even a variant this type accepts, so it
 //! cannot, by construction, produce a transition. `resolve_session_at_startup` and
-//! `SuspendInhibitor` cover RF-26/RF-27's retry-and-degrade paths.
+//! `SuspendInhibitor` cover RF-26/RF-27's retry-and-degrade paths. `connect_bounded` and
+//! `init_session_monitor_with` cover RF-65: a bus that never completes its handshake cannot
+//! block daemon startup, and total D-Bus absence degrades to a logged warning, not a fatal
+//! error. `ZbusSessionMonitor` is the production impl; its two bridge threads
+//! (`xwl-logind-sleep`, `xwl-logind-lockedhint`) each install their D-Bus match rule
+//! synchronously, on the caller's thread, before spawning — so no signal sent during the
+//! spawn window is lost.
+//!
+//! **Deviation from design §2 D-3's diagram.** D-3 draws one bridge thread. This file uses
+//! two (`PrepareForSleep` on the `Manager` interface, `PropertiesChanged` on the resolved
+//! session's `Properties` interface): `zbus::blocking`'s signal iterators each block on their
+//! own `.next()`, and multiplexing two independent blocking sources on one OS thread needs
+//! either `epoll`-over-zbus-internals (not exposed) or hand-written async composition, which
+//! is out of scope for a module whose whole point (D-13) is confining `zbus` to this file
+//! without growing an async runtime here. Reported as a stated deviation, not a silent one;
+//! the thread-count consequence (RNF-1) is one more than D-3's own "3-4" estimate.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use nix::sys::eventfd::{EfdFlags, EventFd};
 
 use crate::tracker::SourceEvent;
 
@@ -211,6 +236,294 @@ impl SuspendInhibitor {
     }
 }
 
+/// How long `connect_bounded` waits for a connection attempt before treating the bus as
+/// unreachable (RF-65).
+const BUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds a D-Bus connect attempt so a bus that accepts the socket and then stalls the SASL
+/// handshake cannot block daemon startup forever (RF-65, task 12.8/12.9).
+///
+/// `method_timeout` cannot do this: zbus 5.19.0 applies it only *after* the handshake
+/// completes (`zbus-5.19.0/src/blocking/connection/builder.rs:595,603`), and
+/// `zbus::blocking::Connection::system()` bypasses the connection builder entirely (`system()`
+/// is `block_on(crate::Connection::system())`,
+/// `zbus-5.19.0/src/blocking/connection/mod.rs:42`), so it can never carry one anyway. `connect`
+/// therefore runs on a throwaway thread; a stalling bus leaves that thread parked on `connect`
+/// forever — an accepted one-thread leak, never a startup hang.
+fn connect_bounded(
+    connect: Box<dyn FnOnce() -> zbus::Result<zbus::blocking::Connection> + Send>,
+    timeout: Duration,
+) -> Result<zbus::blocking::Connection, SessionError> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("xwl-logind-connect".to_string())
+        .spawn(move || {
+            let _ = tx.send(connect());
+        })
+        .map_err(|e| SessionError(format!("failed to spawn D-Bus connect thread: {e}")))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(SessionError(e.to_string())),
+        Err(_) => Err(SessionError(
+            "D-Bus system bus connection attempt timed out".to_string(),
+        )),
+    }
+}
+
+/// RF-65: attempts session monitoring, degrading to a logged warning — never a fatal error —
+/// when D-Bus/logind is entirely unreachable. `connect` is a parameter so the degrade path
+/// itself is unit-testable without touching any real socket (task 12.9).
+fn init_session_monitor_with<F>(connect: F) -> (Option<ZbusSessionMonitor>, Option<String>)
+where
+    F: FnOnce() -> Result<ZbusSessionMonitor, SessionError>,
+{
+    match connect() {
+        Ok(monitor) => (Some(monitor), None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "session-state tracking (lock/suspend) unavailable, D-Bus unreachable: {err:?}"
+            )),
+        ),
+    }
+}
+
+/// RF-65's production entry point: window capture, exclusion and storage all start up
+/// regardless of what this returns.
+pub fn init_session_monitor() -> (Option<ZbusSessionMonitor>, Option<String>) {
+    init_session_monitor_with(ZbusSessionMonitor::connect)
+}
+
+/// Owned event handed from a bridge thread to the reactor (design §2 D-3). No `zbus`/
+/// `zvariant` type crosses this boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogindEvent {
+    LockedHintChanged(bool),
+    PrepareForSleep(bool),
+}
+
+/// Bridge-to-reactor event queue (design §2 D-3): bounded, drop-oldest-on-full with a
+/// `lagged` flag the reactor turns into a forced `LockedHint` re-read — a logind event storm
+/// degrades latency but never blocks capture.
+const EVENT_QUEUE_CAPACITY: usize = 32;
+
+#[derive(Debug, Default)]
+struct EventQueue {
+    inner: Mutex<VecDeque<LogindEvent>>,
+    lagged: AtomicBool,
+}
+
+impl EventQueue {
+    fn push(&self, event: LogindEvent) {
+        let mut queue = self.inner.lock().expect("logind event queue lock poisoned");
+        if queue.len() >= EVENT_QUEUE_CAPACITY {
+            queue.pop_front();
+            self.lagged.store(true, Ordering::Relaxed);
+        }
+        queue.push_back(event);
+    }
+
+    fn drain(&self) -> (Vec<LogindEvent>, bool) {
+        let mut queue = self.inner.lock().expect("logind event queue lock poisoned");
+        let events = queue.drain(..).collect();
+        let lagged = self.lagged.swap(false, Ordering::Relaxed);
+        (events, lagged)
+    }
+}
+
+/// Spawns a named bridge thread (design §2 D-3) with `RNF-1`'s bounded 64 KiB stack. `run`
+/// receives the shared queue/eventfd so it can push translated events; the D-Bus match rule
+/// this thread drains must already be installed by the caller before this is invoked (see
+/// `ZbusSessionMonitor::connect`/`resolve_session`), so nothing sent during the spawn window
+/// is lost.
+fn spawn_bridge_thread<F>(
+    name: &str,
+    events: Arc<EventQueue>,
+    event_fd: Arc<EventFd>,
+    run: F,
+) -> Result<thread::JoinHandle<()>, SessionError>
+where
+    F: FnOnce(Arc<EventQueue>, Arc<EventFd>) + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(64 * 1024)
+        .spawn(move || run(events, event_fd))
+        .map_err(|e| SessionError(format!("failed to spawn {name}: {e}")))
+}
+
+/// The production `SessionMonitor` (D-13, task 12.10). The only type in the crate naming a
+/// `zbus`/`zvariant` type (task 12.11).
+pub struct ZbusSessionMonitor {
+    connection: zbus::blocking::Connection,
+    manager: zbus::blocking::Proxy<'static>,
+    session_path: Option<zbus::zvariant::OwnedObjectPath>,
+    inhibit_fd: Option<std::os::fd::OwnedFd>,
+    events: Arc<EventQueue>,
+    event_fd: Arc<EventFd>,
+    // Kept alive for the daemon's lifetime; never joined (the process owns these threads
+    // until it exits, matching D-3's transports).
+    bridge_threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl ZbusSessionMonitor {
+    /// Connects to the real system bus, bounded per `connect_bounded`, and starts the
+    /// `PrepareForSleep` bridge (RF-27's suspend half). `resolve_session` starts the second
+    /// bridge (`LockedHint`) once a session path is known.
+    pub fn connect() -> Result<Self, SessionError> {
+        let connection = connect_bounded(
+            Box::new(zbus::blocking::Connection::system),
+            BUS_CONNECT_TIMEOUT,
+        )?;
+
+        let manager = zbus::blocking::Proxy::new_owned(
+            connection.clone(),
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .map_err(|e| SessionError(e.to_string()))?;
+
+        let events = Arc::new(EventQueue::default());
+        let event_fd = Arc::new(
+            EventFd::from_flags(EfdFlags::EFD_NONBLOCK)
+                .map_err(|e| SessionError(format!("eventfd() failed: {e}")))?,
+        );
+
+        // Match rule installed synchronously here (`SignalStream::new` awaits
+        // `MessageStream::for_match_rule`, zbus-5.19.0 src/proxy/mod.rs) before the bridge
+        // thread spawns below.
+        let sleep_signals = manager
+            .receive_signal("PrepareForSleep")
+            .map_err(|e| SessionError(e.to_string()))?;
+
+        let sleep_thread = spawn_bridge_thread(
+            "xwl-logind-sleep",
+            events.clone(),
+            event_fd.clone(),
+            move |events, event_fd| {
+                for msg in sleep_signals {
+                    if let Ok(going_to_sleep) = msg.body().deserialize::<bool>() {
+                        events.push(LogindEvent::PrepareForSleep(going_to_sleep));
+                        let _ = event_fd.write(1);
+                    }
+                }
+            },
+        )?;
+
+        Ok(ZbusSessionMonitor {
+            connection,
+            manager,
+            session_path: None,
+            inhibit_fd: None,
+            events,
+            event_fd,
+            bridge_threads: vec![sleep_thread],
+        })
+    }
+
+    /// The fd Phase 14's reactor adds to its permanent `poll(2)` set.
+    pub fn event_fd(&self) -> RawFd {
+        self.event_fd.as_raw_fd()
+    }
+
+    /// Drains every translated event queued since the last drain, plus whether the queue
+    /// overflowed (design §2 D-3's `lagged`).
+    pub fn drain_events(&self) -> (Vec<LogindEvent>, bool) {
+        self.events.drain()
+    }
+}
+
+impl SessionMonitor for ZbusSessionMonitor {
+    fn locked_hint(&self) -> Result<bool, SessionError> {
+        let path = self
+            .session_path
+            .as_ref()
+            .ok_or_else(|| SessionError("session not resolved yet".to_string()))?;
+
+        let session = zbus::blocking::Proxy::new(
+            &self.connection,
+            "org.freedesktop.login1",
+            path.clone(),
+            "org.freedesktop.login1.Session",
+        )
+        .map_err(|e| SessionError(e.to_string()))?;
+
+        session
+            .get_property::<bool>("LockedHint")
+            .map_err(|e| SessionError(e.to_string()))
+    }
+
+    fn take_sleep_inhibitor(&mut self) -> Result<(), SessionError> {
+        let fd: zbus::zvariant::OwnedFd = self
+            .manager
+            .call(
+                "Inhibit",
+                &("sleep", "xwindowlog", "Recording session activity", "delay"),
+            )
+            .map_err(|e| SessionError(e.to_string()))?;
+        self.inhibit_fd = Some(fd.into());
+        Ok(())
+    }
+
+    fn release_sleep_inhibitor(&mut self) {
+        self.inhibit_fd = None;
+    }
+
+    fn resolve_session(&mut self, pid: u32) -> Result<(), SessionError> {
+        let path: zbus::zvariant::OwnedObjectPath = self
+            .manager
+            .call("GetSessionByPID", &(pid,))
+            .map_err(|e| SessionError(e.to_string()))?;
+
+        let properties = zbus::blocking::Proxy::new(
+            &self.connection,
+            "org.freedesktop.login1",
+            path.clone(),
+            "org.freedesktop.DBus.Properties",
+        )
+        .map_err(|e| SessionError(e.to_string()))?;
+
+        // Same synchronous-install guarantee as the `PrepareForSleep` watch above, filtered
+        // server-side to this session's own `PropertiesChanged` (arg 0 is the interface name).
+        let locked_hint_signals = properties
+            .receive_signal_with_args(
+                "PropertiesChanged",
+                &[(0, "org.freedesktop.login1.Session")],
+            )
+            .map_err(|e| SessionError(e.to_string()))?;
+
+        let thread = spawn_bridge_thread(
+            "xwl-logind-lockedhint",
+            self.events.clone(),
+            self.event_fd.clone(),
+            move |events, event_fd| {
+                for msg in locked_hint_signals {
+                    let Ok((_iface, changed, _invalidated)) = msg.body().deserialize::<(
+                        String,
+                        HashMap<String, zbus::zvariant::OwnedValue>,
+                        Vec<String>,
+                    )>() else {
+                        continue;
+                    };
+                    let Some(value) = changed.get("LockedHint") else {
+                        continue;
+                    };
+                    if let Ok(locked) = bool::try_from(value.clone()) {
+                        events.push(LogindEvent::LockedHintChanged(locked));
+                        let _ = event_fd.write(1);
+                    }
+                }
+            },
+        )?;
+        self.bridge_threads.push(thread);
+
+        self.session_path = Some(path);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +716,96 @@ mod tests {
         assert!(!inhibitor.is_held());
         let message = diagnostic.expect("refusal must produce a diagnostic");
         assert!(message.contains("refused"));
+    }
+
+    // --- 12.8/12.9: D-Bus unreachable / stalling at startup (RF-65) --------------------
+
+    #[test]
+    fn connect_bounded_times_out_against_a_bus_that_accepts_and_then_stalls() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+        // Abstract socket: no filesystem cleanup, and unique enough not to collide with a
+        // parallel test run.
+        let name = format!(
+            "xwindowlog-test-stalling-bus-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let bind_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&bind_addr).unwrap();
+
+        let _accept_thread = thread::spawn(move || {
+            // Accept and never write a single byte back: the client's SASL handshake read
+            // blocks forever on this end. Kept alive for the test binary's lifetime.
+            if let Ok((_stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        let connect_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let result = connect_bounded(
+            Box::new(move || {
+                let stream = UnixStream::connect_addr(&connect_addr)?;
+                zbus::blocking::connection::Builder::async_io_unix_stream(stream).build()
+            }),
+            Duration::from_millis(300),
+        );
+
+        match result {
+            Err(SessionError(message)) => {
+                assert_eq!(message, "D-Bus system bus connection attempt timed out")
+            }
+            Ok(_) => panic!("expected a timeout, got a connection to the stalling socket"),
+        }
+    }
+
+    #[test]
+    fn init_session_monitor_degrades_to_a_warning_when_dbus_is_unreachable() {
+        let (monitor, diagnostic) =
+            init_session_monitor_with(|| Err(SessionError("no bus reachable".to_string())));
+
+        assert!(monitor.is_none());
+        let message = diagnostic.expect("unreachable D-Bus must produce a diagnostic");
+        assert!(message.contains("unavailable"));
+    }
+
+    // --- Real-bus acceptance (task 12.10), gated per hard-won lesson #8 ----------------
+
+    fn require_real_bus() -> bool {
+        std::env::var("XWINDOWLOG_REQUIRE_REAL_BUS").as_deref() == Ok("1")
+    }
+
+    #[test]
+    fn real_bus_resolves_own_session_and_reads_locked_hint() {
+        if !require_real_bus() {
+            return;
+        }
+
+        let mut monitor = ZbusSessionMonitor::connect().expect("system bus must be reachable");
+        monitor
+            .resolve_session(std::process::id())
+            .expect("GetSessionByPID(own pid) must succeed on a real logind session");
+
+        let locked = monitor
+            .locked_hint()
+            .expect("LockedHint must be readable once resolved");
+        assert!(!locked, "environment precondition: session starts unlocked");
+    }
+
+    #[test]
+    fn real_bus_inhibit_acquire_and_release_round_trip() {
+        if !require_real_bus() {
+            return;
+        }
+
+        let mut monitor = ZbusSessionMonitor::connect().expect("system bus must be reachable");
+        monitor
+            .take_sleep_inhibitor()
+            .expect("Inhibit() must succeed for an unprivileged session in this environment");
+
+        monitor.release_sleep_inhibitor();
+        // No further assertion: releasing drops the `OwnedFd`, which closes it on `Drop`.
+        // Definition of done requires no leaked fd across the whole suite, checked externally.
     }
 }
