@@ -398,6 +398,15 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     pub fn cancel_timer(&mut self, timer: Timer) {
         self.deadlines.cancel(timer);
     }
+
+    /// Reaches the owned logind source for suspend-inhibitor coordination (Phase 15
+    /// composition, task 15.10's RF-27 wiring): sequencing a `PrepareForSleep` reaction
+    /// strictly after its own interval-closing effect is committed is `main.rs`'s job, not
+    /// this module's, and doing that from outside requires reaching the exact adapter this
+    /// reactor was built with.
+    pub fn logind_mut(&mut self) -> &mut L {
+        &mut self.logind
+    }
 }
 
 /// One `accept()` per wakeup at most (design §2 D-6: "bounds the cost of a connect storm
@@ -1211,5 +1220,26 @@ mod tests {
             deadlines.poll_timeout(clock.now_mono()),
             nix::poll::PollTimeout::NONE
         );
+    }
+
+    // --- 15.10: `logind_mut` reaches the exact adapter this reactor was built with ---------
+
+    #[test]
+    fn logind_mut_reaches_the_same_source_the_reactor_polls() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer, mut logind_writer, _socket_path) =
+            make_reactor_source("logind-mut");
+
+        // Pushed through the accessor, not through the constructor — proving `logind_mut`
+        // reaches the SAME instance `next_event` polls, not a detached copy.
+        reactor
+            .logind_mut()
+            .push_event(SourceEvent::PrepareForSleep(true));
+        logind_writer
+            .write_all(b"x")
+            .expect("write to the synthetic logind fd must succeed");
+
+        let event = reactor.next_event(None).expect("next_event must not error");
+        assert_eq!(event, Some(SourceEvent::PrepareForSleep(true)));
     }
 }
