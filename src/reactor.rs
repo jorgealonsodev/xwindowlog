@@ -5,32 +5,21 @@
 //! fd readiness and deadline expiry into `tracker::SourceEvent`s; state-transition decisions
 //! stay in `tracker.rs` (task 14.12).
 
-// `ReactorSource`'s own fields, `accept_one`, `service_clients` and `min_timeout` have no
-// consumer yet: `impl WindowSource for ReactorSource` (task 14.7, the next commit of this same
-// phase) is what reads them. This mirrors the same landing-ahead-of-its-consumer pattern
-// `clock.rs`/`tracker.rs` carried through their own early phases (design §8's ordering);
-// removed once a real consumer exists, same as task 15.13's final sweep expects of any allow
-// left over past its reason.
-#![allow(
-    dead_code,
-    reason = "consumed by WindowSource::next_event, landing in the next commit of this phase"
-)]
-
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use nix::poll::PollTimeout;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::Uid;
 
 use crate::clock::{Clock, MonoInstant};
 use crate::control::{self, Accepted, PauseState, CLIENT_DEADLINE};
 use crate::signals::SelfPipe;
-use crate::tracker::{SourceError, SourceEvent, Timer};
+use crate::tracker::{SourceError, SourceEvent, Timer, WindowSource};
 
 /// The reactor's own deadline set (design §2 D-2): one optional monotonic `Instant` per
 /// `Timer` kind, `arm`ed either by this module itself (`ReconnectBackoff`, `PauseExpiry`,
@@ -443,11 +432,314 @@ fn decide(
     event
 }
 
+impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSource<X, L, C> {
+    /// Design §2 D-6's whole loop body, adapted to `WindowSource`'s one-event-per-call
+    /// contract: drain-before-poll first (fd readiness from a *previous* wakeup may still hold
+    /// buffered, undrained items), hand out anything already pending without polling again,
+    /// and only actually call `poll(2)` — incrementing `wakeups` — once nothing anywhere is
+    /// immediately available. Deadlines fire on **every** wakeup (task 14.4), not only when
+    /// `poll()` returns 0.
+    fn next_event(
+        &mut self,
+        deadline: Option<MonoInstant>,
+    ) -> Result<Option<SourceEvent>, SourceError> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+
+            self.x11.flush()?;
+            let x11_backlog = drain_budget(&mut self.x11, X11_BUDGET, &mut self.pending)?;
+            let dbus_backlog = drain_budget(&mut self.logind, DBUS_BUDGET, &mut self.pending)?;
+
+            let now_wall = self.clock.now_wall();
+            service_clients(
+                &mut self.clients,
+                &mut self.paused,
+                now_wall,
+                &mut self.pending,
+            );
+
+            if self.signals.drain() > 0 {
+                let levels = self.signals.take_levels();
+                if levels.terminate || levels.interrupt {
+                    self.pending.push_back(SourceEvent::Shutdown);
+                }
+                if levels.reload {
+                    self.pending.push_back(SourceEvent::ReloadConfig);
+                }
+            }
+
+            if !self.pending.is_empty() {
+                continue;
+            }
+
+            // Nothing anywhere is immediately available: this is the one branch that actually
+            // calls `poll(2)` (RNF-2's "zero wakeups" is this branch never being reached while
+            // idle, not a fast loop around it).
+            let listener_ready = {
+                // Safety: `x11`/`logind`/`signals` only expose a `RawFd`, not `AsFd`; each
+                // fd is kept alive by its owning field for this entire block, and no fd is
+                // closed before `pfds` (and the `BorrowedFd`s it holds) are dropped at the end
+                // of this block.
+                let x11_fd = unsafe { BorrowedFd::borrow_raw(self.x11.as_raw_fd()) };
+                let logind_fd = unsafe { BorrowedFd::borrow_raw(self.logind.as_raw_fd()) };
+                let signals_fd = unsafe { BorrowedFd::borrow_raw(self.signals.as_raw_fd()) };
+
+                let mut pfds = vec![
+                    PollFd::new(x11_fd, PollFlags::POLLIN),
+                    PollFd::new(logind_fd, PollFlags::POLLIN),
+                    PollFd::new(signals_fd, PollFlags::POLLIN),
+                    PollFd::new(self.listener.as_fd(), PollFlags::POLLIN),
+                ];
+                for client in &self.clients {
+                    pfds.push(PollFd::new(client.stream.as_fd(), PollFlags::POLLIN));
+                }
+
+                let deadlines = &self.deadlines;
+                let clock = &self.clock;
+                poll_retrying(
+                    || {
+                        let now = clock.now_mono();
+                        let base = timeout_for_wakeup(deadlines, now, x11_backlog, dbus_backlog);
+                        match deadline {
+                            Some(at) => min_timeout(base, timeout_until(now, at)),
+                            None => base,
+                        }
+                    },
+                    |timeout| poll(&mut pfds, timeout),
+                )
+                .map_err(|e| SourceError(format!("poll(2) failed: {e}")))?;
+
+                pfds[3].any().unwrap_or(false)
+            };
+            self.wakeups.fetch_add(1, Ordering::Relaxed);
+
+            if listener_ready {
+                accept_one(&self.listener, &mut self.clients, self.own_uid);
+            }
+
+            let now = self.clock.now_mono();
+            for timer in self.deadlines.take_due(now) {
+                self.pending.push_back(SourceEvent::DeadlineElapsed(timer));
+            }
+
+            if self.pending.is_empty() {
+                if let Some(at) = deadline {
+                    if now.0 >= at.0 {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::{Clock, FakeClock, WallTs};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    /// A synthetic stand-in for X11's/logind's `BudgetedSource` (tasks.md PR 14 Work Unit:
+    /// "synthetic fds (pipes) standing in for the four real sources; no real X11/D-Bus needed
+    /// here"). One queued event is emitted per byte read off the paired socket; reads are
+    /// non-blocking, matching every real `BudgetedSource` impl's contract.
+    struct SyntheticSource {
+        reader: UnixStream,
+        events: VecDeque<SourceEvent>,
+    }
+
+    impl SyntheticSource {
+        fn pair() -> (Self, UnixStream) {
+            let (reader, writer) = UnixStream::pair().expect("UnixStream::pair must succeed");
+            reader
+                .set_nonblocking(true)
+                .expect("set_nonblocking must succeed");
+            (
+                SyntheticSource {
+                    reader,
+                    events: VecDeque::new(),
+                },
+                writer,
+            )
+        }
+
+        fn push_event(&mut self, event: SourceEvent) {
+            self.events.push_back(event);
+        }
+    }
+
+    impl BudgetedSource for SyntheticSource {
+        fn as_raw_fd(&self) -> RawFd {
+            self.reader.as_raw_fd()
+        }
+
+        fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError> {
+            let mut buf = [0u8; 64];
+            match self.reader.read(&mut buf) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(self.events.pop_front()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(SourceError(e.to_string())),
+            }
+        }
+    }
+
+    /// A fresh, bound control-socket listener for tests that need the real fd table shape
+    /// (design §2 D-2's fd3) without wiring a whole daemon around it.
+    fn bind_test_listener(case: &str) -> (UnixListener, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "xwindowlog-test-reactor-{case}-{}-{n}.sock",
+            std::process::id()
+        ));
+        let listener = control::bind(&path).expect("bind must succeed on a fresh path");
+        (listener, path)
+    }
+
+    fn make_reactor_source(
+        case: &str,
+    ) -> (
+        ReactorSource<SyntheticSource, SyntheticSource, FakeClock>,
+        UnixStream,
+        UnixStream,
+        std::path::PathBuf,
+    ) {
+        let (x11, x11_writer) = SyntheticSource::pair();
+        let (logind, logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, socket_path) = bind_test_listener(case);
+        let clock = FakeClock::new(WallTs(0));
+        let reactor = ReactorSource::new(x11, logind, signals, listener, Uid::current(), clock);
+        (reactor, x11_writer, logind_writer, socket_path)
+    }
+
+    // --- 14.6: `ReactorSource` wakes exactly once for a synthetic X11 change, with no prior
+    // read, and issues zero wakeups over a synthetic idle window with nothing pending anywhere
+    // (window-capture "No busy-waiting between changes"; daemon-lifecycle "Zero wakeups over an
+    // idle window") ------------------------------------------------------------------------
+
+    #[test]
+    fn reactor_source_wakes_exactly_once_for_a_synthetic_change_with_no_prior_read() {
+        // Real signal delivery is process-global (see `signals::SIGNAL_TEST_GUARD`'s doc):
+        // this reactor installs a real `SelfPipe`, so it must not run concurrently with any
+        // test that raises a real SIGTERM/SIGINT/SIGHUP.
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, mut x11_writer, _logind_writer, _socket_path) =
+            make_reactor_source("wakes-once");
+        reactor.x11.push_event(SourceEvent::UserActive);
+
+        let handle = std::thread::spawn(move || {
+            // The write happens only after the reactor thread has had time to block inside
+            // `poll(2)` — proving the event is delivered by a genuine wakeup, not found by a
+            // pre-poll drain of data that was already sitting on the fd (which window-capture's
+            // scenario explicitly forbids: "the daemon does not perform any window-state query
+            // before that wakeup").
+            std::thread::sleep(Duration::from_millis(100));
+            x11_writer
+                .write_all(b"x")
+                .expect("write to the synthetic x11 fd must succeed");
+            x11_writer
+        });
+
+        let event = reactor.next_event(None).expect("next_event must not error");
+        handle.join().expect("writer thread must not panic");
+
+        assert_eq!(event, Some(SourceEvent::UserActive));
+        assert_eq!(
+            reactor.wakeups(),
+            1,
+            "one synthetic change must cost exactly one poll(2) wakeup, never a spin"
+        );
+    }
+
+    #[test]
+    fn reactor_source_issues_zero_wakeups_over_an_idle_window_with_nothing_pending() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, mut x11_writer, _logind_writer, _socket_path) =
+            make_reactor_source("idle-window");
+        reactor.x11.push_event(SourceEvent::UserActive);
+        let wakeups = reactor.wakeups_handle();
+
+        let handle = std::thread::spawn(move || reactor.next_event(None));
+
+        // A fast, deterministic stand-in for the daemon-lifecycle scenario's literal 60s idle
+        // window (design §12 D-12 reserves the literal duration for the local benchmark, not
+        // this unit test): if the loop were spinning instead of genuinely blocked in poll(),
+        // this window would already show a nonzero count.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            wakeups.load(Ordering::Relaxed),
+            0,
+            "nothing pending anywhere must cost zero poll(2) wakeups over the idle window"
+        );
+
+        x11_writer
+            .write_all(b"x")
+            .expect("write to the synthetic x11 fd must succeed");
+        let event = handle
+            .join()
+            .expect("reactor thread must not panic")
+            .expect("next_event must not error");
+
+        assert_eq!(event, Some(SourceEvent::UserActive));
+        assert_eq!(wakeups.load(Ordering::Relaxed), 1);
+    }
+
+    // --- CRITICAL fix (carried over from Phase 13's R4-blocking-service-stalls-reactor): a
+    // control client that trickles bytes in slowly must never stall any other fd. Proves
+    // `service_clients` drives `control::try_read_request_line` (never
+    // `control::service_connection`'s blocking read) from the poll loop. ---------------------
+
+    #[test]
+    fn a_dribbling_control_peer_never_stalls_the_reactor_from_servicing_other_fds() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, x11_writer, _logind_writer, socket_path) = make_reactor_source("dribble");
+        let mut client = UnixStream::connect(&socket_path).expect("connect must succeed");
+
+        // One byte every 150ms, never a trailing `\n`: this dribble deliberately never
+        // completes a request line during this test, and spans 750ms — most of
+        // `control::CLIENT_DEADLINE`'s 1s budget. If the reactor's control-fd handling ever
+        // called the blocking `read_request_line`/`service_connection` path instead of
+        // `try_read_request_line`, accepting this connection would park the whole reactor for
+        // up to that 1s budget before it could look at any other fd.
+        let dribble = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = client.write_all(b"{");
+            }
+            client
+        });
+
+        // The unrelated X11 change arrives while the peer is still mid-dribble.
+        let mut writer = x11_writer.try_clone().expect("try_clone must succeed");
+        reactor.x11.push_event(SourceEvent::UserActive);
+        let x11_delay = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            writer
+                .write_all(b"x")
+                .expect("write to the synthetic x11 fd must succeed");
+        });
+
+        let started = Instant::now();
+        let event = reactor.next_event(None).expect("next_event must not error");
+        let elapsed = started.elapsed();
+
+        assert_eq!(event, Some(SourceEvent::UserActive));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "delivering the unrelated X11 event took {elapsed:?}; a dribbling control peer \
+             must never delay another fd anywhere close to CLIENT_DEADLINE's 1s budget"
+        );
+
+        x11_delay.join().expect("writer thread must not panic");
+        dribble.join().expect("dribble thread must not panic");
+    }
 
     // --- 14.3: budget exhaustion yields PollTimeout::ZERO, never a sleep -------------------
 

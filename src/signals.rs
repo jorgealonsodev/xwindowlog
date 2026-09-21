@@ -101,21 +101,23 @@ impl AsRawFd for SelfPipe {
     }
 }
 
+/// Real signal delivery is process-global: `signal_hook` invokes every registered action for a
+/// signal number regardless of which `SelfPipe` instance (or which test module) registered it,
+/// and no registration is ever un-installed. Any test that raises a real `SIGTERM`/`SIGINT`/
+/// `SIGHUP`, or that installs a `SelfPipe` and observes its levels/drain count, must hold this
+/// lock for its entire duration — not just within this module. `reactor.rs`'s tests (task 14,
+/// which install a real `SelfPipe` as part of the reactor's permanent fd table) hit exactly
+/// this: an unrelated `raise(SIGTERM)` from this module's own test landed on their self-pipe
+/// mid-run and was observed as a spurious `SourceEvent::Shutdown`, because two process-global
+/// signal handlers were live at once with no ordering between them (rust-testing skill: never
+/// let one test's global mutation disarm — or contaminate — a parallel sibling).
+#[cfg(test)]
+pub(crate) static SIGNAL_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nix::sys::signal::{raise, Signal};
-    use std::sync::Mutex;
-
-    /// Real signal delivery is process-global: `signal_hook` invokes every registered action
-    /// for a signal number regardless of which test registered it (its own test suite shares
-    /// `SIGUSR1` across tests for the same reason). Each [`SelfPipe`] instance's flags are
-    /// private, so cross-test contamination can only happen if two of *these* tests race their
-    /// own `raise()` calls against each other's freshly-installed, still-`false` flags. This
-    /// lock serializes them, the same fix the project already applies to other process-global
-    /// state (see `rust-testing` skill: never let one test's global mutation disarm a parallel
-    /// sibling).
-    static SIGNAL_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     // --- 13.2: coalesced SIGTERM+SIGHUP burst is observed as both flags, pipe drains empty ---
 
