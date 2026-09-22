@@ -118,6 +118,8 @@
 use std::env;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use x11rb::connection::Connection;
@@ -205,6 +207,13 @@ pub enum X11InitError {
     Connect(ConnectError),
     Protocol(ReplyError),
     Io(ConnectionError),
+    /// `connect_bounded` could not spawn the thread it runs the connect attempt on (T1,
+    /// RF-32) — mirrors `logind::connect_bounded`'s own spawn-failure variant.
+    ReconnectSpawn(String),
+    /// `connect_bounded` exceeded its timeout (T1, RF-32): the peer accepted the connection
+    /// and then stalled, exactly the failure class `logind::connect_bounded` was already
+    /// built to guard against.
+    ReconnectTimeout,
 }
 
 impl From<ConnectError> for X11InitError {
@@ -231,6 +240,12 @@ impl fmt::Display for X11InitError {
             X11InitError::Connect(e) => write!(f, "X11 connection failed: {e}"),
             X11InitError::Protocol(e) => write!(f, "X11 protocol error: {e}"),
             X11InitError::Io(e) => write!(f, "X11 connection error: {e}"),
+            X11InitError::ReconnectSpawn(e) => {
+                write!(f, "failed to spawn X11 reconnect thread: {e}")
+            }
+            X11InitError::ReconnectTimeout => {
+                write!(f, "X11 reconnect attempt timed out")
+            }
         }
     }
 }
@@ -1632,6 +1647,41 @@ pub fn os_entropy() -> u64 {
         .finish()
 }
 
+/// How long `connect_bounded` waits for a reconnect attempt before treating the peer as
+/// unreachable (T1, RF-32). Matches `logind::connect_bounded`'s own `BUS_CONNECT_TIMEOUT` —
+/// the precedent this bound follows, for the same class of problem: a local IPC peer that
+/// accepts a connection and then stalls the application-level handshake.
+const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+type X11ConnectResult = Result<(X11Source, Vec<String>), X11InitError>;
+
+/// Bounds a connect attempt so a peer that accepts the socket and then stalls the X11 setup
+/// handshake cannot block the single-threaded reactor that drives `Reconnector::attempt`
+/// forever (T1, RF-32). Phase 12 already learned this failure class the hard way for logind's
+/// D-Bus connect (`logind::connect_bounded`); this follows the exact same shape: run the
+/// connect on a throwaway thread and bound how long the caller waits for it with
+/// `recv_timeout`. `x11rb::rust_connection::RustConnection::connect` (called from
+/// `X11Source::connect_with_afk_threshold`) has no such bound of its own and cannot be
+/// interrupted once blocked, so a stalling peer leaves that thread parked on the read forever
+/// — an accepted one-thread leak, never a hang for the reactor.
+fn connect_bounded(
+    connect: Box<dyn FnOnce() -> X11ConnectResult + Send>,
+    timeout: Duration,
+) -> X11ConnectResult {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("xwl-x11-reconnect".to_string())
+        .spawn(move || {
+            let _ = tx.send(connect());
+        })
+        .map_err(|e| X11InitError::ReconnectSpawn(e.to_string()))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(X11InitError::ReconnectTimeout),
+    }
+}
+
 /// RF-6/RF-32's outage driver: owns the "single `unknown` interval per outage" bookkeeping
 /// that `tracker::Tracker::on_display_lost` cannot enforce on its own — it is an "any" row
 /// that transitions to `unknown` every time it is called (see its doc), so which
@@ -1684,9 +1734,18 @@ impl Reconnector {
         }
     }
 
-    /// One attempt. `entropy` feeds `ReconnectBackoff::next_delay` — see its doc.
+    /// One attempt. `entropy` feeds `ReconnectBackoff::next_delay` — see its doc. Bounded by
+    /// `connect_bounded` (T1, RF-32) so a peer that accepts and then stalls cannot hang this
+    /// call.
     pub fn attempt(&mut self, entropy: u64) -> ReconnectAttempt {
-        match X11Source::connect_with_afk_threshold(self.display.as_deref(), self.afk_threshold) {
+        let display = self.display.clone();
+        let afk_threshold = self.afk_threshold;
+        match connect_bounded(
+            Box::new(move || {
+                X11Source::connect_with_afk_threshold(display.as_deref(), afk_threshold)
+            }),
+            RECONNECT_CONNECT_TIMEOUT,
+        ) {
             Ok((source, diagnostics)) => {
                 self.backoff.reset();
                 let outage_was_open = std::mem::replace(&mut self.outage_open, false);
@@ -2130,6 +2189,53 @@ mod tests {
                     panic!("must not re-report an outage already open")
                 }
                 ReconnectAttempt::Restored { .. } => panic!("nothing is listening on :9199"),
+            }
+        }
+    }
+
+    /// **RED (T1, RF-32): the reconnect attempt must be bounded.** `reconnector_reports_
+    /// outage_opened_once_then_still_down` above only proves behavior against a *refused*
+    /// connection, which fails fast on its own and would pass even with no bound at all. This
+    /// proves the stronger property the constraint actually requires: a peer that accepts the
+    /// TCP connection and then never speaks — so `x11rb::connect`'s setup-handshake read would
+    /// block forever with no bound — must still make `Reconnector::attempt` return, because the
+    /// single-threaded reactor that will drive this (`src/reactor.rs`) cannot afford to hang.
+    #[test]
+    fn reconnector_attempt_times_out_against_a_peer_that_accepts_and_then_stalls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind a local TCP listener for the test");
+        let port = listener
+            .local_addr()
+            .expect("local_addr on a just-bound listener")
+            .port();
+        // x11rb maps a "host:N" display string to TCP port 6000+N
+        // (x11rb_protocol::parse_display::connect_addresses). Linux's ephemeral port range
+        // (32768+ by default) is always above 6000, so this subtraction never underflows.
+        let display_num = port - 6000;
+        let display = format!("127.0.0.1:{display_num}");
+
+        let _accept_thread = thread::spawn(move || {
+            // Accept and never write a single byte back: the client's setup-handshake read
+            // blocks forever on this end. Kept alive for the test binary's lifetime, exactly
+            // like `logind::connect_bounded`'s own stalling-peer test.
+            if let Ok((_stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        let mut reconnector = Reconnector::new(Some(&display), Duration::from_secs(240));
+        let start = std::time::Instant::now();
+        let result = reconnector.attempt(1);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "attempt against a stalling peer must return well within the bound, took {elapsed:?}"
+        );
+        match result {
+            ReconnectAttempt::OutageOpened { .. } | ReconnectAttempt::StillDown { .. } => {}
+            ReconnectAttempt::Restored { .. } => {
+                panic!("a stalling peer never completes the X11 setup handshake")
             }
         }
     }
