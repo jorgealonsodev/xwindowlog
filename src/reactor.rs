@@ -265,6 +265,65 @@ pub trait BudgetedSource {
     /// into a `SourceEvent`. `Ok(None)` means genuinely empty right now — the drain-before-poll
     /// stopping condition.
     fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError>;
+
+    /// Attempts to recover this source after a fault (RF-32's mid-run X11 reconnection). Most
+    /// sources have no such notion — the logind bridge has nothing analogous to "the display
+    /// went away and came back" — so the default means exactly that: "this source does not
+    /// support recovery," and every existing `BudgetedSource` (`LogindAdapter`/`LogindSource`)
+    /// keeps that default unchanged (RF-32 T3).
+    ///
+    /// `entropy` is forwarded, unused by the default, to whichever backoff policy an
+    /// overriding implementor drives internally (`x11::ReconnectBackoff::next_delay`'s own
+    /// parameter — same convention, so a caller supplying real entropy doesn't need to know
+    /// which sources care).
+    ///
+    /// A `Some(_)` return means an attempt was actually made; `RecoveryOutcome` tells a future
+    /// reactor-side caller (RF-32 T4/T5) everything it needs to act: whether an outage just
+    /// opened, how long to wait before retrying, or whether the source was restored — telling
+    /// it exactly which `SourceEvent` to emit. An overriding implementor is responsible for
+    /// installing any replacement source itself before returning (RF-32 T3:
+    /// `X11Adapter::recover` does this via `replace_source`) — this module's own fd-liveness
+    /// contract already covers the rest: `ReactorSource::next_event` re-queries
+    /// `self.x11.as_raw_fd()` on every poll iteration, so a replaced connection needs no
+    /// separate change notification.
+    fn recover(&mut self, _entropy: u64) -> Option<RecoveryOutcome> {
+        None
+    }
+}
+
+/// The outcome of one `BudgetedSource::recover` attempt.
+///
+/// This mirrors `x11::ReconnectAttempt`'s three-outcome contract (RF-32's feature doc,
+/// `src/x11.rs:1649-1671`: whether an outage just opened, whether it's still down, or whether
+/// it was restored) rather than reusing that type directly, for two reasons:
+///
+/// 1. This module's own doc comment on `BudgetedSource` states the existing invariant this
+///    type must not break: "no `x11rb`/`zbus` type is named anywhere in this module"
+///    (task 14.12) — `ReconnectAttempt::Restored` carries `source: Box<x11::X11Source>`, an
+///    X11-specific type wrapping `x11rb::rust_connection::RustConnection`, and naming it here
+///    would pull a concrete X11 type into the trait every `BudgetedSource` implementor
+///    (including `LogindAdapter`) must depend on, undermining the feature doc's own stated
+///    goal of keeping `ReactorSource<X, L, C>` generic.
+/// 2. It would be a lie anyway: RF-32 T3 (`X11Adapter::recover`) installs the reconnected
+///    source into its own field via `replace_source` before returning, exactly so a future
+///    reactor caller never has to touch the source object directly. `X11Source` isn't `Clone`
+///    (it owns a live connection/fd), so a type that DID carry the replacement source could
+///    never also be handed back here once `X11Adapter` had already moved it into `self.source`.
+#[derive(Debug)]
+pub enum RecoveryOutcome {
+    /// The first failure of a new outage. The caller MUST translate this into exactly one
+    /// `SourceEvent::DisplayLost` (RF-6/RF-32) — never again until `Restored` is observed.
+    OutageOpened { retry_after: Duration },
+    /// A subsequent failed attempt during an outage already reported via `OutageOpened`. No
+    /// additional event — re-arm `Timer::ReconnectBackoff` for `retry_after` and keep waiting.
+    StillDown { retry_after: Duration },
+    /// Recovery succeeded; the implementor already installed the replacement source (see this
+    /// trait's `recover` doc). The caller MUST translate this into exactly one
+    /// `SourceEvent::DisplayRestored`. `outage_was_open` is `false` when the very first attempt
+    /// of an outage succeeded immediately, so no `OutageOpened` preceded it — the caller must
+    /// then emit `SourceEvent::DisplayLost` before `DisplayRestored`, mirroring
+    /// `x11::ReconnectAttempt::Restored`'s own doc contract exactly.
+    Restored { outage_was_open: bool },
 }
 
 /// Drains `source` up to `budget` items into `out`, per D-6's fairness rule (service every
@@ -705,6 +764,45 @@ mod tests {
                 Err(e) => Err(SourceError(e.to_string())),
             }
         }
+    }
+
+    // --- BudgetedSource::recover's default (RF-32 T3) ---------------------------------------
+    //
+    // `SyntheticSource` (above) does not override `recover`, exactly like `LogindAdapter` and
+    // `LogindSource` in `src/adapters.rs` — it "stands in for X11's/logind's `BudgetedSource`"
+    // per its own doc comment, so it is a faithful proxy for "any implementor that does not opt
+    // into recovery."
+
+    #[test]
+    fn default_recover_is_a_genuine_no_op_returning_none() {
+        let (mut source, _writer) = SyntheticSource::pair();
+
+        assert!(
+            source.recover(0).is_none(),
+            "a source that never overrides recover must fall through to BudgetedSource's \
+             default, which means \"this source does not support recovery\""
+        );
+    }
+
+    #[test]
+    fn default_recover_does_not_disturb_already_queued_events() {
+        // The genuine property under test is behavioral, not structural: calling the default
+        // `recover` must not perturb the source's own state — proven here by an event queued
+        // before the call still being the exact one drained after it, through the real
+        // `try_next`/fd machinery, not by inspecting a private field.
+        let (mut source, mut writer) = SyntheticSource::pair();
+        source.push_event(SourceEvent::ActiveWindowDestroyed);
+        writer
+            .write_all(b"x")
+            .expect("write to the paired socket must succeed");
+
+        let _ = source.recover(0xdead_beef);
+
+        assert_eq!(
+            source.try_next().expect("try_next must not error"),
+            Some(SourceEvent::ActiveWindowDestroyed),
+            "the queued event must still be exactly what try_next drains after recover() runs"
+        );
     }
 
     /// A fresh, bound control-socket listener for tests that need the real fd table shape

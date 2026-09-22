@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use xwindowlog::exclude::Excluder;
 use xwindowlog::logind::{LockedHintTracker, LogindEvent, ZbusSessionMonitor};
-use xwindowlog::reactor::BudgetedSource;
+use xwindowlog::reactor::{BudgetedSource, RecoveryOutcome};
 use xwindowlog::tracker::{SourceError, SourceEvent, WindowInfo};
-use xwindowlog::x11::{RawEvent, Reconnector, X11Source};
+use xwindowlog::x11::{RawEvent, ReconnectAttempt, Reconnector, X11Source};
 
 /// The `WindowInfo::desktop()` sentinel's own app-id text (`tracker.rs`'s `WindowInfo::desktop`
 /// is private to that module, so this is the one place outside it that needs the same literal —
@@ -73,17 +73,11 @@ pub struct X11Adapter {
     source: X11Source,
     excluder: Rc<RefCell<Excluder>>,
     current_app_id: String,
-    /// RF-32 T2: the adapter owns the reconnect policy state (`ReconnectBackoff`,
+    /// RF-32 T2/T3: the adapter owns the reconnect policy state (`ReconnectBackoff`,
     /// `outage_open`) for its own display/`afk_threshold`, rather than that state living
-    /// somewhere else and being handed the adapter's fd out of band — `Reconnector::attempt`
-    /// (T3+) needs exactly the `display`/`afk_threshold` this adapter's own `X11Source` was
-    /// built with to reconnect to the same place.
-    #[allow(
-        dead_code,
-        reason = "read only via reconnector_mut, whose only caller today is this file's own \
-                  tests; T2 forbids wiring main.rs/reactor.rs, so production has no caller yet \
-                  (T3-T5 add one)"
-    )]
+    /// somewhere else and being handed the adapter's fd out of band — `Reconnector::attempt`,
+    /// driven from `recover` (T3), needs exactly the `display`/`afk_threshold` this adapter's
+    /// own `X11Source` was built with to reconnect to the same place.
     reconnector: Reconnector,
 }
 
@@ -115,9 +109,8 @@ impl X11Adapter {
     }
 
     /// Replaces the adapter's live `X11Source` with a freshly (re)connected one — RF-32 T2's
-    /// mechanism for a future caller to act on `ReconnectAttempt::Restored { source, .. }`
-    /// (T3+ wires that caller; this method only has to make the replacement possible and
-    /// observable). No separate change-notification is needed: `ReactorSource::next_event`
+    /// mechanism, driven by T3's `recover` on `ReconnectAttempt::Restored { source, .. }`. No
+    /// separate change-notification is needed: `ReactorSource::next_event`
     /// already re-queries `as_raw_fd()` on every poll iteration (`src/reactor.rs:583-590`,
     /// feature doc constraint 3), so the very next call after this one sees the new fd.
     ///
@@ -135,24 +128,14 @@ impl X11Adapter {
     /// evaluates a title) without first observing a fresh `ActiveWindow` on the new
     /// connection would otherwise evaluate a title against a stale, wrong `app_id` — a D-7
     /// exclusion-boundary risk, not just a cosmetic one.
-    #[allow(
-        dead_code,
-        reason = "no production caller yet; T2 forbids wiring one (T3-T5 add it), exercised \
-                  today only by this file's own tests"
-    )]
     pub fn replace_source(&mut self, source: X11Source) {
         self.source = source;
         DESKTOP_APP_ID.clone_into(&mut self.current_app_id);
     }
 
-    /// RF-32 T2: exposes the adapter's owned `Reconnector` so a future caller (T3's
-    /// `BudgetedSource` recovery method) can drive `Reconnector::attempt` without this
-    /// adapter needing to re-expose the policy's own internals.
-    #[allow(
-        dead_code,
-        reason = "no production caller yet; T2 forbids wiring one (T3 adds it), exercised \
-                  today only by this file's own tests"
-    )]
+    /// RF-32 T2: exposes the adapter's owned `Reconnector` so T3's `BudgetedSource::recover`
+    /// can drive `Reconnector::attempt` without this adapter needing to re-expose the policy's
+    /// own internals.
     pub fn reconnector_mut(&mut self) -> &mut Reconnector {
         &mut self.reconnector
     }
@@ -176,6 +159,39 @@ impl BudgetedSource for X11Adapter {
             .map_err(|e| SourceError(format!("x11 poll_for_event failed: {e}")))?;
         Ok(raw
             .map(|raw| translate_x11_event(&self.excluder.borrow(), &mut self.current_app_id, raw)))
+    }
+
+    /// RF-32 T3: drives the adapter's own `Reconnector` (T2's `reconnector_mut`) and, on
+    /// success, installs the reconnected `X11Source` via T2's `replace_source` — so a future
+    /// reactor caller (T4/T5) never has to touch the source object itself, matching
+    /// `BudgetedSource::recover`'s own doc contract.
+    ///
+    /// `RecoveryOutcome`'s doc explains why this maps `x11::ReconnectAttempt`'s outcomes rather
+    /// than returning that type directly: its `Restored` variant carries `source:
+    /// Box<X11Source>` for a caller that installs the source itself, and `X11Source` is not
+    /// `Clone` (it owns a live connection/fd) — once `replace_source` below has moved it into
+    /// `self.source`, there is no second copy left to also hand back.
+    fn recover(&mut self, entropy: u64) -> Option<RecoveryOutcome> {
+        match self.reconnector_mut().attempt(entropy) {
+            ReconnectAttempt::OutageOpened { retry_after } => {
+                Some(RecoveryOutcome::OutageOpened { retry_after })
+            }
+            ReconnectAttempt::StillDown { retry_after } => {
+                Some(RecoveryOutcome::StillDown { retry_after })
+            }
+            ReconnectAttempt::Restored {
+                source,
+                outage_was_open,
+                // Already written to stderr by `X11Source::connect_with_afk_threshold` itself
+                // (`src/x11.rs:472`) — the same reason `main.rs:263`'s own startup connect
+                // discards its returned diagnostics as `_diagnostics`. Nothing here re-derives
+                // or silently drops information a human would otherwise see.
+                diagnostics: _,
+            } => {
+                self.replace_source(*source);
+                Some(RecoveryOutcome::Restored { outage_was_open })
+            }
+        }
     }
 }
 
@@ -595,7 +611,7 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
-    use xwindowlog::x11::ReconnectAttempt;
+    use xwindowlog::reactor::RecoveryOutcome;
 
     static NEXT_ADAPTER_TEST_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
     // Disjoint from `tests/x11_integration.rs`'s `DISPLAY_BASE = 213` and
@@ -619,6 +635,15 @@ mod tests {
     /// `X11Source` on it (see the module comment above for why the connect call itself is
     /// the readiness probe).
     fn spawn_xvfb_and_connect() -> (TestXvfb, X11Source) {
+        let (guard, source, _display) = spawn_xvfb_and_connect_with_display();
+        (guard, source)
+    }
+
+    /// Same as `spawn_xvfb_and_connect`, additionally returning the `:N` display string —
+    /// needed by RF-32 T3's `recover`-through-a-real-reconnect test, which must point its
+    /// `X11Adapter`'s owned `Reconnector` at the SAME Xvfb its initial `source` already
+    /// connected to.
+    fn spawn_xvfb_and_connect_with_display() -> (TestXvfb, X11Source, String) {
         let display_num = ADAPTER_TEST_DISPLAY_BASE
             + NEXT_ADAPTER_TEST_DISPLAY_OFFSET.fetch_add(1, Ordering::SeqCst);
         let display = format!(":{display_num}");
@@ -634,7 +659,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match X11Source::connect_with_afk_threshold(Some(&display), Duration::from_secs(240)) {
-                Ok((source, _diagnostics)) => return (guard, source),
+                Ok((source, _diagnostics)) => return (guard, source, display),
                 Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -701,5 +726,100 @@ mod tests {
             ReconnectAttempt::OutageOpened { .. } => {}
             _ => panic!("attempting to reconnect to a nonexistent display must fail"),
         }
+    }
+
+    // --- BudgetedSource::recover (RF-32 T3) --------------------------------------------------
+
+    #[test]
+    fn recover_reports_outage_opened_when_the_reconnect_target_is_unreachable() {
+        let (_xvfb, source) = spawn_xvfb_and_connect();
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            // Same unreachable local display `x11_adapter_owns_a_working_reconnector` uses:
+            // `x11rb::connect` fails fast against a missing unix socket, so this never needs
+            // `Reconnector::attempt`'s 5s bound to fire.
+            Some(":9999"),
+            Duration::from_secs(1),
+        );
+
+        match adapter.recover(0) {
+            Some(RecoveryOutcome::OutageOpened { .. }) => {}
+            other => panic!("expected Some(RecoveryOutcome::OutageOpened), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_installs_the_reconnected_source_and_reports_restored() {
+        // The adapter starts on one Xvfb connection (`source`); its OWN `Reconnector` is
+        // pointed at a SECOND, independent Xvfb on `display2` (not back at `display1`) so a
+        // successful `recover()` is unambiguously proof that `replace_source` ran: the fd
+        // genuinely changes to a DIFFERENT server's connection, not just a fresh connection to
+        // the same one (which could theoretically reuse a kernel-recycled fd number by
+        // coincidence and look identical either way).
+        let (_xvfb1, source) = spawn_xvfb_and_connect();
+        let (_xvfb2, _source2_unused, display2) = spawn_xvfb_and_connect_with_display();
+        let original_fd = source.as_raw_fd();
+
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            Some(&display2),
+            Duration::from_secs(1),
+        );
+        assert_eq!(adapter.as_raw_fd(), original_fd);
+
+        match adapter.recover(0) {
+            Some(RecoveryOutcome::Restored { .. }) => {}
+            other => panic!("expected Some(RecoveryOutcome::Restored), got {other:?}"),
+        }
+
+        assert_ne!(
+            adapter.as_raw_fd(),
+            original_fd,
+            "recover() must have installed the freshly reconnected source, observable through \
+             as_raw_fd() changing — not merely through a field recover() happened to set"
+        );
+    }
+
+    #[test]
+    fn recover_resets_current_app_id_after_installing_the_reconnected_source() {
+        // `replace_source` already resets `current_app_id`; this proves `recover()` actually
+        // routes through `replace_source` for that side effect too, rather than only updating
+        // `self.source` some other way.
+        let (_xvfb1, source) = spawn_xvfb_and_connect();
+        let (_xvfb2, _source2_unused, display2) = spawn_xvfb_and_connect_with_display();
+
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            Some(&display2),
+            Duration::from_secs(1),
+        );
+        adapter.current_app_id = "stale-app-from-before-the-outage".to_string();
+
+        match adapter.recover(0) {
+            Some(RecoveryOutcome::Restored { .. }) => {}
+            other => panic!("expected Some(RecoveryOutcome::Restored), got {other:?}"),
+        }
+
+        assert_eq!(adapter.current_app_id, DESKTOP_APP_ID);
+    }
+
+    // --- BudgetedSource::recover's default, exercised through the real LogindSource enum ----
+
+    #[test]
+    fn logind_source_has_no_recovery_and_falls_through_to_the_trait_default() {
+        // `LogindSource` (and the `LogindAdapter` it wraps) never overrides `recover` — this
+        // is the real production type the feature doc names ("Assert LogindAdapter is
+        // unaffected"), exercised here via its D-Bus-free `Absent` branch so the test needs no
+        // real session bus.
+        let null = NullFd::new().expect("NullFd::new must succeed");
+        let mut source = LogindSource::Absent(null);
+
+        assert!(
+            source.recover(0).is_none(),
+            "LogindSource must keep BudgetedSource::recover's no-op default unchanged"
+        );
     }
 }

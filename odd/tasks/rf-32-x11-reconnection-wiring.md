@@ -133,8 +133,34 @@ policy — it is tested and correct; it only gains a caller.
       on a different idle threshold than the configured one. Fix: switch `src/main.rs:267`
       to `with_reconnect_config`. Disclosed by the T2 writer at `src/adapters.rs:60-68`
       rather than decided silently.
-- [ ] **T3** — Add the recovery capability to `BudgetedSource` with a no-op default,
-      implemented by `X11Adapter`. Assert `LogindAdapter` is unaffected.
+- [x] **T3** — Add the recovery capability to `BudgetedSource` with a no-op default,
+      implemented by `X11Adapter`. Route: delegated writer, worktree `rf-32-t2`. Three
+      genuine RED cycles (E0599 on a missing `recover`, then three `expected Some(...),
+      got None` panics against the no-op default). `BudgetedSource::recover` at
+      `src/reactor.rs:289`, `RecoveryOutcome` enum at `:313`, `X11Adapter`'s impl at
+      `src/adapters.rs:174`. T2's three `#[allow(dead_code)]` attributes removed —
+      `recover` is a real caller of the field and both methods. Checks:
+      `cargo test --all-targets` 279 passed 0 failed (parent re-ran it independently:
+      279 passed); clippy `-D warnings` clean; fmt clean after one self-inflicted
+      long-line fix. +248/-30 across two files.
+
+      **`ReconnectAttempt` was NOT reused as the return type, for two verified
+      reasons.** First, ownership: `recover` must install the source itself via
+      `replace_source`, and `X11Source` is not `Clone` because it owns a live
+      connection and fd — once moved into `self.source` there is no second copy to
+      also return inside `ReconnectAttempt::Restored.source`. That is a physical
+      impossibility, not a style preference. Second, `reactor.rs`'s own stated
+      invariant (task 14.12) is that no `x11rb`/`zbus` type is named anywhere in the
+      module; `ReconnectAttempt::Restored` carries `Box<X11Source>`, which wraps
+      `RustConnection`. `RecoveryOutcome` therefore mirrors `ReconnectAttempt`'s three
+      discriminants and field names exactly and cross-references its `SourceEvent`
+      contract, rather than inventing a parallel vocabulary.
+
+      Scope note: the brief said not to touch `src/reactor.rs`, which contradicted
+      requiring a `BudgetedSource` method, since the trait is defined only there
+      (`src/reactor.rs:254`). Resolved by editing only the trait definition and the
+      module's own tests. Verified: the diff touches exactly two hunks in that file
+      and leaves `next_event`, `Deadlines` and timer arming untouched.
 - [ ] **T4** — Intercept the mid-run X11 error inside `ReactorSource::next_event`:
       emit `DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`.
 - [ ] **T5** — Drive `DeadlineElapsed(ReconnectBackoff)` through the policy; emit
@@ -146,8 +172,8 @@ policy — it is tested and correct; it only gains a caller.
 
 ## Progress
 
-Exploration complete 2026-09-22 (read-only mapping agent). **T1 and T2 done**, 2 of 8
-(T2a added from T2's disclosure). Baseline moved 269 -> 270 -> 273 tests.
+Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2 and T3 done**,
+3 of 8 (T2a added from T2's disclosure). Baseline moved 269 -> 270 -> 273 -> 279 tests.
 
 T1 delivered on `main` as `1991d0d`. Its native review, lineage
 `review-7d07179fee1ffc81`, assessed `high` (`process_boundary`, `src/x11.rs`), ran four
@@ -174,5 +200,6 @@ closes.
 
 ## Next step
 
-T3 — add the recovery capability to `BudgetedSource` with a no-op default, implemented
-by `X11Adapter`. T2a must land before T5.
+T4 — intercept the mid-run X11 error inside `ReactorSource::next_event`: emit
+`DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`. T2a must land
+before T5.
