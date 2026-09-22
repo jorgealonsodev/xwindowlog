@@ -394,6 +394,14 @@ pub struct ReactorSource<X, L, C> {
     /// itself has already told a client, and is expected to move in lockstep with the
     /// `PauseExpiry` deadline once Phase 15 arms/cancels it through [`Self::arm_timer`].
     paused: bool,
+    /// RF-32 U1's gate: `true` from the moment `recover_x11` reports `OutageOpened`/`StillDown`
+    /// until it reports `Restored`. While `true`, `next_event` does not call `service_x11`
+    /// (and therefore does not call `X::recover`/`Reconnector::attempt`) at all — the *only*
+    /// path back to another attempt is `Timer::ReconnectBackoff` actually elapsing. Without
+    /// this, `next_event`'s drain-before-poll loop restarts immediately after `recover_x11`
+    /// arms the timer and `continue`s, so `service_x11` fails again against the still-dead
+    /// source before `poll(2)` is ever reached — the exact defect this unit fixes.
+    x11_down: bool,
 }
 
 impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
@@ -423,6 +431,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
             wakeup_causes: Arc::new(Mutex::new(VecDeque::new())),
             pending: VecDeque::new(),
             paused: false,
+            x11_down: false,
         }
     }
 
@@ -474,6 +483,66 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     /// deadline once Phase 15 arms/cancels it"; this is that lockstep's other half.
     pub fn mark_resumed(&mut self) {
         self.paused = false;
+    }
+
+    /// Flushes and drains the X11 source only — split out of `next_event` so a mid-run error
+    /// from either call can be caught in one place (RF-32 T4) without disturbing
+    /// `self.logind`'s own, unrelated `?` propagation right next to it.
+    fn service_x11(&mut self) -> Result<bool, SourceError> {
+        self.x11.flush()?;
+        drain_budget(&mut self.x11, X11_BUDGET, &mut self.pending)
+    }
+
+    /// RF-32 T4/U1: intercepts a mid-run X11 fault caught by `service_x11`, and is also the
+    /// sole handler `next_event` calls when `Timer::ReconnectBackoff` elapses (U1). Drives one
+    /// recovery attempt through the `BudgetedSource` seam (`X::recover`, RF-32 T3) and queues
+    /// exactly the `SourceEvent` sequence `RecoveryOutcome`'s own doc contract requires,
+    /// mirroring `x11::ReconnectAttempt`'s — the policy `Reconnector::attempt` actually drives.
+    /// Queues onto `self.pending` rather than returning a value: every caller just `continue`s
+    /// (or falls through to) the loop and the top-of-loop `pop_front` hands the event straight
+    /// back out.
+    ///
+    /// Also owns `self.x11_down`, U1's gate: set once an outage opens or persists, so
+    /// `next_event` stops calling `service_x11` (and therefore this method) until the armed
+    /// deadline fires; cleared on `Restored`, so normal servicing resumes.
+    fn recover_x11(&mut self) {
+        match self.x11.recover(crate::x11::os_entropy()) {
+            Some(RecoveryOutcome::OutageOpened { retry_after }) => {
+                self.x11_down = true;
+                self.pending.push_back(SourceEvent::DisplayLost);
+                self.arm_reconnect_backoff(retry_after);
+            }
+            Some(RecoveryOutcome::StillDown { retry_after }) => {
+                self.x11_down = true;
+                self.arm_reconnect_backoff(retry_after);
+            }
+            Some(RecoveryOutcome::Restored { outage_was_open }) => {
+                self.x11_down = false;
+                if !outage_was_open {
+                    self.pending.push_back(SourceEvent::DisplayLost);
+                }
+                self.pending.push_back(SourceEvent::DisplayRestored);
+            }
+            None => {
+                // `X11Adapter::recover` (RF-32 T3) always returns `Some`; only a source that
+                // never overrides `recover` (this trait's no-op default), or a test double
+                // whose outcome queue ran out, can land here. There is nothing to translate and
+                // `x11_down` is deliberately left as it was: if it was already `true`, staying
+                // gated is the safer failure than silently resuming un-recovered; production's
+                // `X11Adapter` never actually reaches this branch.
+            }
+        }
+    }
+
+    /// Arms `Timer::ReconnectBackoff` for `retry_after` from now, the same
+    /// `clock.now_mono().checked_add(duration)` -> `arm_timer` mechanism `main.rs` already uses
+    /// for `Timer::PauseExpiry` (`src/main.rs:391-393`). An unrepresentable overflow (never
+    /// observed in practice — see `MonoInstant::checked_add`'s own doc) leaves the timer
+    /// unarmed rather than panicking or arming the wrong instant.
+    fn arm_reconnect_backoff(&mut self, retry_after: Duration) {
+        if let Some(at) = self.clock.now_mono().checked_add(retry_after) {
+            self.arm_timer(Timer::ReconnectBackoff, at);
+        }
     }
 }
 
@@ -605,8 +674,31 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                 return Ok(Some(event));
             }
 
-            self.x11.flush()?;
-            let x11_backlog = drain_budget(&mut self.x11, X11_BUDGET, &mut self.pending)?;
+            // RF-32 U1's gate: while an outage is open, do not call `service_x11` (and
+            // therefore do not call `X::recover`/`Reconnector::attempt`) at all. Without this,
+            // a failed `service_x11` below would drive `recover_x11`, which `continue`s back to
+            // the top of this very loop with `pending` still not holding anything that stops
+            // it — `service_x11` runs again immediately against the still-dead source, forever,
+            // and `poll(2)` (and the deadline this same call armed) is never reached. Gated,
+            // this iteration instead falls straight through to servicing logind/signals/clients
+            // and `poll(2)` below; the only way back to another attempt is
+            // `Timer::ReconnectBackoff` actually elapsing (handled further down).
+            let x11_backlog = if self.x11_down {
+                false
+            } else {
+                match self.service_x11() {
+                    Ok(backlog) => backlog,
+                    Err(_) => {
+                        // RF-32 T4: a mid-run X11 error must never escape `next_event` as an
+                        // `Err` — that would unwind into `main.rs`'s startup-error path and
+                        // exit the daemon (the feature doc's Decision). Route it through the T3
+                        // seam instead; `self.logind`'s own drain right below keeps propagating
+                        // via `?` unchanged — only this X11 slot is caught here.
+                        self.recover_x11();
+                        continue;
+                    }
+                }
+            };
             let dbus_backlog = drain_budget(&mut self.logind, DBUS_BUDGET, &mut self.pending)?;
 
             let now_wall = self.clock.now_wall();
@@ -695,7 +787,19 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
             let due = self.deadlines.take_due(now);
             cause.deadline_due = !due.is_empty();
             for timer in due {
-                self.pending.push_back(SourceEvent::DeadlineElapsed(timer));
+                if timer == Timer::ReconnectBackoff {
+                    // RF-32 U1: the backoff deadline drives the next reconnect attempt
+                    // internally rather than escaping as a raw `DeadlineElapsed` event —
+                    // nothing outside this module owns X11 reconnection state
+                    // (`tracker.rs`'s own doc: `reactor.rs` tracks this deadline "itself,
+                    // outside the tracker"), and this is the design's "reactor-internal
+                    // recovery" route. `recover_x11` queues whichever `SourceEvent`s the
+                    // outcome requires (`DisplayRestored`, or nothing while still down) and,
+                    // on success, clears `x11_down` so normal servicing resumes.
+                    self.recover_x11();
+                } else {
+                    self.pending.push_back(SourceEvent::DeadlineElapsed(timer));
+                }
             }
 
             if let Some(at) = deadline {
@@ -802,6 +906,410 @@ mod tests {
             source.try_next().expect("try_next must not error"),
             Some(SourceEvent::ActiveWindowDestroyed),
             "the queued event must still be exactly what try_next drains after recover() runs"
+        );
+    }
+
+    // --- RF-32 T4: a mid-run X11 error must be caught inside `next_event`, drive recovery
+    // through the `BudgetedSource::recover` seam (RF-32 T3), and never itself escape as `Err`
+    // ------------------------------------------------------------------------------------------
+
+    /// A `BudgetedSource` double that can be told to fail its next `try_next` on demand, and to
+    /// hand back a scripted `RecoveryOutcome` from `recover` — proof that `next_event` reacts to
+    /// exactly what the `BudgetedSource` seam reports, without depending on a real
+    /// `x11rb`/`Reconnector` type (task 14.12's "no x11rb/zbus type in this module" boundary,
+    /// held even for this recoverable double). Also usable, unscripted, as a plain
+    /// non-recovering source (its own `recover` falls through to `None` once the queue is
+    /// empty) — used in the logind slot to prove RF-32 T4 does NOT generically swallow every
+    /// `BudgetedSource`'s errors, only the X11 slot's.
+    struct RecoverableSource {
+        reader: UnixStream,
+        events: VecDeque<SourceEvent>,
+        fail_next_try_next: bool,
+        /// RF-32 U1: how many MORE consecutive `try_next` calls must fail, simulating a
+        /// connection that stays genuinely dead across several loop iterations rather than
+        /// `fail_next_try_next`'s single point-in-time fault. Bounded (not an unconditional
+        /// "always fail") so that a still-ungated `next_event` — which retries in a tight loop
+        /// with no `poll(2)` in between — burns through it and returns instead of hanging the
+        /// test suite; the resulting inflated `recover_call_count` is itself the proof the gate
+        /// is missing.
+        remaining_failures: u32,
+        recover_outcomes: VecDeque<RecoveryOutcome>,
+        /// RF-32 U1: counts every call to `recover` (i.e. every `Reconnector::attempt` a real
+        /// `X11Adapter` would have made), independent of what outcome was queued for it. This
+        /// is the mandatory test property's own counter — proving the gate — rather than a
+        /// production concern of this double.
+        recover_calls: u32,
+    }
+
+    impl RecoverableSource {
+        fn pair() -> (Self, UnixStream) {
+            let (reader, writer) = UnixStream::pair().expect("UnixStream::pair must succeed");
+            reader
+                .set_nonblocking(true)
+                .expect("set_nonblocking must succeed");
+            (
+                RecoverableSource {
+                    reader,
+                    events: VecDeque::new(),
+                    fail_next_try_next: false,
+                    remaining_failures: 0,
+                    recover_outcomes: VecDeque::new(),
+                    recover_calls: 0,
+                },
+                writer,
+            )
+        }
+
+        /// Makes the very next `try_next` call return a synthetic `SourceError`, mirroring the
+        /// shape `X11Adapter::try_next` produces from a real mid-run `x11rb` failure — one
+        /// error, then normal behavior resumes (RF-32's error is a single point-in-time fault,
+        /// not a source that is permanently broken).
+        fn fail_next_try_next(&mut self) {
+            self.fail_next_try_next = true;
+        }
+
+        /// Makes the next `times` calls to `try_next` all fail — a source that stays down
+        /// across iterations, unlike `fail_next_try_next`'s one-shot fault. This is what a
+        /// gating test needs: under a correctly gated `next_event`, `try_next` is never called
+        /// again while `x11_down` is set, so this budget is never touched past the first
+        /// failure; under an ungated one, every loop restart calls it again and burns through
+        /// the budget immediately, in the very call the test is asserting against.
+        fn fail_try_next_persistently(&mut self, times: u32) {
+            self.remaining_failures = times;
+        }
+
+        /// Queues one `RecoveryOutcome` for `recover` to hand back, in call order.
+        fn queue_recover_outcome(&mut self, outcome: RecoveryOutcome) {
+            self.recover_outcomes.push_back(outcome);
+        }
+
+        /// How many times `recover` (this double's stand-in for `Reconnector::attempt`) has
+        /// actually been called so far.
+        fn recover_call_count(&self) -> u32 {
+            self.recover_calls
+        }
+    }
+
+    impl BudgetedSource for RecoverableSource {
+        fn as_raw_fd(&self) -> RawFd {
+            self.reader.as_raw_fd()
+        }
+
+        fn try_next(&mut self) -> Result<Option<SourceEvent>, SourceError> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err(SourceError(
+                    "synthetic persistent mid-run source failure (RF-32 U1 test double)"
+                        .to_string(),
+                ));
+            }
+            if self.fail_next_try_next {
+                self.fail_next_try_next = false;
+                return Err(SourceError(
+                    "synthetic mid-run source failure (RF-32 T4 test double)".to_string(),
+                ));
+            }
+            let mut buf = [0u8; 64];
+            match self.reader.read(&mut buf) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(self.events.pop_front()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(SourceError(e.to_string())),
+            }
+        }
+
+        fn recover(&mut self, _entropy: u64) -> Option<RecoveryOutcome> {
+            self.recover_calls += 1;
+            self.recover_outcomes.pop_front()
+        }
+    }
+
+    /// Builds a reactor with a `RecoverableSource` in the X11 slot and a plain
+    /// `SyntheticSource` in the logind slot — the shape every T4 test below needs, factored out
+    /// so each test states only what makes it distinct (mirrors `make_reactor_source` above,
+    /// which cannot be reused as-is because it fixes both slots to `SyntheticSource`).
+    fn make_recoverable_x11_reactor(
+        case: &str,
+    ) -> (
+        ReactorSource<RecoverableSource, SyntheticSource, FakeClock>,
+        UnixStream,
+    ) {
+        let (x11, x11_writer) = RecoverableSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener(case);
+        let clock = FakeClock::new(WallTs(0));
+        let reactor = ReactorSource::new(x11, logind, signals, listener, Uid::current(), clock);
+        (reactor, x11_writer)
+    }
+
+    #[test]
+    fn a_mid_run_x11_error_produces_display_lost_instead_of_propagating() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer) = make_recoverable_x11_reactor("x11-error-display-lost");
+        reactor.x11.fail_next_try_next();
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::OutageOpened {
+                retry_after: Duration::from_millis(80),
+            });
+
+        let event = reactor
+            .next_event(None)
+            .expect("a mid-run X11 error must be caught inside next_event, never propagate");
+
+        assert_eq!(
+            event,
+            Some(SourceEvent::DisplayLost),
+            "an OutageOpened outcome must translate into exactly one DisplayLost event \
+             (x11::ReconnectAttempt::OutageOpened's doc contract)"
+        );
+    }
+
+    /// RF-32 U1's mandatory test property. `next_event` is drain-before-poll (`recover_x11` is
+    /// called again on every loop restart unless something gates it), so a single-iteration
+    /// test cannot distinguish "waits for the deadline" from "retries immediately" — this test
+    /// drives a SECOND external call to `next_event` before the armed deadline elapses and
+    /// proves `recover` (this double's stand-in for `Reconnector::attempt`) was not called
+    /// again by it.
+    ///
+    /// Uses `fail_try_next_persistently`, not `fail_next_try_next`: a one-shot failure heals
+    /// itself on the very next `try_next` call regardless of whether the gate exists, which
+    /// makes the assertions below pass vacuously either way (verified by mutation: replacing
+    /// the production `if self.x11_down` check with `if false` still left this test green
+    /// against a one-shot double, because `service_x11` simply stopped erroring on the second
+    /// call — see this unit's report for the exact mutation transcript). The source here stays
+    /// down across several consecutive `try_next` calls, so an ungated retry loop actually
+    /// observes it still failing and keeps calling `recover`.
+    #[test]
+    fn no_reconnect_attempt_happens_before_the_backoff_deadline_fires() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (x11, _x11_writer) = RecoverableSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("reconnect-backoff-gated");
+        // A real `SystemClock`, not `FakeClock`: proving the timer's own duration requires real
+        // wall-clock time to actually pass, the same reason
+        // `an_idle_client_past_its_deadline_is_reaped_and_frees_its_slot` above uses it.
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+        // Stays down for 5 more `try_next` calls past the first failure — comfortably enough
+        // that an ungated retry loop (which would call it again immediately, with nothing
+        // between iterations) burns through the budget and inflates `recover_call_count` well
+        // past 1 inside the second `next_event` call itself, rather than this test hanging.
+        reactor.x11.fail_try_next_persistently(5);
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::OutageOpened {
+                retry_after: Duration::from_millis(80),
+            });
+
+        // First external call: the outage opens. Exactly one `recover` call so far.
+        let lost = reactor.next_event(None).expect("must not error");
+        assert_eq!(lost, Some(SourceEvent::DisplayLost));
+        assert_eq!(
+            reactor.x11.recover_call_count(),
+            1,
+            "the first failure must drive exactly one recovery attempt"
+        );
+
+        // Second external call, well short of the armed 80ms backoff: the drain-before-poll
+        // defect called `recover` again right here, on this very call, before ever reaching
+        // `poll(2)`. Gated correctly, this call must reach `poll(2)`, time out against the
+        // caller's own short deadline, and return `None` without touching `recover` again.
+        let too_early_deadline = MonoInstant(Instant::now() + Duration::from_millis(20));
+        let too_early = reactor
+            .next_event(Some(too_early_deadline))
+            .expect("must not error");
+        assert_eq!(
+            too_early, None,
+            "nothing is due yet: the call must time out on the caller's own short deadline"
+        );
+        assert_eq!(
+            reactor.x11.recover_call_count(),
+            1,
+            "THE mandatory assertion: driving next_event a second time, before the backoff \
+             deadline elapses, must NOT increment the recovery-attempt count — proving the \
+             retry is gated on the deadline rather than retried immediately on every loop \
+             restart"
+        );
+
+        // Third external call, past the armed 80ms: only now must a second attempt happen.
+        let due_deadline = MonoInstant(Instant::now() + Duration::from_millis(500));
+        let _ = reactor
+            .next_event(Some(due_deadline))
+            .expect("must not error");
+        assert_eq!(
+            reactor.x11.recover_call_count(),
+            2,
+            "once the armed deadline has genuinely elapsed, exactly one more recovery attempt \
+             must happen"
+        );
+    }
+
+    /// The other half of the same property: once the deadline drives the next attempt and it
+    /// succeeds, the caller must see exactly one `DisplayRestored` — never the raw
+    /// `DeadlineElapsed(Timer::ReconnectBackoff)` event, which nothing outside this module
+    /// (`tracker.rs`'s own doc: "`reactor.rs` tracks the unrelated `ReconnectBackoff` ... \
+    /// deadline itself, outside the tracker") is equipped to act on.
+    #[test]
+    fn the_backoff_deadline_drives_the_next_attempt_and_a_success_emits_display_restored() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (x11, _x11_writer) = RecoverableSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("reconnect-backoff-drives-restore");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+        reactor.x11.fail_next_try_next();
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::OutageOpened {
+                retry_after: Duration::from_millis(50),
+            });
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::Restored {
+                outage_was_open: true,
+            });
+
+        let lost = reactor.next_event(None).expect("must not error");
+        assert_eq!(lost, Some(SourceEvent::DisplayLost));
+
+        let due_deadline = MonoInstant(Instant::now() + Duration::from_millis(500));
+        let restored = reactor
+            .next_event(Some(due_deadline))
+            .expect("must not error");
+        assert_eq!(
+            restored,
+            Some(SourceEvent::DisplayRestored),
+            "the elapsed backoff deadline must drive the next attempt internally and translate \
+             a Restored outcome into exactly one DisplayRestored — never a raw \
+             DeadlineElapsed(Timer::ReconnectBackoff)"
+        );
+    }
+
+    /// The gate itself: while an outage is open, `next_event` must not call `service_x11`
+    /// (and therefore not `recover`) again at all until the deadline fires — proven here by
+    /// observing the reactor still services the OTHER sources (signals, in this case) normally
+    /// while X11 stays down, rather than being stuck busy-retrying it.
+    ///
+    /// Uses `fail_try_next_persistently`, not `fail_next_try_next`, for the same reason as
+    /// `no_reconnect_attempt_happens_before_the_backoff_deadline_fires`: a one-shot failure
+    /// heals itself on the very next call, so an ungated `service_x11` would simply succeed on
+    /// the second `next_event` here too — with or without the gate — and the
+    /// `recover_call_count` assertion below would pass vacuously.
+    #[test]
+    fn other_sources_keep_being_serviced_normally_while_x11_is_down() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (x11, _x11_writer) = RecoverableSource::pair();
+        let (mut logind, mut logind_writer) = SyntheticSource::pair();
+        logind.push_event(SourceEvent::PrepareForSleep(true));
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("reconnect-backoff-other-sources");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+        reactor.x11.fail_try_next_persistently(5);
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::OutageOpened {
+                retry_after: Duration::from_secs(3600),
+            });
+
+        let lost = reactor.next_event(None).expect("must not error");
+        assert_eq!(lost, Some(SourceEvent::DisplayLost));
+
+        // The backoff is armed an hour out, so nothing about it is due. If X11 being down
+        // blocked the reactor from reaching `poll(2)` for any other source, this logind event
+        // — already sitting on its own fd — would never be observed.
+        logind_writer
+            .write_all(b"x")
+            .expect("write to the synthetic logind fd must succeed");
+        let event = reactor
+            .next_event(None)
+            .expect("logind must still be serviced while X11 is down");
+        assert_eq!(event, Some(SourceEvent::PrepareForSleep(true)));
+        assert_eq!(
+            reactor.x11.recover_call_count(),
+            1,
+            "servicing another source while X11 is down must not itself trigger another \
+             recovery attempt"
+        );
+    }
+
+    #[test]
+    fn a_logind_error_still_propagates_and_is_not_recovered() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (x11, _x11_writer) = SyntheticSource::pair();
+        let (mut logind, _logind_writer) = RecoverableSource::pair();
+        logind.fail_next_try_next();
+        // Deliberately no queued `recover` outcome: if `next_event` ever caught the logind
+        // slot's error the way it catches X11's, `recover` would still be called here and this
+        // test's own setup would silently hide the regression by returning `None` from the
+        // default-shaped fallback. The distinguishing proof is `result.is_err()` below — only
+        // the X11 slot may swallow its own `SourceError`.
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("logind-error-propagates");
+        let clock = FakeClock::new(WallTs(0));
+        let mut reactor = ReactorSource::new(x11, logind, signals, listener, Uid::current(), clock);
+
+        let result = reactor.next_event(None);
+
+        assert!(
+            result.is_err(),
+            "a logind-shaped SourceError must still propagate as Err — drain_budget is generic \
+             over S: BudgetedSource and RF-32 T4 must only special-case the X11 slot, never \
+             every BudgetedSource"
+        );
+    }
+
+    #[test]
+    fn a_same_instant_recovery_emits_display_lost_before_display_restored() {
+        // x11::ReconnectAttempt::Restored's doc contract (mirrored by RecoveryOutcome::Restored,
+        // src/reactor.rs): when `outage_was_open` is false, the caller was never told to open
+        // the outage's one `unknown` interval, and must still emit DisplayLost before
+        // DisplayRestored so a same-instant recovery is recorded as the short gap it really
+        // was, rather than disappearing entirely.
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer) =
+            make_recoverable_x11_reactor("same-instant-recovery-display-lost-then-restored");
+        reactor.x11.fail_next_try_next();
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::Restored {
+                outage_was_open: false,
+            });
+
+        let first = reactor.next_event(None).expect("must not error");
+        assert_eq!(
+            first,
+            Some(SourceEvent::DisplayLost),
+            "outage_was_open: false must still open the unknown interval with DisplayLost first"
+        );
+
+        let second = reactor.next_event(None).expect("must not error");
+        assert_eq!(
+            second,
+            Some(SourceEvent::DisplayRestored),
+            "exactly one DisplayRestored must follow, closing the interval DisplayLost opened"
         );
     }
 

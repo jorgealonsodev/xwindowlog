@@ -141,19 +141,50 @@ policy — it is tested and correct; it only gains a caller.
       and re-ran the test: it failed with `left: 240s, right: 37s`. The guard is real.
       Source then restored and all three checks re-run clean.
 
-- [ ] **T4** — Intercept the mid-run X11 error inside `ReactorSource::next_event`:
-      emit `DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`.
-- [ ] **T5** — Drive `DeadlineElapsed(ReconnectBackoff)` through the policy; emit
-      `DisplayRestored` and reset backoff on success, re-arm on `StillDown`.
-- [ ] **T6** — Keep a genuine startup failure fatal. Prove `main.rs` still exits with
-      `ExitStatus::Environment` when the first connect fails.
-- [ ] **T7** — End-to-end against real Xvfb: kill the server mid-run, restart it,
-      prove the daemon reconnects and keeps capturing.
+- [x] **U1 — Complete the reconnection loop** (absorbed the old T4 and T5).
+      Route: delegated writer, worktree `rf-32-t4`, returned once by the parent with
+      mutation evidence. Gate is `x11_down: bool` on `ReactorSource` (`src/reactor.rs:404`),
+      set on `OutageOpened`/`StillDown` and cleared on `Restored` in `recover_x11`
+      (`:508`), read at the top of the X11 step in `next_event` (`:686`) so `service_x11`
+      — and therefore `attempt()` — is never called while down. The backoff deadline is
+      consumed inside the `take_due` loop (`:790`) and drives the next attempt directly,
+      instead of escaping as a raw `DeadlineElapsed(Timer::ReconnectBackoff)`; nothing
+      outside this module owns X11 reconnection state, and `tracker.rs` says so itself.
+      Checks: `cargo test --all-targets` 286 passed 0 failed, clippy `-D warnings` clean,
+      fmt clean — all three re-run by the parent. +514/-14 in `src/reactor.rs`.
+
+      **The first submission passed its own mandatory assertion while the gate was
+      disabled.** The parent caught it by mutation: replacing `if self.x11_down` with
+      `if false` left `no_reconnect_attempt_happens_before_the_backoff_deadline_fires`
+      passing. Cause: `RecoverableSource::fail_next_try_next` is one-shot and `try_next`
+      clears it on the first failure, so the source HEALED ITSELF on the second call —
+      `service_x11` returned `Ok`, `recover` was never reached, and the count stayed at 1
+      with or without a gate. The test measured a recovered source, not a dead one.
+
+      Fixed with `fail_try_next_persistently(times)` (`remaining_failures`, bounded at 5
+      rather than unconditional so a missing gate burns the budget and fails fast instead
+      of hanging the suite forever — the ungated `Err(_) => { recover_x11(); continue; }`
+      has no other exit). Re-verified by the parent's own mutation: the assertion now
+      fails `left: 5, right: 1`. That `5` is direct evidence of the hot loop — the whole
+      failure budget is consumed inside a SINGLE `next_event` call.
+
+      **Rule this unit establishes**: a test that arms or gates on state must observe the
+      SECOND iteration against a fault that PERSISTS. A one-shot fault double heals
+      itself and makes the assertion vacuous. Verify every such test by mutation before
+      believing it.
+
+- [ ] **U2 — Prove it end to end** (absorbs the old T6 and T7).
+      A genuine startup connection failure must stay fatal: `main.rs` still exits with
+      `ExitStatus::Environment` when the FIRST connect fails, while a mid-run loss now
+      recovers. Then the real proof: against real Xvfb, kill the server mid-run, restart
+      it, and show the daemon reconnects and keeps capturing. Startup-fatal and
+      midrun-recoverable are the two halves of one distinction, so they are proven
+      together rather than asserted separately.
 
 ## Progress
 
-Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2, T3 and T2a done**,
-4 of 8. Baseline moved 269 -> 270 -> 273 -> 279 -> 280 tests.
+Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2, T3, T2a and U1
+done**, 5 of 6 units. Baseline moved 269 -> 270 -> 273 -> 279 -> 280 -> 286 tests.
 
 Reviews so far: `review-7d07179fee1ffc81` (T1, high, four lenses) and
 `review-cc5cf7104f4f472c` (T2+T3 slice, medium, one lens). Both approved with zero
@@ -184,6 +215,13 @@ closes.
 
 ## Next step
 
-T4 — intercept the mid-run X11 error inside `ReactorSource::next_event`: emit
-`DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`. T2a is done,
-so T5 is unblocked once T4 lands.
+U2 — prove it end to end: startup failure stays fatal, mid-run loss recovers against
+real Xvfb.
+
+## Why the remaining work was regrouped
+
+The first four tasks were sized by edit surface, which produced a review cycle per
+small task and, worse, split one mechanism across two of them. The remainder is sized
+by MECHANISM instead: U1 is "a deadline is armed and honored", U2 is "startup fatal,
+mid-run recoverable". Each is one coherent behavior with its own tests and one review,
+which is both cheaper and harder to ship broken.
