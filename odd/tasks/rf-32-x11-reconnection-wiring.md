@@ -121,46 +121,26 @@ policy — it is tested and correct; it only gains a caller.
       independently: 273 passed); clippy `-D warnings` clean; `cargo fmt --check` clean.
       +213/-1 in one file.
 
-- [ ] **T2a** — Make the adapter's `Reconnector` use the CONFIGURED afk threshold.
-      T2 could not: `Reconnector::new` needs `display`/`afk_threshold`, and supplying the
-      real ones meant changing `X11Adapter::new`'s signature, whose only call site is
-      `src/main.rs:267` — a file T2 was forbidden to touch. `new` therefore defaults to
-      `(None, DEFAULT_RECONNECT_AFK_THRESHOLD)`. `display` matches production, which always
-      passes `None`; **`afk_threshold` does not** — `main.rs` passes
-      `config.afk_threshold`, which can differ from the 240 s default. Harmless today
-      because nothing calls `reconnector_mut()` in production, and it must be fixed
-      BEFORE T5 gives it a production caller, or a reconnected source would silently run
-      on a different idle threshold than the configured one. Fix: switch `src/main.rs:267`
-      to `with_reconnect_config`. Disclosed by the T2 writer at `src/adapters.rs:60-68`
-      rather than decided silently.
-- [x] **T3** — Add the recovery capability to `BudgetedSource` with a no-op default,
-      implemented by `X11Adapter`. Route: delegated writer, worktree `rf-32-t2`. Three
-      genuine RED cycles (E0599 on a missing `recover`, then three `expected Some(...),
-      got None` panics against the no-op default). `BudgetedSource::recover` at
-      `src/reactor.rs:289`, `RecoveryOutcome` enum at `:313`, `X11Adapter`'s impl at
-      `src/adapters.rs:174`. T2's three `#[allow(dead_code)]` attributes removed —
-      `recover` is a real caller of the field and both methods. Checks:
-      `cargo test --all-targets` 279 passed 0 failed (parent re-ran it independently:
-      279 passed); clippy `-D warnings` clean; fmt clean after one self-inflicted
-      long-line fix. +248/-30 across two files.
+- [x] **T2a** — Make the adapter's `Reconnector` use the CONFIGURED afk threshold.
+      Route: delegated writer, worktree `rf-32-t2`. `build_x11_adapter` at
+      `src/main.rs:252-258`, production call site at `:282` now passing
+      `config.afk_threshold`; read-only `Reconnector::afk_threshold()` accessor at
+      `src/x11.rs:1737`. `X11Adapter::new` and `DEFAULT_RECONNECT_AFK_THRESHOLD` were
+      DELETED, not `#[cfg(test)]`-gated: once `main.rs` stopped calling them, clippy
+      `-D warnings` failed with two genuine `dead_code` errors. The two tests that used
+      `new` now call `with_reconnect_config` directly. The stale doc comment declaring
+      the gap is gone, replaced by one describing what the code actually does.
+      Checks: `cargo test --all-targets` 280 passed 0 failed; clippy `-D warnings`
+      clean; fmt clean — all three re-run by the parent after its mutation check below.
+      +67/-26 across three files.
 
-      **`ReconnectAttempt` was NOT reused as the return type, for two verified
-      reasons.** First, ownership: `recover` must install the source itself via
-      `replace_source`, and `X11Source` is not `Clone` because it owns a live
-      connection and fd — once moved into `self.source` there is no second copy to
-      also return inside `ReconnectAttempt::Restored.source`. That is a physical
-      impossibility, not a style preference. Second, `reactor.rs`'s own stated
-      invariant (task 14.12) is that no `x11rb`/`zbus` type is named anywhere in the
-      module; `ReconnectAttempt::Restored` carries `Box<X11Source>`, which wraps
-      `RustConnection`. `RecoveryOutcome` therefore mirrors `ReconnectAttempt`'s three
-      discriminants and field names exactly and cross-references its `SourceEvent`
-      contract, rather than inventing a parallel vocabulary.
+      **Mutation-verified by the parent.** The writer's RED was a compile error
+      (`E0425: cannot find function build_x11_adapter`), not an assertion failing
+      against the defaulting behavior, so the test had never been shown to reject the
+      real defect. The parent hardcoded the threshold back to `Duration::from_secs(240)`
+      and re-ran the test: it failed with `left: 240s, right: 37s`. The guard is real.
+      Source then restored and all three checks re-run clean.
 
-      Scope note: the brief said not to touch `src/reactor.rs`, which contradicted
-      requiring a `BudgetedSource` method, since the trait is defined only there
-      (`src/reactor.rs:254`). Resolved by editing only the trait definition and the
-      module's own tests. Verified: the diff touches exactly two hunks in that file
-      and leaves `next_event`, `Deadlines` and timer arming untouched.
 - [ ] **T4** — Intercept the mid-run X11 error inside `ReactorSource::next_event`:
       emit `DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`.
 - [ ] **T5** — Drive `DeadlineElapsed(ReconnectBackoff)` through the policy; emit
@@ -172,8 +152,12 @@ policy — it is tested and correct; it only gains a caller.
 
 ## Progress
 
-Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2 and T3 done**,
-3 of 8 (T2a added from T2's disclosure). Baseline moved 269 -> 270 -> 273 -> 279 tests.
+Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2, T3 and T2a done**,
+4 of 8. Baseline moved 269 -> 270 -> 273 -> 279 -> 280 tests.
+
+Reviews so far: `review-7d07179fee1ffc81` (T1, high, four lenses) and
+`review-cc5cf7104f4f472c` (T2+T3 slice, medium, one lens). Both approved with zero
+findings and acknowledged, authority burned. The reviewed boundary is `aaf95c6`.
 
 T1 delivered on `main` as `1991d0d`. Its native review, lineage
 `review-7d07179fee1ffc81`, assessed `high` (`process_boundary`, `src/x11.rs`), ran four
@@ -201,5 +185,5 @@ closes.
 ## Next step
 
 T4 — intercept the mid-run X11 error inside `ReactorSource::next_event`: emit
-`DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`. T2a must land
-before T5.
+`DisplayLost`, arm `Timer::ReconnectBackoff`, stop it escaping as `Err`. T2a is done,
+so T5 is unblocked once T4 lands.

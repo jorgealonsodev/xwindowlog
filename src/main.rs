@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use nix::fcntl::{Flock, FlockArg};
@@ -17,6 +18,7 @@ use nix::unistd::Uid;
 
 use xwindowlog::clock::{Clock, SystemClock};
 use xwindowlog::control;
+use xwindowlog::exclude::Excluder;
 use xwindowlog::logind::{
     self, LockedHintTracker, SessionMonitor as _, SessionResolution, SuspendInhibitor,
 };
@@ -242,6 +244,19 @@ fn run_daemon() -> ExitCode {
     }
 }
 
+/// Builds the production `X11Adapter`, threading the CONFIGURED `afk_threshold` into its
+/// owned `Reconnector` (RF-32 T2a) instead of a hardcoded default, which would silently
+/// diverge from `afk_threshold` once `recover()` gets a production caller (T5). `display:
+/// None` matches this function's own `X11Source::connect_with_afk_threshold(None, ..)` call
+/// above.
+fn build_x11_adapter(
+    source: X11Source,
+    excluder: Rc<RefCell<Excluder>>,
+    afk_threshold: Duration,
+) -> X11Adapter {
+    X11Adapter::with_reconnect_config(source, excluder, None, afk_threshold)
+}
+
 fn try_run_daemon() -> Result<(), StartupError> {
     let config = DaemonConfig::load_default().map_err(StartupError::Config)?;
     let runtime_dir = runtime_dir()?;
@@ -264,7 +279,7 @@ fn try_run_daemon() -> Result<(), StartupError> {
         X11Source::connect_with_afk_threshold(None, config.afk_threshold)
             .map_err(StartupError::X11)?;
     let excluder = Rc::new(RefCell::new(config.excluder));
-    let x11_adapter = X11Adapter::new(x11_source, Rc::clone(&excluder));
+    let x11_adapter = build_x11_adapter(x11_source, Rc::clone(&excluder), config.afk_threshold);
 
     let (monitor, degrade_diagnostic) = logind::init_session_monitor();
     if let Some(diagnostic) = degrade_diagnostic {

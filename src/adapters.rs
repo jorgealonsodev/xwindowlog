@@ -57,17 +57,6 @@ fn translate_x11_event(
     }
 }
 
-/// Mirrors `x11.rs`'s own private `DEFAULT_AFK_THRESHOLD` (`src/x11.rs:177`) — not `pub`, so
-/// this is the one place outside that module that needs the same literal (same shape as
-/// `DESKTOP_APP_ID` above). Used only by `X11Adapter::new`'s owned `Reconnector` (RF-32 T2):
-/// `main.rs`'s single call site (`src/main.rs:267`) still calls `new`, not
-/// `with_reconnect_config`, and stays out of this task's authorized scope, so the adapter
-/// cannot yet be told the real `afk_threshold` the production `X11Source` was actually built
-/// with (`src/main.rs:264` passes `config.afk_threshold`, which may differ from this
-/// default). Disclosed gap: this mismatch is latent until whichever later task wires
-/// `main.rs` to call `with_reconnect_config` with its real config instead.
-const DEFAULT_RECONNECT_AFK_THRESHOLD: Duration = Duration::from_secs(240);
-
 /// `reactor::BudgetedSource` over the real `x11.rs` capture engine (design §2 D-2 fd0).
 pub struct X11Adapter {
     source: X11Source,
@@ -82,18 +71,12 @@ pub struct X11Adapter {
 }
 
 impl X11Adapter {
-    /// `display: None`, matching `main.rs`'s only production call site
-    /// (`X11Source::connect_with_afk_threshold(None, ..)`, `src/main.rs:264`) — see
-    /// `DEFAULT_RECONNECT_AFK_THRESHOLD`'s doc for the one field this cannot mirror yet.
-    pub fn new(source: X11Source, excluder: Rc<RefCell<Excluder>>) -> Self {
-        Self::with_reconnect_config(source, excluder, None, DEFAULT_RECONNECT_AFK_THRESHOLD)
-    }
-
-    /// Same as `new`, with the `Reconnector`'s `display`/`afk_threshold` explicit rather than
-    /// defaulted — mirrors `X11Source::connect`/`connect_with_afk_threshold`'s own
-    /// default-plus-override shape (`src/x11.rs:429-439`) for the same reason: a future
-    /// caller that actually knows the production config (or a test) needs a `Reconnector`
-    /// that would reconnect to the *same* display this adapter's `source` came from.
+    /// Constructs the adapter with its owned `Reconnector`'s `display`/`afk_threshold`
+    /// explicit, rather than defaulted — mirrors `X11Source::connect_with_afk_threshold`'s own
+    /// shape (`src/x11.rs:438`). `main.rs`'s production call site (`build_x11_adapter`) passes
+    /// `display: None` (matching its own `X11Source::connect_with_afk_threshold(None, ..)`
+    /// call) and its real configured `afk_threshold` (RF-32 T2a), so the `Reconnector` would
+    /// reconnect to the *same* display and idle threshold this adapter's `source` came from.
     pub fn with_reconnect_config(
         source: X11Source,
         excluder: Rc<RefCell<Excluder>>,
@@ -679,7 +662,13 @@ mod tests {
             "two independent Xvfb connections must not share a fd"
         );
 
-        let mut adapter = X11Adapter::new(source1, Rc::new(RefCell::new(passthrough_excluder())));
+        // The Reconnector config is not exercised by this test; any values are fine.
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source1,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            None,
+            Duration::from_secs(240),
+        );
         assert_eq!(adapter.as_raw_fd(), fd1);
 
         adapter.replace_source(source2);
@@ -696,7 +685,13 @@ mod tests {
         let (_xvfb1, source1) = spawn_xvfb_and_connect();
         let (_xvfb2, source2) = spawn_xvfb_and_connect();
 
-        let mut adapter = X11Adapter::new(source1, Rc::new(RefCell::new(passthrough_excluder())));
+        // The Reconnector config is not exercised by this test; any values are fine.
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source1,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            None,
+            Duration::from_secs(240),
+        );
         adapter.current_app_id = "stale-app-from-before-the-outage".to_string();
 
         adapter.replace_source(source2);
@@ -726,6 +721,30 @@ mod tests {
             ReconnectAttempt::OutageOpened { .. } => {}
             _ => panic!("attempting to reconnect to a nonexistent display must fail"),
         }
+    }
+
+    #[test]
+    fn build_x11_adapter_gives_the_reconnector_the_configured_afk_threshold_not_the_default() {
+        // RF-32 T2a: `main.rs`'s production call site (`build_x11_adapter`) must thread its
+        // own configured `afk_threshold` into the adapter's owned `Reconnector`, never a
+        // hardcoded default. `37s` is chosen only because it is unambiguously NOT the 240s
+        // default `X11Adapter` used to fall back to, so a regression back to hardcoding that
+        // default fails this assertion instead of coincidentally matching it.
+        let (_xvfb, source) = spawn_xvfb_and_connect();
+        let configured = Duration::from_secs(37);
+
+        let mut adapter = crate::build_x11_adapter(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            configured,
+        );
+
+        assert_eq!(
+            adapter.reconnector_mut().afk_threshold(),
+            configured,
+            "main.rs's production adapter must reconnect using the SAME afk_threshold its \
+             live X11Source was configured with, not a hardcoded default"
+        );
     }
 
     // --- BudgetedSource::recover (RF-32 T3) --------------------------------------------------

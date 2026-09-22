@@ -1734,6 +1734,13 @@ impl Reconnector {
         }
     }
 
+    /// The idle threshold this policy will reconnect with. Read-only: exposed so a caller
+    /// (or a test, RF-32 T2a) can confirm which value actually reached this `Reconnector`,
+    /// as distinct from whatever default its owner's own constructor might otherwise apply.
+    pub fn afk_threshold(&self) -> Duration {
+        self.afk_threshold
+    }
+
     /// One attempt. `entropy` feeds `ReconnectBackoff::next_delay` — see its doc. Bounded by
     /// `connect_bounded` (T1, RF-32) so a peer that accepts and then stalls cannot hang this
     /// call.
