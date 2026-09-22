@@ -7,12 +7,13 @@
 use std::cell::RefCell;
 use std::os::fd::RawFd;
 use std::rc::Rc;
+use std::time::Duration;
 
 use xwindowlog::exclude::Excluder;
 use xwindowlog::logind::{LockedHintTracker, LogindEvent, ZbusSessionMonitor};
 use xwindowlog::reactor::BudgetedSource;
 use xwindowlog::tracker::{SourceError, SourceEvent, WindowInfo};
-use xwindowlog::x11::{RawEvent, X11Source};
+use xwindowlog::x11::{RawEvent, Reconnector, X11Source};
 
 /// The `WindowInfo::desktop()` sentinel's own app-id text (`tracker.rs`'s `WindowInfo::desktop`
 /// is private to that module, so this is the one place outside it that needs the same literal —
@@ -56,20 +57,104 @@ fn translate_x11_event(
     }
 }
 
+/// Mirrors `x11.rs`'s own private `DEFAULT_AFK_THRESHOLD` (`src/x11.rs:177`) — not `pub`, so
+/// this is the one place outside that module that needs the same literal (same shape as
+/// `DESKTOP_APP_ID` above). Used only by `X11Adapter::new`'s owned `Reconnector` (RF-32 T2):
+/// `main.rs`'s single call site (`src/main.rs:267`) still calls `new`, not
+/// `with_reconnect_config`, and stays out of this task's authorized scope, so the adapter
+/// cannot yet be told the real `afk_threshold` the production `X11Source` was actually built
+/// with (`src/main.rs:264` passes `config.afk_threshold`, which may differ from this
+/// default). Disclosed gap: this mismatch is latent until whichever later task wires
+/// `main.rs` to call `with_reconnect_config` with its real config instead.
+const DEFAULT_RECONNECT_AFK_THRESHOLD: Duration = Duration::from_secs(240);
+
 /// `reactor::BudgetedSource` over the real `x11.rs` capture engine (design §2 D-2 fd0).
 pub struct X11Adapter {
     source: X11Source,
     excluder: Rc<RefCell<Excluder>>,
     current_app_id: String,
+    /// RF-32 T2: the adapter owns the reconnect policy state (`ReconnectBackoff`,
+    /// `outage_open`) for its own display/`afk_threshold`, rather than that state living
+    /// somewhere else and being handed the adapter's fd out of band — `Reconnector::attempt`
+    /// (T3+) needs exactly the `display`/`afk_threshold` this adapter's own `X11Source` was
+    /// built with to reconnect to the same place.
+    #[allow(
+        dead_code,
+        reason = "read only via reconnector_mut, whose only caller today is this file's own \
+                  tests; T2 forbids wiring main.rs/reactor.rs, so production has no caller yet \
+                  (T3-T5 add one)"
+    )]
+    reconnector: Reconnector,
 }
 
 impl X11Adapter {
+    /// `display: None`, matching `main.rs`'s only production call site
+    /// (`X11Source::connect_with_afk_threshold(None, ..)`, `src/main.rs:264`) — see
+    /// `DEFAULT_RECONNECT_AFK_THRESHOLD`'s doc for the one field this cannot mirror yet.
     pub fn new(source: X11Source, excluder: Rc<RefCell<Excluder>>) -> Self {
+        Self::with_reconnect_config(source, excluder, None, DEFAULT_RECONNECT_AFK_THRESHOLD)
+    }
+
+    /// Same as `new`, with the `Reconnector`'s `display`/`afk_threshold` explicit rather than
+    /// defaulted — mirrors `X11Source::connect`/`connect_with_afk_threshold`'s own
+    /// default-plus-override shape (`src/x11.rs:429-439`) for the same reason: a future
+    /// caller that actually knows the production config (or a test) needs a `Reconnector`
+    /// that would reconnect to the *same* display this adapter's `source` came from.
+    pub fn with_reconnect_config(
+        source: X11Source,
+        excluder: Rc<RefCell<Excluder>>,
+        display: Option<&str>,
+        afk_threshold: Duration,
+    ) -> Self {
         X11Adapter {
             source,
             excluder,
             current_app_id: DESKTOP_APP_ID.to_string(),
+            reconnector: Reconnector::new(display, afk_threshold),
         }
+    }
+
+    /// Replaces the adapter's live `X11Source` with a freshly (re)connected one — RF-32 T2's
+    /// mechanism for a future caller to act on `ReconnectAttempt::Restored { source, .. }`
+    /// (T3+ wires that caller; this method only has to make the replacement possible and
+    /// observable). No separate change-notification is needed: `ReactorSource::next_event`
+    /// already re-queries `as_raw_fd()` on every poll iteration (`src/reactor.rs:583-590`,
+    /// feature doc constraint 3), so the very next call after this one sees the new fd.
+    ///
+    /// Also resets `current_app_id` back to the desktop sentinel. Decision (feature doc T2):
+    /// a freshly connected `X11Source` always starts with `active_window: None`
+    /// (`src/x11.rs:479`), and this module's own doc contract says `current_app_id` must
+    /// "exactly mirror what `x11.rs` itself tracks internally" — so leaving the old value in
+    /// place after a reconnect would desync the mirror from the connection it is supposed to
+    /// describe. `X11Source`'s state machine happens to gate `RawEvent::TitleChanged` behind
+    /// its own `active_window` being `Some(_)` already (`is_active_window_notify`/
+    /// `active_window_title_notify`, `src/x11.rs`), which would currently stop a stale
+    /// `current_app_id` from reaching a real `TitleChanged` translation — but that guard
+    /// lives in a different module than `current_app_id` and this adapter has no business
+    /// depending on it silently. A future translation path that emits `TitleChanged` (or
+    /// evaluates a title) without first observing a fresh `ActiveWindow` on the new
+    /// connection would otherwise evaluate a title against a stale, wrong `app_id` — a D-7
+    /// exclusion-boundary risk, not just a cosmetic one.
+    #[allow(
+        dead_code,
+        reason = "no production caller yet; T2 forbids wiring one (T3-T5 add it), exercised \
+                  today only by this file's own tests"
+    )]
+    pub fn replace_source(&mut self, source: X11Source) {
+        self.source = source;
+        DESKTOP_APP_ID.clone_into(&mut self.current_app_id);
+    }
+
+    /// RF-32 T2: exposes the adapter's owned `Reconnector` so a future caller (T3's
+    /// `BudgetedSource` recovery method) can drive `Reconnector::attempt` without this
+    /// adapter needing to re-expose the policy's own internals.
+    #[allow(
+        dead_code,
+        reason = "no production caller yet; T2 forbids wiring one (T3 adds it), exercised \
+                  today only by this file's own tests"
+    )]
+    pub fn reconnector_mut(&mut self) -> &mut Reconnector {
+        &mut self.reconnector
     }
 }
 
@@ -489,5 +574,132 @@ mod tests {
         let mut source = LogindSource::Absent(null);
 
         assert_eq!(source.try_next().expect("must not error"), None);
+    }
+
+    // --- replace_source / owned Reconnector (RF-32 T2) --------------------------------------
+    //
+    // These need a real, working `X11Source` — not a `translate_x11_event` synthetic input —
+    // so unlike every other test above, they spawn a real (bare, window-manager-less) `Xvfb`
+    // per connection: `X11Source::connect_with_afk_threshold` performs a full connect + atom
+    // intern + EWMH-compliance probe that a fake socket cannot satisfy (T1's stalling-peer
+    // test in `src/x11.rs` deliberately never gets this far). `adapters.rs` is compiled into
+    // the `xwindowlog` *binary* target (`main.rs`'s `mod adapters;`), not the library crate,
+    // so it cannot reuse `tests/x11_integration.rs`'s `spawn_xvfb` (that file only ever sees
+    // the library's public API through `tests/`) — this is a small, self-contained trim of
+    // the same pattern, with no window manager or EWMH readiness poll needed here: a bare
+    // Xvfb is enough for `connect_with_afk_threshold` to succeed (it falls back to
+    // `CaptureMode::InputFocusFallback`), and the connect call itself doubles as the
+    // readiness probe and the kept-alive connection under test — so unlike
+    // `tests/x11_integration.rs`'s `XvfbGuard::_keepalive`, there is no separate probe
+    // connection to drop and therefore no close-down-reset race window to guard against.
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+    use xwindowlog::x11::ReconnectAttempt;
+
+    static NEXT_ADAPTER_TEST_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
+    // Disjoint from `tests/x11_integration.rs`'s `DISPLAY_BASE = 213` and
+    // `tests/daemon_e2e.rs`'s own base — this is a different test binary (this module is
+    // compiled into the `xwindowlog` bin's unit tests, run in its own process), but nothing
+    // stops a developer running both concurrently, so the ranges stay non-overlapping.
+    const ADAPTER_TEST_DISPLAY_BASE: u32 = 313;
+
+    struct TestXvfb {
+        child: Child,
+    }
+
+    impl Drop for TestXvfb {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Spawns a fresh, bare `Xvfb` and returns it alongside a real, already-connected
+    /// `X11Source` on it (see the module comment above for why the connect call itself is
+    /// the readiness probe).
+    fn spawn_xvfb_and_connect() -> (TestXvfb, X11Source) {
+        let display_num = ADAPTER_TEST_DISPLAY_BASE
+            + NEXT_ADAPTER_TEST_DISPLAY_OFFSET.fetch_add(1, Ordering::SeqCst);
+        let display = format!(":{display_num}");
+        let child = Command::new("Xvfb")
+            .arg(&display)
+            .args(["-screen", "0", "320x240x24", "-nolisten", "tcp"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Xvfb must be installed for src/adapters.rs's X11Adapter tests");
+        let guard = TestXvfb { child };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match X11Source::connect_with_afk_threshold(Some(&display), Duration::from_secs(240)) {
+                Ok((source, _diagnostics)) => return (guard, source),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("Xvfb on {display} did not become ready within 10s: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn replace_source_reports_the_new_connections_fd_and_not_the_old_ones() {
+        let (_xvfb1, source1) = spawn_xvfb_and_connect();
+        let (_xvfb2, source2) = spawn_xvfb_and_connect();
+        let fd1 = source1.as_raw_fd();
+        let fd2 = source2.as_raw_fd();
+        assert_ne!(
+            fd1, fd2,
+            "two independent Xvfb connections must not share a fd"
+        );
+
+        let mut adapter = X11Adapter::new(source1, Rc::new(RefCell::new(passthrough_excluder())));
+        assert_eq!(adapter.as_raw_fd(), fd1);
+
+        adapter.replace_source(source2);
+
+        assert_eq!(
+            adapter.as_raw_fd(),
+            fd2,
+            "as_raw_fd must observe the replacement connection, not the original one"
+        );
+    }
+
+    #[test]
+    fn replace_source_resets_current_app_id_to_the_desktop_sentinel() {
+        let (_xvfb1, source1) = spawn_xvfb_and_connect();
+        let (_xvfb2, source2) = spawn_xvfb_and_connect();
+
+        let mut adapter = X11Adapter::new(source1, Rc::new(RefCell::new(passthrough_excluder())));
+        adapter.current_app_id = "stale-app-from-before-the-outage".to_string();
+
+        adapter.replace_source(source2);
+
+        assert_eq!(
+            adapter.current_app_id, DESKTOP_APP_ID,
+            "a freshly reconnected X11Source starts with no known active window \
+             (active_window: None, src/x11.rs:479), so the adapter's own memory of the \
+             active app-id must not survive a reconnect stale"
+        );
+    }
+
+    #[test]
+    fn x11_adapter_owns_a_working_reconnector() {
+        let (_xvfb, source) = spawn_xvfb_and_connect();
+        let mut adapter = X11Adapter::with_reconnect_config(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            // A local display number nothing is listening on: `x11rb::connect` fails fast
+            // against a missing unix socket, no DNS/TCP path involved, so this never needs
+            // `Reconnector::attempt`'s 5s bound (T1, `RECONNECT_CONNECT_TIMEOUT`) to fire.
+            Some(":9999"),
+            Duration::from_secs(1),
+        );
+
+        match adapter.reconnector_mut().attempt(0) {
+            ReconnectAttempt::OutageOpened { .. } => {}
+            _ => panic!("attempting to reconnect to a nonexistent display must fail"),
+        }
     }
 }

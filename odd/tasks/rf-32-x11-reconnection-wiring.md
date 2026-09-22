@@ -110,9 +110,29 @@ policy — it is tested and correct; it only gains a caller.
       Checks: `cargo test --all-targets` 270 passed 0 failed (parent re-ran it
       independently: 270 passed); `cargo clippy --all-targets -- -D warnings` clean;
       `cargo fmt --check` clean. +108/-2 in one file.
-- [ ] **T2** — Give `X11Adapter` a way to replace its live `X11Source` and to own a
-      `Reconnector`. RED first on the replacement being observable through
-      `as_raw_fd`.
+- [x] **T2** — Give `X11Adapter` a way to replace its live `X11Source` and to own a
+      `Reconnector`. Route: delegated writer in the isolated worktree `rf-32-t2`,
+      because the main checkout held a frozen review candidate. RED: two tests panicking
+      on a `todo!()` stub, `14 passed; 2 failed`. GREEN: `16 passed`. `replace_source`
+      and `reconnector_mut` at `src/adapters.rs:143-160`, `with_reconnect_config` at
+      `:103-115`, `reconnector` field at `:72-88`. The fd test drives two genuinely
+      distinct Xvfb connections rather than asserting on a field that was just set.
+      Checks: `cargo test --all-targets` 273 passed 0 failed (parent re-ran it
+      independently: 273 passed); clippy `-D warnings` clean; `cargo fmt --check` clean.
+      +213/-1 in one file.
+
+- [ ] **T2a** — Make the adapter's `Reconnector` use the CONFIGURED afk threshold.
+      T2 could not: `Reconnector::new` needs `display`/`afk_threshold`, and supplying the
+      real ones meant changing `X11Adapter::new`'s signature, whose only call site is
+      `src/main.rs:267` — a file T2 was forbidden to touch. `new` therefore defaults to
+      `(None, DEFAULT_RECONNECT_AFK_THRESHOLD)`. `display` matches production, which always
+      passes `None`; **`afk_threshold` does not** — `main.rs` passes
+      `config.afk_threshold`, which can differ from the 240 s default. Harmless today
+      because nothing calls `reconnector_mut()` in production, and it must be fixed
+      BEFORE T5 gives it a production caller, or a reconnected source would silently run
+      on a different idle threshold than the configured one. Fix: switch `src/main.rs:267`
+      to `with_reconnect_config`. Disclosed by the T2 writer at `src/adapters.rs:60-68`
+      rather than decided silently.
 - [ ] **T3** — Add the recovery capability to `BudgetedSource` with a no-op default,
       implemented by `X11Adapter`. Assert `LogindAdapter` is unaffected.
 - [ ] **T4** — Intercept the mid-run X11 error inside `ReactorSource::next_event`:
@@ -126,8 +146,17 @@ policy — it is tested and correct; it only gains a caller.
 
 ## Progress
 
-Exploration complete 2026-09-22 (read-only mapping agent). **T1 done**, 1 of 7.
-Baseline moved 269 -> 270 tests.
+Exploration complete 2026-09-22 (read-only mapping agent). **T1 and T2 done**, 2 of 8
+(T2a added from T2's disclosure). Baseline moved 269 -> 270 -> 273 tests.
+
+T1 delivered on `main` as `1991d0d`. Its native review, lineage
+`review-7d07179fee1ffc81`, assessed `high` (`process_boundary`, `src/x11.rs`), ran four
+lenses, found nothing, and was acknowledged with authority burned (consumed revision
+`sha256:c0d60cff...deb1d4de`). The reviewed boundary is now `1991d0d`.
+
+T2 lives on branch `rf-32-t2` in a sibling worktree, created so its writes could not
+contaminate T1's frozen review candidate. Merge it back to `main` once its own review
+closes.
 
 ## Disclosed debt from T1
 
@@ -145,5 +174,5 @@ Baseline moved 269 -> 270 tests.
 
 ## Next step
 
-T2 — give `X11Adapter` a way to replace its live `X11Source` and to own a
-`Reconnector`.
+T3 — add the recovery capability to `BudgetedSource` with a no-op default, implemented
+by `X11Adapter`. T2a must land before T5.
