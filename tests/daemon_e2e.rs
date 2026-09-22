@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt as _, CreateWindowAux, PropMode, Window, WindowClass,
+    AtomEnum, ConnectionExt as _, CreateWindowAux, InputFocus, PropMode, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -62,7 +62,15 @@ fn free_display_number() -> u32 {
 }
 
 fn spawn_xvfb() -> XvfbGuard {
-    let display = format!(":{}", free_display_number());
+    spawn_xvfb_on(format!(":{}", free_display_number()))
+}
+
+/// Spawns a fresh `Xvfb` bound to a caller-chosen `display` rather than picking one via
+/// `free_display_number` — split out of `spawn_xvfb` (RF-32 U2) so the mid-run reconnection
+/// test below can bring a NEW server up on the exact same display an earlier one just died on,
+/// mirroring `tests/x11_integration.rs`'s own `spawn_xvfb`/`spawn_xvfb_on` factoring.
+/// Readiness-polled the same way `spawn_xvfb` always was.
+fn spawn_xvfb_on(display: String) -> XvfbGuard {
     let child = Command::new("Xvfb")
         .arg(&display)
         .args(["-screen", "0", "320x240x24", "-nolisten", "tcp"])
@@ -208,7 +216,23 @@ impl FakeWm {
         self.conn.flush().expect("flush");
     }
 
+    /// Sets BOTH signals a real window manager might expose (RF-24): the EWMH
+    /// `_NET_ACTIVE_WINDOW` property this struct's name is about, and the X input focus
+    /// `CaptureMode::InputFocusFallback` reads instead. A freshly (re)connected `X11Source`
+    /// decides its own EWMH compliance once, at connect time (RF-24) — the mid-run reconnection
+    /// test below (`daemon_reconnects_to_a_restarted_xvfb_and_keeps_capturing`) cannot fully
+    /// control whether its own reconnect attempt races the replacement `FakeWm`'s
+    /// `declare_ewmh_supported` call, so this method's own signal must be legible to whichever
+    /// mode the daemon actually locked onto, or that race turns into test flakiness instead of
+    /// staying an internal implementation detail. Window must already be mapped — `SetInputFocus`
+    /// answers `BadMatch` for a window that is not viewable (`tests/x11_integration.rs`'s own
+    /// `FakeWm::focus` doc).
     fn set_active_window(&self, window: Window) {
+        self.conn
+            .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .expect("set_input_focus request")
+            .check()
+            .expect("set_input_focus reply");
         self.conn
             .change_property32(
                 PropMode::REPLACE,
@@ -336,6 +360,42 @@ fn wait_for_file(path: &std::path::Path, timeout: Duration) {
             start.elapsed() < timeout,
             "{} never appeared within {timeout:?}",
             path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Spawns the compiled daemon against `env`'s scratch directories but a caller-chosen
+/// `DISPLAY`, instead of `spawn_daemon`'s own hardcoded `env.xvfb.display()` — RF-32 U2's
+/// startup-failure test needs to point the daemon at a display nothing answers on, distinct
+/// from `env.xvfb`'s live one.
+fn spawn_daemon_with_display(env: &DaemonEnv, display: &str) -> DaemonChild {
+    let child = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+        .arg("daemon")
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("XDG_CONFIG_HOME", env.config_home.path())
+        .env("XDG_DATA_HOME", env.data_home.path())
+        .env("DISPLAY", display)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the compiled xwindowlog binary must succeed");
+    DaemonChild(child)
+}
+
+/// A bounded `Child::wait`, polled via `try_wait` rather than the blocking `wait()` every other
+/// test in this file uses after a signal — RF-32 U2's own "beware hangs" rule: a startup path
+/// that regressed into hanging instead of exiting must fail this test on a timeout, not block
+/// the suite.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait must not error") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process did not exit within {timeout:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -786,6 +846,126 @@ fn control_socket_pause_then_resume_reaches_the_store() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    send_signal(daemon.0.id(), nix::sys::signal::Signal::SIGTERM);
+    let status = daemon.0.wait().expect("wait");
+    assert_eq!(status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// RF-32 U2: startup-fatal vs. mid-run-recoverable, proven end to end against a real Xvfb
+// (odd/tasks/rf-32-x11-reconnection-wiring.md task U2). Startup and mid-run failures already
+// travel different code paths (`main.rs:278-280`'s direct `X11Source::connect_with_afk_
+// threshold` call happens before any `X11Adapter`/`Reconnector` exists), so the two are the two
+// halves of one distinction and are proven together rather than asserted separately.
+// ---------------------------------------------------------------------------------------------
+
+/// U2 half 1 — a genuine FIRST-connect X11 failure must still exit `ExitStatus::Environment`
+/// (3). U1's reactor-internal recovery structurally cannot apply here: there is no
+/// `ReactorSource`/`X11Adapter` yet when `try_run_daemon`'s startup connect runs, so this
+/// property was never expected to change — this test proves it did not, rather than assuming it
+/// from reading the code.
+#[test]
+fn daemon_exits_with_environment_status_when_the_first_x11_connect_fails() {
+    let env = DaemonEnv::new("startup-x11-failure");
+    // A display nothing is listening on, proved by actually trying to connect
+    // (`free_display_number`'s own readiness check) rather than assumed free — deliberately NOT
+    // `env.xvfb`'s live display, which stays up but unused for this test.
+    let dead_display = format!(":{}", free_display_number());
+
+    let mut daemon = spawn_daemon_with_display(&env, &dead_display);
+    let status = wait_with_timeout(&mut daemon.0, Duration::from_secs(10));
+
+    assert!(
+        !status.success(),
+        "a genuine startup X11 connect failure must not exit 0"
+    );
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "RF-32/RF-60: a startup X11 connect failure stays an environment error \
+         (ExitStatus::Environment = 3), never a reconnect loop: {status:?}"
+    );
+
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .expect("stderr must be piped")
+        .read_to_string(&mut stderr)
+        .expect("reading stderr must succeed");
+    assert!(
+        !stderr.trim().is_empty(),
+        "a startup failure must report a reason on stderr, got empty output"
+    );
+}
+
+/// U2 half 2 — the real proof: against a real Xvfb, kill the server mid-run, restart it on the
+/// SAME display, and show the running daemon reconnects and keeps capturing — driven through
+/// the actual wired path (`ReactorSource::next_event` -> `recover_x11` ->
+/// `X11Adapter::recover` -> its owned `Reconnector`), unlike `tests/x11_integration.rs`'s own
+/// `reconnector_recovers_when_a_real_xvfb_restarts_on_the_same_display`, which drives
+/// `Reconnector` directly and never goes through the reactor or a real daemon process at all.
+#[test]
+fn daemon_reconnects_to_a_restarted_xvfb_and_keeps_capturing() {
+    let mut env = DaemonEnv::new("mid-run-x11-reconnect");
+    let wm = FakeWm::connect(env.xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let mut daemon = spawn_daemon(&env);
+    wait_for_file(&env.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(
+        &env,
+        &wm,
+        "before-outage",
+        "Before Outage",
+        Duration::from_secs(10),
+    );
+
+    // Kill the real Xvfb server the daemon is connected to — a genuine mid-run connection loss,
+    // not a simulated error — and reap it before anything else touches the display.
+    let display = env.xvfb.display().to_string();
+    env.xvfb
+        .child
+        .kill()
+        .expect("SIGKILL the Xvfb must succeed");
+    env.xvfb.child.wait().expect("reap the killed Xvfb");
+    drop(wm); // the fake WM's own connection died with the server; drop it explicitly.
+
+    // The daemon process itself must survive a mid-run X11 loss — that is exactly what RF-32/U1
+    // changed (before it, a mid-run error propagated out of `next_event` and the daemon exited).
+    let still_alive = daemon.0.try_wait().expect("try_wait must not error");
+    assert_eq!(
+        still_alive, None,
+        "a mid-run X11 connection loss must not exit the daemon process"
+    );
+
+    // Deliberately let at least one reconnect attempt fail against the now-dead display first
+    // (`ReconnectBackoff`'s own 500ms floor) before bringing the replacement Xvfb up, purely to
+    // avoid wasting attempts against a socket nothing is listening on yet. This is NOT relied on
+    // for correctness: the daemon's reconnect attempt can still race the replacement `FakeWm`'s
+    // own `declare_ewmh_supported` call (RF-24 decides EWMH compliance once, at connect time),
+    // landing the reconnected source in `CaptureMode::InputFocusFallback` instead of EWMH mode —
+    // `FakeWm::set_active_window`'s own doc explains why it sets BOTH signals so this test's
+    // observation is correct regardless of which mode wins that race.
+    std::thread::sleep(Duration::from_millis(600));
+
+    // The replacement Xvfb comes up on the SAME display; `spawn_xvfb_on` blocks internally
+    // until it accepts connections.
+    env.xvfb = spawn_xvfb_on(display.clone());
+    let wm = FakeWm::connect(&display);
+    wm.declare_ewmh_supported();
+
+    // Bounded so a broken reconnect mechanism fails this test on a timeout instead of hanging
+    // the suite; generous enough to cover several backoff attempts even under load.
+    activate_window_until_observed(
+        &env,
+        &wm,
+        "after-outage",
+        "After Outage",
+        Duration::from_secs(30),
+    );
 
     send_signal(daemon.0.id(), nix::sys::signal::Signal::SIGTERM);
     let status = daemon.0.wait().expect("wait");

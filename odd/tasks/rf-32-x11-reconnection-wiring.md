@@ -173,18 +173,55 @@ policy — it is tested and correct; it only gains a caller.
       itself and makes the assertion vacuous. Verify every such test by mutation before
       believing it.
 
-- [ ] **U2 — Prove it end to end** (absorbs the old T6 and T7).
-      A genuine startup connection failure must stay fatal: `main.rs` still exits with
-      `ExitStatus::Environment` when the FIRST connect fails, while a mid-run loss now
-      recovers. Then the real proof: against real Xvfb, kill the server mid-run, restart
-      it, and show the daemon reconnects and keeps capturing. Startup-fatal and
-      midrun-recoverable are the two halves of one distinction, so they are proven
-      together rather than asserted separately.
+- [x] **U2 — Prove it end to end** (absorbed the old T6 and T7). Route: delegated
+      writer, worktree `rf-32-u2`. Scope `tests/daemon_e2e.rs` only, +182/-2. Checks:
+      `cargo test --all-targets` 288 passed 0 failed, clippy `-D warnings` clean, fmt
+      clean — all three re-run by the parent.
+
+      **Half 1** — `daemon_exits_with_environment_status_when_the_first_x11_connect_fails`
+      (`tests/daemon_e2e.rs:869`): spawns the real binary with `DISPLAY` on a port proved
+      dead by a live connect probe, asserts exit `3` (`ExitStatus::Environment`) and
+      non-empty stderr. Honestly reported as a **characterization test**, not a driven
+      RED: the property already held, because the startup connect runs before any
+      `X11Adapter` exists and reactor-internal recovery structurally cannot reach it.
+      Mutation-verified anyway — flipping `StartupError::exit_status`'s `X11(_)` arm to
+      `ExitStatus::Ok` makes it fail.
+
+      **Half 2** — `daemon_reconnects_to_a_restarted_xvfb_and_keeps_capturing`
+      (`tests/daemon_e2e.rs:912`): real daemon, real Xvfb, captures an interval, SIGKILLs
+      the server, asserts the DAEMON PROCESS SURVIVES, restarts Xvfb on the same display,
+      and proves a second activation is still captured — through the wired path
+      (`next_event` -> `recover_x11` -> `X11Adapter::recover` -> `Reconnector`), unlike
+      `x11_integration.rs`'s tests which drive `Reconnector` directly and never touch the
+      reactor. Mutation-verified independently by the parent: making `recover` an
+      unconditional `StillDown` that never reconnects fails the test at its bounded 30 s
+      deadline (31.05 s wall), and `src/adapters.rs` restored clean afterwards.
+
+      **A real race was found and fixed, not papered over.** In 1 of 19 repeated runs the
+      daemon's reconnect beat the replacement `FakeWm`'s `declare_ewmh_supported()`. RF-24
+      decides EWMH compliance once, at connect time, so losing that race locks the
+      reconnected `X11Source` into `CaptureMode::InputFocusFallback`, which reads real
+      input focus rather than `_NET_ACTIVE_WINDOW` — and `FakeWm::set_active_window` only
+      wrote the EWMH property, so the stimulus was invisible in that mode. Fixed by having
+      `set_active_window` also call `set_input_focus` (mirroring `x11_integration.rs`'s own
+      `FakeWm::focus` precedent), making the stimulus legible under either capture mode.
+      25/25 clean runs after the fix. A longer sleep would have hidden this instead.
 
 ## Progress
 
-Exploration complete 2026-09-22 (read-only mapping agent). **T1, T2, T3, T2a and U1
-done**, 5 of 6 units. Baseline moved 269 -> 270 -> 273 -> 279 -> 280 -> 286 tests.
+Exploration complete 2026-09-22 (read-only mapping agent). **All 6 units done.**
+Baseline moved 269 -> 270 -> 273 -> 279 -> 280 -> 286 -> 288 tests.
+
+Reviews: `review-7d07179fee1ffc81` (T1, high, four lenses) and
+`review-cc5cf7104f4f472c` (T2+T3, medium, one lens) and `review-c551e5e1c5735b23`
+(T2a, high, four lenses) all approved with zero findings and acknowledged, authority
+burned. The U1 slice candidate (`review-d746919b58808c2b`) was **declined by the
+user** — candidate-scoped, no review record created, delivery under ordinary policy.
+U2 was not assessed separately.
+
+**The defect that mattered most was found by neither reviews nor TDD.** The ungated
+retry loop was caught by reading the order of `next_event`, and the vacuous gate
+assertion by mutation. See the rule under U1.
 
 Reviews so far: `review-7d07179fee1ffc81` (T1, high, four lenses) and
 `review-cc5cf7104f4f472c` (T2+T3 slice, medium, one lens). Both approved with zero
@@ -215,8 +252,16 @@ closes.
 
 ## Next step
 
-U2 — prove it end to end: startup failure stays fatal, mid-run loss recovers against
-real Xvfb.
+**RF-32 is complete.** All six units are done and the daemon reconnects instead of
+exiting. Remaining work is integration, not implementation: branches `rf-32-t2`,
+`rf-32-t4` and `rf-32-u2` are stacked and unmerged, and `main` has unpushed commits.
+Delivery is the user's decision under ordinary repository policy.
+
+Carried debt, all disclosed, none blocking:
+1. A timed-out reconnect attempt leaks one parked thread (`src/x11.rs:1658-1668`
+   states this openly; same tradeoff `logind::connect_bounded` accepted).
+2. Test-only `port - 6000` underflow assumption in T1's stalling-peer test.
+3. The reactor's 20 ms `thread::sleep` accept back-off, inherited from Phase 14.
 
 ## Why the remaining work was regrouped
 
