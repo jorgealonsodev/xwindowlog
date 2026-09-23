@@ -60,7 +60,7 @@ Applicable checks are structural, listed under Acceptance criteria.
 ## Progress
 Created 2026-09-17. All tasks T1–T7 complete.
 
-Verification evidence (observed, 2026-09-17):
+Historical verification evidence (observed, 2026-09-17; not replayed verbatim):
 - `grep -c '^#' PRD.md` → 56, same as before the change.
 - `diff <(grep -o '^#*' PRD.md.orig) <(grep -o '^#*' PRD.md)` → identical heading
   nesting sequence, 56 entries, same order.
@@ -71,6 +71,26 @@ Verification evidence (observed, 2026-09-17):
   no match; the 11 English tool names are present.
 - `wc -l PRD.md` → 765 lines, identical to the pre-translation file.
 - `git status --short` → only ` M PRD.md` plus untracked `odd/`.
+
+## Current ledger evidence (observed 2026-09-23)
+
+The block above is retained as provenance, not as a current claim. `PRD.md.orig`
+is absent, so its original diff and residue-scan outputs are
+**historical/unverifiable as a replay**. The PRD also changed after `f5cdc80`:
+`git diff --stat f5cdc80..HEAD -- PRD.md` reports 79 changed lines, and the
+current file is 800 lines. The following read-only checks were run against the
+current `PRD.md`.
+
+| Task | Ledger status | Current evidence |
+|---|---|---|
+| T1 | **PROVEN — current structural evidence** | Span scan for current lines 1–143: 0 accented-character matches and 0 Spanish-identifier matches; 13 headings in the span. |
+| T2 | **PROVEN — current structural evidence** | Span scan for current lines 144–313: 0 accented-character matches and 0 Spanish-identifier matches; 5 headings in the span. |
+| T7 | **PROVEN — current structural evidence** | `wc -l PRD.md` → 800; `grep -c '^#' PRD.md` → 56; heading nesting vs `f5cdc80^` → identical (56/56); current RF-1..RF-66 and RNF-1..RNF-13 inventories → no missing identifiers or dangling references; D-1 → resolved. |
+
+The current inventory includes RF-65 and RF-66, which were added after the
+translation commit. No claim is made that the historical translation review
+was replayed semantically; the statuses above close T1, T2 and T7 on the
+reproducible structural evidence available in the current file.
 
 Deliberate content changes beyond pure translation, all flowing from D-1:
 - RF-15 tool, parameter and alias names moved to English `snake_case`.
