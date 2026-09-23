@@ -83,8 +83,8 @@ current `PRD.md`.
 
 | Task | Ledger status | Current evidence |
 |---|---|---|
-| T1 | **PROVEN — current structural evidence** | Span scan for current lines 1–143: 0 accented-character matches and 0 Spanish-identifier matches; 13 headings in the span. |
-| T2 | **PROVEN — current structural evidence** | Span scan for current lines 144–313: 0 accented-character matches and 0 Spanish-identifier matches; 5 headings in the span. |
+| T1 | **PROVEN — current structural evidence** | Prose-only scan of current lines 1–143 after removing inline code literals: 0 accented-character matches and 0 Spanish-identifier matches; 13 headings in the span. |
+| T2 | **PROVEN — current structural evidence** | Raw scan of current lines 144–313 finds 4 accented `ó` characters: two on line 241 (`navegaci[oó]n`, `inc[oó]gnito`) and two on line 243 (`c[oó]digo`, `verificaci[oó]n`). All four are inside preserved RF-48 inline regex/code literals; the prose-only scan after removing inline code literals has 0 accented-character matches and 0 Spanish-identifier matches; 5 headings in the span. |
 | T7 | **PROVEN — current structural evidence** | `wc -l PRD.md` → 800; `grep -c '^#' PRD.md` → 56; heading nesting vs `f5cdc80^` → identical (56/56); current RF-1..RF-66 and RNF-1..RNF-13 inventories → no missing identifiers or dangling references; D-1 → resolved. |
 
 The current inventory includes RF-65 and RF-66, which were added after the
