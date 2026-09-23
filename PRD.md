@@ -698,7 +698,7 @@ X11, absence, logind, exclusion, SQLite, systemd, `today` and `status`.
 - [ ] The static musl binary compiles in CI; verified to be static.
 - [ ] The `.deb` built with `cargo-deb` installs cleanly in an empty container, with the systemd unit, man page and completions.
 - [ ] The `PKGBUILD` builds in a clean Arch container and passes `namcap` with no serious errors.
-- [ ] `SHA256SUMS` per release; signing decision taken and documented (D-5).
+- [ ] Official release contract: publish a sorted `SHA256SUMS` manifest signed with minisign, with the public key and fingerprint published for verification. Provision the signing key and document the verification material before the first release.
 - [ ] Versioning policy documented for **all three** surfaces (§19).
 - [ ] Release checklist executed end to end at least once.
 - [ ] Installation instructions independently verified for each channel, not copied from another project.
@@ -732,7 +732,7 @@ RNF-5 forbids telemetry, and that is correct, but it means that **adoption can o
 
 Each one evolves at its own pace and must be versioned separately in the CHANGELOG.
 
-Distribution: `cargo install`, static musl tarball (with the caveat that `rusqlite bundled` needs a C toolchain for musl), `.deb` via `cargo-deb`, and the AUR. Checksums per release; signing pending D-5.
+Distribution: `cargo install`, static musl tarball (with the caveat that `rusqlite bundled` needs a C toolchain for musl), `.deb` via `cargo-deb`, and the AUR. The official release contract is a sorted `SHA256SUMS` manifest signed with minisign, with the public key and fingerprint published for verification. Provisioning the signing key and documenting the verification material are prerequisites before the first release.
 
 ---
 
@@ -744,7 +744,7 @@ Distribution: `cargo install`, static musl tarball (with the caveat that `rusqli
 - **D-2 — One binary or two. RESOLVED on 2026-09-23: keep one `xwindowlog` binary with subcommands.** Accept the corrected 6–8 MB size and the eventual tokio linkage even though the daemon does not use tokio; do not split `xwindowlog` from `xwindowlog-mcp`. Because one binary has one release profile, use `panic = "unwind"` so the long-lived MCP process can isolate handler panics, accepting that the daemon does not use the smaller `panic = "abort"` profile.
 - **D-3 — Default retention. RESOLVED on 2026-09-17: `retention_days = 365` is the compiled-in default.** Data minimization wins: the title history must not grow indefinitely in a tool whose central asset is sensitive by design. Note what this does and does not mean in v1: the value alone deletes nothing, because RF-52 leaves the automatic trigger to v2 and v1 ships pruning only as the opt-in `contrib/xwindowlog-prune.timer`. From v2, when the trigger becomes automatic, this default starts pruning at 365 days without being asked. RF-52 and the §11.2 example already stated 365; §14.6 was reworded to match, because it described the opposite.
 - **D-4 — Wayland. RESOLVED on 2026-09-23: v1 remains X11-only; v2 may evaluate wlroots compositors only.** Start with Sway and Hyprland through `wlr-foreign-toplevel-management`, whose audience overlaps heavily with the current one. GNOME, KDE and a promise of "full Wayland" remain out of scope indefinitely because there is no universal analogue to `_NET_ACTIVE_WINDOW` and the maintenance scope is too large for a single maintainer.
-- **D-5 — Release signing.** Are binaries and checksums signed (GPG or minisign) and with which key, this being a binary that processes window titles?
+- **D-5 — Release signing. RESOLVED on 2026-09-23: use minisign.** The official release contract is a sorted `SHA256SUMS` manifest signed with minisign, with the public key and fingerprint published for verification. Provisioning the signing key and documenting the verification material are prerequisites before the first release; this decision does not claim that a key, fingerprint, release workflow, or automation already exists.
 
 ### Answers to the open questions from v1.2
 

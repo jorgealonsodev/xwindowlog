@@ -109,5 +109,9 @@ Deliberate content changes beyond pure translation, all flowing from D-1:
 ## Next step
 D-2 was resolved on 2026-09-23 as one `xwindowlog` binary with the shared
 `panic = "unwind"` release profile. D-4 was resolved the same day as wlroots-only
-evaluation in v2; D-5 remains open. Then Phase 1 (daemon); acceptance criteria are
-already written in §17.
+evaluation in v2. D-5 was resolved the same day in favor of minisign: the official
+release contract is a sorted `SHA256SUMS` manifest signed with minisign, with the
+public key and fingerprint published for verification. Provisioning the signing
+key and documenting the verification material remain prerequisites before the
+first release; no key, fingerprint, release workflow, or automation is claimed
+here. Then Phase 1 (daemon); acceptance criteria are already written in §17.
