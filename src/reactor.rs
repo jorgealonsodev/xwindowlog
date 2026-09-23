@@ -277,17 +277,19 @@ pub trait BudgetedSource {
     /// parameter — same convention, so a caller supplying real entropy doesn't need to know
     /// which sources care).
     ///
-    /// A `Some(_)` return means an attempt was actually made; `RecoveryOutcome` tells a future
-    /// reactor-side caller (RF-32 T4/T5) everything it needs to act: whether an outage just
-    /// opened, how long to wait before retrying, or whether the source was restored — telling
-    /// it exactly which `SourceEvent` to emit. An overriding implementor is responsible for
-    /// installing any replacement source itself before returning (RF-32 T3:
-    /// `X11Adapter::recover` does this via `replace_source`) — this module's own fd-liveness
-    /// contract already covers the rest: `ReactorSource::next_event` re-queries
-    /// `self.x11.as_raw_fd()` on every poll iteration, so a replaced connection needs no
-    /// separate change notification.
-    fn recover(&mut self, _entropy: u64) -> Option<RecoveryOutcome> {
+    /// Optional completion fd for a pending recovery, kept generic as a raw fd.
+    fn recovery_fd(&self) -> Option<RawFd> {
         None
+    }
+
+    /// Starts one recovery attempt, immediately or behind `recovery_fd`.
+    fn recover(&mut self, _entropy: u64) -> Result<Option<RecoveryOutcome>, SourceError> {
+        Ok(None)
+    }
+
+    /// Applies a completed recovery result; the default is a no-op.
+    fn complete_recovery(&mut self) -> Result<Option<RecoveryOutcome>, SourceError> {
+        Ok(None)
     }
 }
 
@@ -493,43 +495,45 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
         drain_budget(&mut self.x11, X11_BUDGET, &mut self.pending)
     }
 
-    /// RF-32 T4/U1: intercepts a mid-run X11 fault caught by `service_x11`, and is also the
-    /// sole handler `next_event` calls when `Timer::ReconnectBackoff` elapses (U1). Drives one
-    /// recovery attempt through the `BudgetedSource` seam (`X::recover`, RF-32 T3) and queues
-    /// exactly the `SourceEvent` sequence `RecoveryOutcome`'s own doc contract requires,
-    /// mirroring `x11::ReconnectAttempt`'s — the policy `Reconnector::attempt` actually drives.
-    /// Queues onto `self.pending` rather than returning a value: every caller just `continue`s
-    /// (or falls through to) the loop and the top-of-loop `pop_front` hands the event straight
-    /// back out.
-    ///
-    /// Also owns `self.x11_down`, U1's gate: set once an outage opens or persists, so
-    /// `next_event` stops calling `service_x11` (and therefore this method) until the armed
-    /// deadline fires; cleared on `Restored`, so normal servicing resumes.
-    fn recover_x11(&mut self) {
-        match self.x11.recover(crate::x11::os_entropy()) {
-            Some(RecoveryOutcome::OutageOpened { retry_after }) => {
+    /// Starts recovery after a service fault or an elapsed `ReconnectBackoff`, marking the source
+    /// down before scheduling so a dead fd cannot remain in the poll set.
+    fn recover_x11(&mut self) -> Result<(), SourceError> {
+        if self.x11.recovery_fd().is_some() {
+            return Ok(());
+        }
+        self.x11_down = true;
+        let outcome = self.x11.recover(crate::x11::os_entropy())?;
+        if let Some(outcome) = outcome {
+            self.apply_recovery_outcome(outcome);
+        }
+        Ok(())
+    }
+
+    /// Completes recovery after the poll-fd block drops, so source replacement is safe.
+    fn complete_x11_recovery(&mut self) -> Result<(), SourceError> {
+        if let Some(outcome) = self.x11.complete_recovery()? {
+            self.apply_recovery_outcome(outcome);
+        }
+        Ok(())
+    }
+
+    fn apply_recovery_outcome(&mut self, outcome: RecoveryOutcome) {
+        match outcome {
+            RecoveryOutcome::OutageOpened { retry_after } => {
                 self.x11_down = true;
                 self.pending.push_back(SourceEvent::DisplayLost);
                 self.arm_reconnect_backoff(retry_after);
             }
-            Some(RecoveryOutcome::StillDown { retry_after }) => {
+            RecoveryOutcome::StillDown { retry_after } => {
                 self.x11_down = true;
                 self.arm_reconnect_backoff(retry_after);
             }
-            Some(RecoveryOutcome::Restored { outage_was_open }) => {
+            RecoveryOutcome::Restored { outage_was_open } => {
                 self.x11_down = false;
                 if !outage_was_open {
                     self.pending.push_back(SourceEvent::DisplayLost);
                 }
                 self.pending.push_back(SourceEvent::DisplayRestored);
-            }
-            None => {
-                // `X11Adapter::recover` (RF-32 T3) always returns `Some`; only a source that
-                // never overrides `recover` (this trait's no-op default), or a test double
-                // whose outcome queue ran out, can land here. There is nothing to translate and
-                // `x11_down` is deliberately left as it was: if it was already `true`, staying
-                // gated is the safer failure than silently resuming un-recovered; production's
-                // `X11Adapter` never actually reaches this branch.
             }
         }
     }
@@ -694,7 +698,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                         // exit the daemon (the feature doc's Decision). Route it through the T3
                         // seam instead; `self.logind`'s own drain right below keeps propagating
                         // via `?` unchanged — only this X11 slot is caught here.
-                        self.recover_x11();
+                        self.recover_x11()?;
                         continue;
                     }
                 }
@@ -726,21 +730,35 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
             // Nothing anywhere is immediately available: this is the one branch that actually
             // calls `poll(2)` (RNF-2's "zero wakeups" is this branch never being reached while
             // idle, not a fast loop around it).
-            let (listener_ready, mut cause) = {
+            let (listener_ready, recovery_ready, mut cause) = {
                 // Safety: `x11`/`logind`/`signals` only expose a `RawFd`, not `AsFd`; each
                 // fd is kept alive by its owning field for this entire block, and no fd is
                 // closed before `pfds` (and the `BorrowedFd`s it holds) are dropped at the end
                 // of this block.
-                let x11_fd = unsafe { BorrowedFd::borrow_raw(self.x11.as_raw_fd()) };
+                let mut pfds = Vec::new();
+                let x11_index = if self.x11_down {
+                    None
+                } else {
+                    let x11_fd = unsafe { BorrowedFd::borrow_raw(self.x11.as_raw_fd()) };
+                    let index = pfds.len();
+                    pfds.push(PollFd::new(x11_fd, PollFlags::POLLIN));
+                    Some(index)
+                };
+                let recovery_index = self.x11.recovery_fd().map(|raw_fd| {
+                    let recovery_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+                    let index = pfds.len();
+                    pfds.push(PollFd::new(recovery_fd, PollFlags::POLLIN));
+                    index
+                });
                 let logind_fd = unsafe { BorrowedFd::borrow_raw(self.logind.as_raw_fd()) };
+                let logind_index = pfds.len();
+                pfds.push(PollFd::new(logind_fd, PollFlags::POLLIN));
                 let signals_fd = unsafe { BorrowedFd::borrow_raw(self.signals.as_raw_fd()) };
-
-                let mut pfds = vec![
-                    PollFd::new(x11_fd, PollFlags::POLLIN),
-                    PollFd::new(logind_fd, PollFlags::POLLIN),
-                    PollFd::new(signals_fd, PollFlags::POLLIN),
-                    PollFd::new(self.listener.as_fd(), PollFlags::POLLIN),
-                ];
+                let signals_index = pfds.len();
+                pfds.push(PollFd::new(signals_fd, PollFlags::POLLIN));
+                let listener_index = pfds.len();
+                pfds.push(PollFd::new(self.listener.as_fd(), PollFlags::POLLIN));
+                let client_start = pfds.len();
                 for client in &self.clients {
                     pfds.push(PollFd::new(client.stream.as_fd(), PollFlags::POLLIN));
                 }
@@ -766,18 +784,30 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                 )
                 .map_err(|e| SourceError(format!("poll(2) failed: {e}")))?;
 
+                let recovery_ready = recovery_index
+                    .and_then(|index| pfds[index].any())
+                    .unwrap_or(false);
                 let cause = WakeupCause {
-                    x11_ready: pfds[0].any().unwrap_or(false),
-                    logind_ready: pfds[1].any().unwrap_or(false),
-                    signals_ready: pfds[2].any().unwrap_or(false),
-                    listener_ready: pfds[3].any().unwrap_or(false),
-                    client_ready: pfds[4..].iter().any(|p| p.any().unwrap_or(false)),
+                    x11_ready: x11_index
+                        .or(recovery_index)
+                        .and_then(|index| pfds[index].any())
+                        .unwrap_or(false),
+                    logind_ready: pfds[logind_index].any().unwrap_or(false),
+                    signals_ready: pfds[signals_index].any().unwrap_or(false),
+                    listener_ready: pfds[listener_index].any().unwrap_or(false),
+                    client_ready: pfds[client_start..]
+                        .iter()
+                        .any(|p| p.any().unwrap_or(false)),
                     forced_by_backlog: x11_backlog || dbus_backlog,
                     ..WakeupCause::default()
                 };
-                (cause.listener_ready, cause)
+                (cause.listener_ready, recovery_ready, cause)
             };
             self.wakeups.fetch_add(1, Ordering::Relaxed);
+
+            if recovery_ready {
+                self.complete_x11_recovery()?;
+            }
 
             if listener_ready {
                 accept_one(&self.listener, &mut self.clients, self.own_uid);
@@ -796,7 +826,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
                     // recovery" route. `recover_x11` queues whichever `SourceEvent`s the
                     // outcome requires (`DisplayRestored`, or nothing while still down) and,
                     // on success, clears `x11_down` so normal servicing resumes.
-                    self.recover_x11();
+                    self.recover_x11()?;
                 } else {
                     self.pending.push_back(SourceEvent::DeadlineElapsed(timer));
                 }
@@ -882,7 +912,10 @@ mod tests {
         let (mut source, _writer) = SyntheticSource::pair();
 
         assert!(
-            source.recover(0).is_none(),
+            source
+                .recover(0)
+                .expect("default recovery must not error")
+                .is_none(),
             "a source that never overrides recover must fall through to BudgetedSource's \
              default, which means \"this source does not support recovery\""
         );
@@ -900,7 +933,9 @@ mod tests {
             .write_all(b"x")
             .expect("write to the paired socket must succeed");
 
-        let _ = source.recover(0xdead_beef);
+        let _ = source
+            .recover(0xdead_beef)
+            .expect("default recovery must not error");
 
         assert_eq!(
             source.try_next().expect("try_next must not error"),
@@ -1018,9 +1053,9 @@ mod tests {
             }
         }
 
-        fn recover(&mut self, _entropy: u64) -> Option<RecoveryOutcome> {
+        fn recover(&mut self, _entropy: u64) -> Result<Option<RecoveryOutcome>, SourceError> {
             self.recover_calls += 1;
-            self.recover_outcomes.pop_front()
+            Ok(self.recover_outcomes.pop_front())
         }
     }
 
@@ -1252,6 +1287,55 @@ mod tests {
             1,
             "servicing another source while X11 is down must not itself trigger another \
              recovery attempt"
+        );
+    }
+
+    #[test]
+    fn a_dead_x11_fd_is_not_polled_while_reconnect_backoff_is_pending() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (x11, x11_writer) = RecoverableSource::pair();
+        let (logind, _logind_writer) = SyntheticSource::pair();
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let (listener, _socket_path) = bind_test_listener("dead-x11-fd-backoff");
+        let mut reactor = ReactorSource::new(
+            x11,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            crate::clock::SystemClock,
+        );
+        reactor.x11.fail_next_try_next();
+        reactor
+            .x11
+            .queue_recover_outcome(RecoveryOutcome::OutageOpened {
+                retry_after: Duration::from_secs(3600),
+            });
+
+        assert_eq!(
+            reactor.next_event(None).expect("must not error"),
+            Some(SourceEvent::DisplayLost)
+        );
+
+        drop(x11_writer);
+        let wakeups_before = reactor.wakeups();
+        let deadline = MonoInstant(Instant::now() + Duration::from_millis(50));
+        let started = Instant::now();
+        assert_eq!(
+            reactor.next_event(Some(deadline)).expect("must not error"),
+            None
+        );
+        let elapsed = started.elapsed();
+        let wakeups = reactor.wakeups() - wakeups_before;
+
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "reactor returned before the caller deadline: {elapsed:?}"
+        );
+        assert!(
+            wakeups <= 2,
+            "a dead X11 fd must be omitted while down; observed {wakeups} poll wakeups in \
+             {elapsed:?}, which indicates a HUP/POLLIN busy spin"
         );
     }
 

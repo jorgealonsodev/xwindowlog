@@ -117,7 +117,8 @@
 
 use std::env;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -1585,7 +1586,7 @@ fn parse_wm_class(raw: &[u8]) -> Option<String> {
 /// delay so many simultaneously-failing daemons don't retry in lockstep. `entropy` is
 /// injected rather than read internally, so a test can pin an exact jittered value — see
 /// `os_entropy` for the production source.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReconnectBackoff {
     attempt: u32,
 }
@@ -1689,6 +1690,7 @@ fn connect_bounded(
 /// it, not something the tracker can guard by itself. Driving this on a timer instead of
 /// blocking, and turning its outcomes into real `SourceEvent`s, is `reactor.rs`'s job (Phase
 /// 14); this type is the retry *policy*, fully testable without one.
+#[derive(Clone)]
 pub struct Reconnector {
     display: Option<String>,
     afk_threshold: Duration,
@@ -1724,6 +1726,40 @@ pub enum ReconnectAttempt {
     },
 }
 
+/// Pollable result handoff for one asynchronous reconnect attempt.
+pub struct ReconnectWorker {
+    completion: std::os::unix::net::UnixStream,
+    result: mpsc::Receiver<Result<(Reconnector, ReconnectAttempt), String>>,
+}
+
+impl ReconnectWorker {
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.completion.as_raw_fd()
+    }
+
+    /// `Ok(None)` means the worker has not signaled yet.
+    pub fn take_result(&mut self) -> Result<Option<(Reconnector, ReconnectAttempt)>, String> {
+        let mut signal = [0u8; 64];
+        match self.completion.read(&mut signal) {
+            Ok(0) => return Err("X11 reconnect worker notification closed".to_string()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(format!("failed to read X11 reconnect notification: {e}")),
+        }
+
+        match self.result.try_recv() {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => {
+                Err("X11 reconnect worker signaled before publishing its result".to_string())
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("X11 reconnect worker exited without a result".to_string())
+            }
+        }
+    }
+}
+
 impl Reconnector {
     pub fn new(display: Option<&str>, afk_threshold: Duration) -> Self {
         Reconnector {
@@ -1739,6 +1775,36 @@ impl Reconnector {
     /// as distinct from whatever default its owner's own constructor might otherwise apply.
     pub fn afk_threshold(&self) -> Duration {
         self.afk_threshold
+    }
+
+    /// Starts one attempt on a worker; only this Send-compatible policy state crosses the boundary.
+    pub fn spawn_attempt(&self, entropy: u64) -> Result<ReconnectWorker, String> {
+        let (completion, mut notifier) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| format!("failed to allocate X11 reconnect notification pair: {e}"))?;
+        completion
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to configure X11 reconnect notification: {e}"))?;
+        let (sender, result) = mpsc::channel();
+        let mut reconnector = self.clone();
+        thread::Builder::new()
+            .name("xwl-x11-reconnect-worker".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let attempt = reconnector.attempt(entropy);
+                    (reconnector, attempt)
+                }))
+                .map_err(|_| "X11 reconnect worker panicked".to_string());
+
+                // Publish first. The reactor treats a notification without a readable result as
+                // a hard source error, so reversing these two operations would be a lost wakeup.
+                let _ = sender.send(result);
+                if let Err(error) = notifier.write_all(&[1]) {
+                    eprintln!("xwindowlog: failed to signal X11 reconnect completion: {error}");
+                }
+            })
+            .map_err(|e| format!("failed to spawn X11 reconnect worker: {e}"))?;
+
+        Ok(ReconnectWorker { completion, result })
     }
 
     /// One attempt. `entropy` feeds `ReconnectBackoff::next_delay` — see its doc. Bounded by

@@ -13,7 +13,7 @@ use xwindowlog::exclude::Excluder;
 use xwindowlog::logind::{LockedHintTracker, LogindEvent, ZbusSessionMonitor};
 use xwindowlog::reactor::{BudgetedSource, RecoveryOutcome};
 use xwindowlog::tracker::{SourceError, SourceEvent, WindowInfo};
-use xwindowlog::x11::{RawEvent, ReconnectAttempt, Reconnector, X11Source};
+use xwindowlog::x11::{RawEvent, ReconnectAttempt, ReconnectWorker, Reconnector, X11Source};
 
 /// The `WindowInfo::desktop()` sentinel's own app-id text (`tracker.rs`'s `WindowInfo::desktop`
 /// is private to that module, so this is the one place outside it that needs the same literal —
@@ -68,6 +68,9 @@ pub struct X11Adapter {
     /// driven from `recover` (T3), needs exactly the `display`/`afk_threshold` this adapter's
     /// own `X11Source` was built with to reconnect to the same place.
     reconnector: Reconnector,
+    /// One worker at most. The adapter remains on the reactor thread; only the owned reconnect
+    /// policy state and its Send-compatible result cross the worker boundary.
+    recovery: Option<ReconnectWorker>,
 }
 
 impl X11Adapter {
@@ -88,6 +91,7 @@ impl X11Adapter {
             excluder,
             current_app_id: DESKTOP_APP_ID.to_string(),
             reconnector: Reconnector::new(display, afk_threshold),
+            recovery: None,
         }
     }
 
@@ -116,9 +120,9 @@ impl X11Adapter {
         DESKTOP_APP_ID.clone_into(&mut self.current_app_id);
     }
 
-    /// RF-32 T2: exposes the adapter's owned `Reconnector` so T3's `BudgetedSource::recover`
-    /// can drive `Reconnector::attempt` without this adapter needing to re-expose the policy's
-    /// own internals.
+    /// Test-only access to the adapter's policy state for the existing RF-32 threshold and
+    /// failure-path assertions; production recovery uses the worker handoff above.
+    #[cfg(test)]
     pub fn reconnector_mut(&mut self) -> &mut Reconnector {
         &mut self.reconnector
     }
@@ -144,23 +148,47 @@ impl BudgetedSource for X11Adapter {
             .map(|raw| translate_x11_event(&self.excluder.borrow(), &mut self.current_app_id, raw)))
     }
 
-    /// RF-32 T3: drives the adapter's own `Reconnector` (T2's `reconnector_mut`) and, on
-    /// success, installs the reconnected `X11Source` via T2's `replace_source` — so a future
-    /// reactor caller (T4/T5) never has to touch the source object itself, matching
-    /// `BudgetedSource::recover`'s own doc contract.
+    /// RF-32 correction: starts the adapter's owned `Reconnector` on a worker. The adapter and
+    /// its `Rc<RefCell<Excluder>>` never cross the worker boundary; the worker result is applied
+    /// by `complete_recovery` on the reactor thread.
     ///
     /// `RecoveryOutcome`'s doc explains why this maps `x11::ReconnectAttempt`'s outcomes rather
     /// than returning that type directly: its `Restored` variant carries `source:
     /// Box<X11Source>` for a caller that installs the source itself, and `X11Source` is not
     /// `Clone` (it owns a live connection/fd) — once `replace_source` below has moved it into
     /// `self.source`, there is no second copy left to also hand back.
-    fn recover(&mut self, entropy: u64) -> Option<RecoveryOutcome> {
-        match self.reconnector_mut().attempt(entropy) {
+    fn recovery_fd(&self) -> Option<RawFd> {
+        self.recovery.as_ref().map(ReconnectWorker::as_raw_fd)
+    }
+
+    fn recover(&mut self, entropy: u64) -> Result<Option<RecoveryOutcome>, SourceError> {
+        if self.recovery.is_some() {
+            return Ok(None);
+        }
+        self.recovery = Some(
+            self.reconnector
+                .spawn_attempt(entropy)
+                .map_err(SourceError)?,
+        );
+        Ok(None)
+    }
+
+    fn complete_recovery(&mut self) -> Result<Option<RecoveryOutcome>, SourceError> {
+        let Some(worker) = self.recovery.as_mut() else {
+            return Ok(None);
+        };
+        let Some((reconnector, attempt)) = worker.take_result().map_err(SourceError)? else {
+            return Ok(None);
+        };
+        self.recovery = None;
+        self.reconnector = reconnector;
+
+        Ok(Some(match attempt {
             ReconnectAttempt::OutageOpened { retry_after } => {
-                Some(RecoveryOutcome::OutageOpened { retry_after })
+                RecoveryOutcome::OutageOpened { retry_after }
             }
             ReconnectAttempt::StillDown { retry_after } => {
-                Some(RecoveryOutcome::StillDown { retry_after })
+                RecoveryOutcome::StillDown { retry_after }
             }
             ReconnectAttempt::Restored {
                 source,
@@ -172,9 +200,9 @@ impl BudgetedSource for X11Adapter {
                 diagnostics: _,
             } => {
                 self.replace_source(*source);
-                Some(RecoveryOutcome::Restored { outage_was_open })
+                RecoveryOutcome::Restored { outage_was_open }
             }
-        }
+        }))
     }
 }
 
@@ -591,10 +619,19 @@ mod tests {
     // readiness probe and the kept-alive connection under test — so unlike
     // `tests/x11_integration.rs`'s `XvfbGuard::_keepalive`, there is no separate probe
     // connection to drop and therefore no close-down-reset race window to guard against.
+    use nix::unistd::Uid;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
     use std::time::Instant;
-    use xwindowlog::reactor::RecoveryOutcome;
+    use xwindowlog::clock::{Clock, SystemClock};
+    use xwindowlog::control;
+    use xwindowlog::reactor::{ReactorSource, RecoveryOutcome};
+    use xwindowlog::signals::SelfPipe;
+    use xwindowlog::tracker::{SourceEvent, WindowSource};
 
     static NEXT_ADAPTER_TEST_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
     // Disjoint from `tests/x11_integration.rs`'s `DISPLAY_BASE = 213` and
@@ -602,6 +639,8 @@ mod tests {
     // compiled into the `xwindowlog` bin's unit tests, run in its own process), but nothing
     // stops a developer running both concurrently, so the ranges stay non-overlapping.
     const ADAPTER_TEST_DISPLAY_BASE: u32 = 313;
+
+    static NEXT_REACTOR_TEST_SOCKET: AtomicU32 = AtomicU32::new(0);
 
     struct TestXvfb {
         child: Child,
@@ -747,6 +786,29 @@ mod tests {
         );
     }
 
+    fn finish_recovery(adapter: &mut X11Adapter) -> RecoveryOutcome {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match adapter
+                .complete_recovery()
+                .expect("recovery completion must not fail")
+            {
+                Some(outcome) => return outcome,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None => panic!("recovery worker did not publish a result within 10s"),
+            }
+        }
+    }
+
+    fn start_recovery(adapter: &mut X11Adapter) {
+        assert!(adapter
+            .recover(0)
+            .expect("recovery worker must spawn")
+            .is_none());
+    }
+
     // --- BudgetedSource::recover (RF-32 T3) --------------------------------------------------
 
     #[test]
@@ -762,10 +824,11 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        match adapter.recover(0) {
-            Some(RecoveryOutcome::OutageOpened { .. }) => {}
-            other => panic!("expected Some(RecoveryOutcome::OutageOpened), got {other:?}"),
-        }
+        start_recovery(&mut adapter);
+        assert!(matches!(
+            finish_recovery(&mut adapter),
+            RecoveryOutcome::OutageOpened { .. }
+        ));
     }
 
     #[test]
@@ -788,10 +851,11 @@ mod tests {
         );
         assert_eq!(adapter.as_raw_fd(), original_fd);
 
-        match adapter.recover(0) {
-            Some(RecoveryOutcome::Restored { .. }) => {}
-            other => panic!("expected Some(RecoveryOutcome::Restored), got {other:?}"),
-        }
+        start_recovery(&mut adapter);
+        assert!(matches!(
+            finish_recovery(&mut adapter),
+            RecoveryOutcome::Restored { .. }
+        ));
 
         assert_ne!(
             adapter.as_raw_fd(),
@@ -817,12 +881,96 @@ mod tests {
         );
         adapter.current_app_id = "stale-app-from-before-the-outage".to_string();
 
-        match adapter.recover(0) {
-            Some(RecoveryOutcome::Restored { .. }) => {}
-            other => panic!("expected Some(RecoveryOutcome::Restored), got {other:?}"),
-        }
+        start_recovery(&mut adapter);
+        assert!(matches!(
+            finish_recovery(&mut adapter),
+            RecoveryOutcome::Restored { .. }
+        ));
 
         assert_eq!(adapter.current_app_id, DESKTOP_APP_ID);
+    }
+
+    #[test]
+    fn reactor_services_control_requests_while_x11_recovery_waits_on_a_silent_peer() {
+        let (xvfb, source, _) = spawn_xvfb_and_connect_with_display();
+        let silent_listener =
+            TcpListener::bind("127.0.0.1:0").expect("silent X11 peer listener must bind");
+        let silent_port = silent_listener
+            .local_addr()
+            .expect("silent listener must have a local address")
+            .port();
+        let silent_display_number = silent_port
+            .checked_sub(6000)
+            .expect("Linux ephemeral TCP ports must be above X11's port offset");
+        let silent_display = format!("127.0.0.1:{silent_display_number}");
+        let (stop_silent_peer, wait_silent_peer) = mpsc::channel();
+        let silent_peer = std::thread::spawn(move || {
+            let (stream, _) = silent_listener.accept().expect("silent peer accept");
+            let _stream = stream;
+            let _ = wait_silent_peer.recv_timeout(std::time::Duration::from_secs(10));
+        });
+
+        let adapter = X11Adapter::with_reconnect_config(
+            source,
+            Rc::new(RefCell::new(passthrough_excluder())),
+            Some(&silent_display),
+            Duration::from_secs(240),
+        );
+        drop(xvfb);
+        let logind = LogindSource::Absent(NullFd::new().expect("NullFd must be constructible"));
+        let signals = SelfPipe::install().expect("SelfPipe::install must succeed");
+        let socket_path = std::env::temp_dir().join(format!(
+            "xwindowlog-adapter-reactor-{}-{}.sock",
+            std::process::id(),
+            NEXT_REACTOR_TEST_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = control::bind(&socket_path).expect("control listener must bind");
+        let mut reactor = ReactorSource::new(
+            adapter,
+            logind,
+            signals,
+            listener,
+            Uid::current(),
+            SystemClock,
+        );
+
+        let control_path = socket_path.clone();
+        let control_sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut client = UnixStream::connect(control_path)
+                .expect("control client must connect while recovery is pending");
+            client
+                .write_all(b"{\"v\":1,\"cmd\":\"pause\"}\n")
+                .expect("control request must be written");
+        });
+        let started = Instant::now();
+        let event = reactor
+            .next_event(Some(
+                SystemClock
+                    .now_mono()
+                    .checked_add(Duration::from_secs(2))
+                    .expect("test deadline must be representable"),
+            ))
+            .expect("reactor must remain serviceable while recovery is pending");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(event, Some(SourceEvent::Pause { .. })),
+            "control request was not serviced while recovery waited: {event:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reactor service must not wait for the five-second X11 connect bound; took {elapsed:?}"
+        );
+
+        control_sender
+            .join()
+            .expect("control sender thread must not panic");
+        let _ = stop_silent_peer.send(());
+        silent_peer
+            .join()
+            .expect("silent peer thread must not panic");
+        let _ = std::fs::remove_file(socket_path);
     }
 
     // --- BudgetedSource::recover's default, exercised through the real LogindSource enum ----
@@ -837,7 +985,10 @@ mod tests {
         let mut source = LogindSource::Absent(null);
 
         assert!(
-            source.recover(0).is_none(),
+            source
+                .recover(0)
+                .expect("the default recovery path must not error")
+                .is_none(),
             "LogindSource must keep BudgetedSource::recover's no-op default unchanged"
         );
     }

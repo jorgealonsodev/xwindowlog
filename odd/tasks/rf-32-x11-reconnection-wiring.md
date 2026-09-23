@@ -270,3 +270,35 @@ small task and, worse, split one mechanism across two of them. The remainder is 
 by MECHANISM instead: U1 is "a deadline is armed and honored", U2 is "startup fatal,
 mid-run recoverable". Each is one coherent behavior with its own tests and one review,
 which is both cheaper and harder to ship broken.
+
+## Post-review correction — 2026-09-23
+
+The native review of `e2d63ae..bfef399` returned `correction_required` with two introduced
+CRITICAL defects:
+
+1. Once `x11_down` was set, the dead X11 fd stayed in `poll(2)`. A killed X server therefore
+   produced permanent HUP/POLLIN readiness and a 100% CPU drain/poll spin instead of waiting for
+   `ReconnectBackoff`.
+2. `recover_x11` called the production `Reconnector::attempt` on the reactor thread. Its bounded
+   connect could still occupy that thread for `RECONNECT_CONNECT_TIMEOUT` (5 seconds), starving
+   logind, signals, and control clients.
+
+The bounded correction keeps the generic `BudgetedSource` boundary and moves only Send-compatible
+recovery policy/result state to a worker. `X11Adapter` and its `Rc<RefCell<Excluder>>` remain on the
+reactor thread; the worker publishes its result before signaling a pollable completion fd. The
+reactor omits the dead X11 fd while down, services the completion fd and other sources, applies a
+completed result only after the `PollFd` block drops, replaces the source on the reactor thread,
+and rejects overlapping recovery. Worker/notification setup failures surface as `SourceError`.
+
+Strict-TDD evidence: the new dead-peer test first observed 8,017 poll wakeups in 50ms; the silent
+peer test first took 5.32s and returned `DisplayLost` instead of servicing its control request.
+Both are green after the correction. Mutation checks also restored the dead-fd branch and inline
+recovery path and reproduced each failure. Focused RF-32 tests, the restarted-Xvfb daemon E2E,
+`cargo test --all-targets` (290 passed), clippy with `-D warnings`, and formatting all pass.
+
+**Current progress:** the post-review correction is implemented and verified; the historical
+“RF-32 is complete” entry above describes only the pre-review boundary. No RF-32 implementation
+work remains in this correction.
+
+**Current next step:** deliver/integrate this single correction work unit under ordinary repository
+policy; do not start another RF-32 correction unless a new review finding provides new evidence.
