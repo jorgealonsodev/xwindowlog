@@ -63,7 +63,7 @@ Single binary with no runtime, 2–5 MB of RAM, mature bindings for X11 (`x11rb`
 | Hourly breakdown | Always included in `summary`: for each hour, active time, number of window switches and the top 3 windows. |
 | Irreversible actions | Never reachable from MCP. `forget` and `prune` are CLI-only (RF-53). |
 | License | MIT. |
-| Environment | X11. Wayland out of scope for v1 (see pending decision D-4). |
+| Environment | X11. Wayland is out of scope for v1; D-4 limits planned v2 evaluation to wlroots compositors. |
 
 ## 6. Personas
 
@@ -743,13 +743,13 @@ Distribution: `cargo install`, static musl tarball (with the caveat that `rusqli
 - **D-1 — MCP contract language. RESOLVED on 2026-09-17: the entire MCP contract is in English.** Tool names, parameter names, aliases, status values and tool descriptions are all English `snake_case`, matching the repo, the README and the project name. This supersedes the earlier technical recommendation of English names with Spanish descriptions: the owner chose a single language for the whole contract, which removes the split between what the model reads as a name and what it reads as a description, and matches the decision that documentation and every other project artifact is English. Applied in RF-15, RF-18, RF-38 to RF-46 and RF-59, and in the `rules.status` values of RF-11.
 - **D-2 — One binary or two. RESOLVED on 2026-09-23: keep one `xwindowlog` binary with subcommands.** Accept the corrected 6–8 MB size and the eventual tokio linkage even though the daemon does not use tokio; do not split `xwindowlog` from `xwindowlog-mcp`. Because one binary has one release profile, use `panic = "unwind"` so the long-lived MCP process can isolate handler panics, accepting that the daemon does not use the smaller `panic = "abort"` profile.
 - **D-3 — Default retention. RESOLVED on 2026-09-17: `retention_days = 365` is the compiled-in default.** Data minimization wins: the title history must not grow indefinitely in a tool whose central asset is sensitive by design. Note what this does and does not mean in v1: the value alone deletes nothing, because RF-52 leaves the automatic trigger to v2 and v1 ships pruning only as the opt-in `contrib/xwindowlog-prune.timer`. From v2, when the trigger becomes automatic, this default starts pruning at 365 days without being asked. RF-52 and the §11.2 example already stated 365; §14.6 was reworded to match, because it described the opposite.
-- **D-4 — Wayland.** *Recommendation:* **do not commit to "full Wayland"**. There is no universal analogue to `_NET_ACTIVE_WINDOW`; each compositor exposes its own thing or nothing at all, and some restrict it on purpose. Evaluate wlroots compositors only first (Sway, Hyprland) via `wlr-foreign-toplevel-management`, whose audience overlaps heavily with the current one. GNOME and KDE on Wayland, out of scope indefinitely. With a single maintainer, "all of Wayland" is a scope risk, not a plan.
+- **D-4 — Wayland. RESOLVED on 2026-09-23: v1 remains X11-only; v2 may evaluate wlroots compositors only.** Start with Sway and Hyprland through `wlr-foreign-toplevel-management`, whose audience overlaps heavily with the current one. GNOME, KDE and a promise of "full Wayland" remain out of scope indefinitely because there is no universal analogue to `_NET_ACTIVE_WINDOW` and the maintenance scope is too large for a single maintainer.
 - **D-5 — Release signing.** Are binaries and checksums signed (GPG or minisign) and with which key, this being a binary that processes window titles?
 
 ### Answers to the open questions from v1.2
 
 - **Automatic summary with cron + API?** **Not for v1**; possibly in v1.x, behind an opt-in flag and as a **separate process** (`xwindowlog report`), never embedded in the daemon. Reason: "the daemon opens no network" (RNF-5) is part of the privacy argument against the cloud competitors; an automatic summary needs to reach the network with the user's key, which is acceptable as a separate process that the user schedules, and would break RNF-5 inside the daemon. It fits above all with P3, who does not remember to ask.
-- **Wayland in v2?** See D-4.
+- **Wayland in v2?** Resolved by D-4: evaluate wlroots compositors only, beginning with Sway and Hyprland.
 
 ### New questions the PRD should be asking
 
