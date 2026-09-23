@@ -107,5 +107,6 @@ Deliberate content changes beyond pure translation, all flowing from D-1:
   runtime behavior, not language.
 
 ## Next step
-Owner decisions D-2..D-5 remain open. Then Phase 1 (daemon); acceptance
-criteria are already written in §17.
+D-2 was resolved on 2026-09-23 as one `xwindowlog` binary with the shared
+`panic = "unwind"` release profile. Owner decisions D-4 and D-5 remain open.
+Then Phase 1 (daemon); acceptance criteria are already written in §17.
