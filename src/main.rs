@@ -114,7 +114,23 @@ impl From<ExitStatus> for ExitCode {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let successful_output = matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            // Preserve clap's stream selection and formatting while mapping usage failures to
+            // RF-60's generic failure status instead of clap's default status 2.
+            let _ = error.print();
+            return if successful_output {
+                ExitStatus::Ok.into()
+            } else {
+                ExitStatus::Failure.into()
+            };
+        }
+    };
     match cli.command {
         Command::Daemon => run_daemon(),
         Command::Completions { shell } => print_completions(shell),

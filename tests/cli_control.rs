@@ -1316,3 +1316,43 @@ fn forget_cli_accepts_case_insensitive_affirmative_confirmation() {
         0
     );
 }
+
+#[test]
+fn cli_usage_errors_exit_one() {
+    let output = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+        .arg("--not-a-real-option")
+        .output()
+        .expect("run the compiled xwindowlog binary with an unknown option");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "invalid CLI usage should use RF-60 generic failure; stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+}
+
+#[test]
+fn cli_help_and_version_exit_zero_on_stdout() {
+    for argument in ["--help", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+            .arg(argument)
+            .output()
+            .expect("run the compiled xwindowlog binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{argument} should exit successfully; stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("xwindowlog") && !stdout.is_empty(),
+            "{argument} should write its output to stdout, got {stdout:?}"
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
