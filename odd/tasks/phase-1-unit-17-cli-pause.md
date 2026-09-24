@@ -93,11 +93,16 @@ cargo fmt -- --check
 
 ## Progress
 
-- Status: implemented; delivery closure pending.
+- Status: implemented and reviewed; delivery closure pending.
 - Work-unit commit: `b35a1ee feat(cli): expose pause control command`.
 - Verification evidence: `cargo test --test cli_control`,
   `cargo test --test daemon_e2e -- control_socket_pause_then_resume_reaches_the_store`,
   `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, and
   `cargo fmt -- --check` all passed.
-- Next step: complete native review and delivery of this coherent pause slice;
-  begin the next Phase 17 command as a separate work unit afterward.
+- Native review: lineage `review-eb1f892defd74369` approved and acknowledged;
+  no blockers. Three non-blocking follow-ups remain: make the SQLite observer
+  read-only, add failure-path coverage for the new CLI mapping, and clean up
+  the Xvfb readiness-timeout child.
+- Parent spot-check: `cargo test --test cli_control` passed after review.
+- Next step: deliver this coherent pause slice; begin the next Phase 17
+  command as a separate work unit afterward.
