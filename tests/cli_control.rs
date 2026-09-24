@@ -549,3 +549,106 @@ fn resume_cli_reaches_running_daemon_and_closes_a_paused_interval() {
 
     wait_for_resumed_interval(&scratch, Duration::from_secs(5));
 }
+
+#[test]
+fn pause_cli_while_already_paused_reports_state_error() {
+    let scratch = Scratch::new("pause-already-paused");
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let _daemon = spawn_daemon(&scratch, &xvfb);
+    wait_for_file(&scratch.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(&scratch, &wm, Duration::from_secs(10));
+
+    let first_pause = run_pause(&scratch);
+    assert!(
+        first_pause.status.success(),
+        "pause setup should succeed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&first_pause.stdout),
+        String::from_utf8_lossy(&first_pause.stderr)
+    );
+    wait_for_paused_interval(&scratch, Duration::from_secs(5));
+
+    let output = run_pause(&scratch);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "a state error must not write to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "xwindowlog: daemon is already paused\n"
+    );
+}
+
+#[test]
+fn resume_cli_while_active_reports_state_error() {
+    let scratch = Scratch::new("resume-active");
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let _daemon = spawn_daemon(&scratch, &xvfb);
+    wait_for_file(&scratch.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(&scratch, &wm, Duration::from_secs(10));
+
+    let output = run_resume(&scratch);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "a state error must not write to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "xwindowlog: daemon is not paused\n"
+    );
+}
+
+#[test]
+fn pause_cli_without_daemon_reports_environment_error() {
+    let scratch = Scratch::new("pause-no-daemon");
+    let start = Instant::now();
+
+    let output = run_pause(&scratch);
+
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "pause without a daemon must fail promptly"
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        output.stdout.is_empty(),
+        "a daemon connection diagnostic must not write to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "xwindowlog: daemon is not running: No such file or directory (os error 2)\n"
+    );
+}
+
+#[test]
+fn resume_cli_without_daemon_reports_environment_error() {
+    let scratch = Scratch::new("resume-no-daemon");
+    let start = Instant::now();
+
+    let output = run_resume(&scratch);
+
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "resume without a daemon must fail promptly"
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        output.stdout.is_empty(),
+        "a daemon connection diagnostic must not write to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "xwindowlog: daemon is not running: No such file or directory (os error 2)\n"
+    );
+}

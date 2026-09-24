@@ -298,8 +298,33 @@ pub fn send_resume(socket_path: &Path) -> io::Result<Response> {
     send_request(socket_path, Request::Resume)
 }
 
+fn connect_with_deadline<F>(connect: F) -> io::Result<UnixStream>
+where
+    F: FnOnce() -> io::Result<UnixStream> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("xwindowlog-control-connect".to_string())
+        .spawn(move || {
+            let _ = sender.send(connect());
+        })
+        .map_err(io::Error::other)?;
+
+    match receiver.recv_timeout(CLIENT_DEADLINE) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control socket connection timed out",
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "control socket connection worker exited unexpectedly",
+        )),
+    }
+}
+
 fn send_request(socket_path: &Path, req: Request) -> io::Result<Response> {
-    let mut stream = UnixStream::connect(socket_path)?;
+    let path = socket_path.to_owned();
+    let mut stream = connect_with_deadline(move || UnixStream::connect(path))?;
     // R4: the daemon bounds its peer at CLIENT_DEADLINE but gave this client none, so a
     // busy-not-crashed daemon left it blocked forever; bound both directions here too.
     stream.set_read_timeout(Some(CLIENT_DEADLINE))?;
@@ -603,6 +628,24 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         drop(server);
+    }
+
+    #[test]
+    fn cli_client_connect_times_out_before_io() {
+        let start = Instant::now();
+        let result = connect_with_deadline(|| {
+            thread::sleep(CLIENT_DEADLINE + Duration::from_millis(50));
+            UnixStream::pair().map(|(stream, _peer)| stream)
+        });
+
+        assert!(
+            matches!(&result, Err(error) if error.kind() == io::ErrorKind::TimedOut),
+            "a stalled connection attempt must return a timeout error: {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the connection phase must honor CLIENT_DEADLINE"
+        );
     }
 
     // --- 13.6: the CLI client section above never depends on `store` -----------------------
