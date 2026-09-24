@@ -547,6 +547,19 @@ fn seed_forget_database(scratch: &Scratch) {
         .expect("close forget survivor interval");
 }
 
+fn seed_forget_precision_intervals(scratch: &Scratch, intervals: &[(&str, i64, i64)]) {
+    let mut store =
+        Store::open(&scratch.database_path()).expect("open forget precision fixture database");
+    for &(app, start, end) in intervals {
+        store
+            .open_only(WallTs::new(start), interval(app, app))
+            .expect("open forget precision fixture interval");
+        store
+            .close_only(WallTs::new(end))
+            .expect("close forget precision fixture interval");
+    }
+}
+
 fn interval_id_for_app(db_path: &Path, app: &str) -> i64 {
     let connection = rusqlite::Connection::open(db_path).expect("open forget fixture for reading");
     connection
@@ -1120,9 +1133,17 @@ fn forget_cli_rejects_malformed_equal_and_reversed_ranges_before_opening_databas
 }
 
 #[test]
-fn forget_cli_rejects_fractional_seconds_without_mutating_database() {
-    let scratch = Scratch::new("forget-fractional-seconds");
-    seed_forget_database(&scratch);
+fn forget_cli_fractional_range_deletes_only_overlapping_integer_intervals() {
+    let scratch = Scratch::new("forget-fractional-range");
+    seed_forget_precision_intervals(
+        &scratch,
+        &[
+            ("forget-before", 900, 1_000),
+            ("forget-lower-overlap", 1_000, 1_001),
+            ("forget-upper-overlap", 1_100, 1_101),
+            ("forget-after", 1_101, 1_102),
+        ],
+    );
 
     let output = run_forget(
         &scratch,
@@ -1136,11 +1157,61 @@ fn forget_cli_rejects_fractional_seconds_without_mutating_database() {
         None,
     );
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("whole-second"));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 2 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
     let db_path = scratch.database_path();
-    assert_eq!(interval_count_for_app(&db_path, "forget-target"), 1);
-    assert_eq!(interval_count_for_app(&db_path, "forget-survivor"), 1);
+    assert_eq!(interval_count_for_app(&db_path, "forget-before"), 1);
+    assert_eq!(interval_count_for_app(&db_path, "forget-lower-overlap"), 0);
+    assert_eq!(interval_count_for_app(&db_path, "forget-upper-overlap"), 0);
+    assert_eq!(interval_count_for_app(&db_path, "forget-after"), 1);
+}
+
+#[test]
+fn forget_cli_pre_epoch_fractional_range_uses_floor_and_ceiling_bounds() {
+    let scratch = Scratch::new("forget-pre-epoch-fractional-range");
+    seed_forget_precision_intervals(
+        &scratch,
+        &[
+            ("forget-pre-before", -2, -1),
+            ("forget-pre-lower-overlap", -1, 0),
+            ("forget-pre-upper-overlap", 0, 1),
+            ("forget-pre-after", 1, 2),
+        ],
+    );
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1969-12-31T23:59:59.500Z",
+            "--to",
+            "1970-01-01T00:00:00.500Z",
+            "--yes",
+        ],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 2 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    let db_path = scratch.database_path();
+    assert_eq!(interval_count_for_app(&db_path, "forget-pre-before"), 1);
+    assert_eq!(
+        interval_count_for_app(&db_path, "forget-pre-lower-overlap"),
+        0
+    );
+    assert_eq!(
+        interval_count_for_app(&db_path, "forget-pre-upper-overlap"),
+        0
+    );
+    assert_eq!(interval_count_for_app(&db_path, "forget-pre-after"), 1);
 }
 
 #[test]

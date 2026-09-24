@@ -48,9 +48,11 @@ vacuum exhaustion without duplicating SQL or changing Store semantics.
       vacuum-exhausted behavior.
 - [x] Require exactly one selector: paired `--from` and `--to`, or
       `--window <id>`; reject mixed, incomplete, or absent selectors.
-- [x] Parse whole-second RFC3339/ISO timestamps into `WallTs`; reject
-      non-zero fractions, malformed, equal, and reversed ranges before store
-      access or mutation.
+- [x] The original CLI slice parsed whole-second RFC3339/ISO timestamps into
+      `WallTs` and rejected non-zero fractions, malformed, equal, and reversed
+      ranges before Store access. The fraction rejection was a historical
+      behavior and is superseded by `phase-1-unit-17-forget-precision.md`;
+      malformed, equal, and reversed ranges remain invalid.
 - [x] Require confirmation for both selector forms unless `--yes` is present;
       cancellation must perform no destructive Store call.
 - [x] Cover range and window deletion, selector validation, confirmation,
@@ -119,15 +121,22 @@ Recorded results:
 - `cargo clippy --all-targets -- -D warnings` — no issues found.
 - `cargo fmt -- --check` — passed with no diff.
 
-### Native-review correction — R3-fractional-forget-boundary
+### Historical correction note — R3-fractional-forget-boundary
 
-`--from` and `--to` reject non-zero fractional nanoseconds with a usage
-diagnostic before store access; whole-second timestamps remain supported. The
-real-binary regression was RED against the pre-fix binary (status `Some(0)`,
-expected `Some(1)`), then GREEN:
-`cargo test --test cli_control -- forget` — `9 passed, 14 filtered out`; seeded
-target and survivor rows remain. `cargo fmt -- --check` and `git diff --check`
-passed.
+The correction recorded in this historical lineage rejected non-zero
+fractional nanoseconds with a usage diagnostic before Store access; its
+real-binary test was RED against the pre-correction binary (status `Some(0)`,
+expected `Some(1)`), then GREEN with `9 passed, 14 filtered out`. That
+whole-second-only behavior is superseded by the new precision-preserving ODD
+work unit in `phase-1-unit-17-forget-precision.md`, which accepts valid
+fractional RFC3339 input and maps it exactly to whole-second Store bounds.
+
+Historical review status is unchanged: native review transaction
+`review-0378350da479c28d` ended escalated after rejecting a correction, and
+this lineage remains escalated/unapproved. This note and the separate new work
+unit do not approve or reuse that review transaction. The earlier test and
+check results above record what was actually verified at that historical
+point; they are not current acceptance criteria for fractional input.
 
 ## Changed files
 

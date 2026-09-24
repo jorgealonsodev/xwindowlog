@@ -393,6 +393,8 @@ fn parse_forget_selector(
                     "invalid forget range: --from must be before --to".to_string(),
                 ));
             }
+            let from = WallTs::new(from.unix_timestamp());
+            let to = forget_range_upper_bound(to)?;
             Ok(ForgetSelector::Range { from, to })
         }
         (None, None, Some(id)) => Ok(ForgetSelector::Window { id }),
@@ -403,19 +405,28 @@ fn parse_forget_selector(
     }
 }
 
-fn parse_forget_timestamp(name: &str, raw: &str) -> Result<WallTs, ReportError> {
+fn parse_forget_timestamp(name: &str, raw: &str) -> Result<OffsetDateTime, ReportError> {
     let timestamp = OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
         .map_err(|error| {
             ReportError::Usage(format!(
                 "invalid {name} timestamp '{raw}': expected an RFC3339/ISO 8601 timestamp ({error})"
             ))
         })?;
-    if timestamp.nanosecond() != 0 {
-        return Err(ReportError::Usage(format!(
-            "invalid {name} timestamp '{raw}': use whole-second precision"
-        )));
-    }
-    Ok(WallTs::new(timestamp.unix_timestamp()))
+    Ok(timestamp)
+}
+
+/// The Store compares integer interval starts with `start < to`, so a
+/// fractional upper bound must be rounded up to the next whole second.
+fn forget_range_upper_bound(timestamp: OffsetDateTime) -> Result<WallTs, ReportError> {
+    let seconds = timestamp.unix_timestamp();
+    let upper_bound = if timestamp.nanosecond() == 0 {
+        seconds
+    } else {
+        seconds.checked_add(1).ok_or_else(|| {
+            ReportError::Overflow("forget --to whole-second boundary overflowed".to_string())
+        })?
+    };
+    Ok(WallTs::new(upper_bound))
 }
 
 fn confirm_forget(selector: ForgetSelector) -> bool {
