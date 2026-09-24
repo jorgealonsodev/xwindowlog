@@ -51,11 +51,9 @@
 //!    property read.
 //! 4. The PRD's transition table has no `paused + Resume` row at all — every
 //!    row Phase 6 implements is exactly this table's set, and this table
-//!    stops at `paused` having no listed exit. Task 15.11 explicitly wires
-//!    `SourceEvent::Resume` later ("RED tests for full pause/resume behavior
-//!    live in Phase 17"), so `on_event_paused` stays a no-op for every event
-//!    in this phase, matching Phase 5's original wildcard fallback rather
-//!    than inventing an unspecified transition.
+//!    stops at `paused` having no listed exit. Phase 17 adds the explicit
+//!    manual-resume and automatic-expiry exits required by the control path;
+//!    every other event remains the original wildcard no-op.
 use std::time::Duration;
 
 use crate::clock::{backdated_close, close_at, Close, MonoInstant, WallTs};
@@ -198,17 +196,16 @@ pub trait WindowSource {
 /// window that was active when the idle alarm fired, so the negative
 /// transition can reopen it (interval-tracking "afk | Idle alarm, negative
 /// transition | active (same window if it still exists...)"). `Locked` and
-/// `Paused` carry nothing: neither row in the table returns to a
+/// `Paused` retains its optional wall-clock expiry target; neither row in the table returns to a
 /// remembered prior window — `locked` always resolves to `unknown`, and
-/// `paused`'s own resume path is out of this phase's scope (see the
-/// module-level Phase 6 deviation note on `SourceEvent::Resume`).
+/// `paused` resolves to `unknown` when its manual or automatic exit is received.
 #[derive(Clone, Debug, PartialEq)]
 enum TrackerState {
     Unknown,
     Active(WindowInfo),
     Afk(WindowInfo),
     Locked,
-    Paused,
+    Paused { until: Option<WallTs> },
 }
 
 /// The single outstanding local deadline the tracker has armed, if any
@@ -325,7 +322,7 @@ impl Tracker {
     /// | `active` | `on_event_active` | title change (debounced), window change, desktop sentinel, destroy-grace arm, idle positive (backdated), lock, pause |
     /// | `afk` | `on_event_afk` | idle negative, lock, pause |
     /// | `locked` | `on_event_locked` | unlock |
-    /// | `paused` | `on_event_paused` | none in this phase's scope — see deviation note 4 |
+    /// | `paused` | `on_event_paused` | manual resume, automatic pause expiry |
     pub fn on_event(
         &mut self,
         event: SourceEvent,
@@ -346,7 +343,7 @@ impl Tracker {
             TrackerState::Active(_) => self.on_event_active(event, now, now_mono),
             TrackerState::Afk(_) => self.on_event_afk(event, now),
             TrackerState::Locked => self.on_event_locked(event, now),
-            TrackerState::Paused => self.on_event_paused(event, now),
+            TrackerState::Paused { .. } => self.on_event_paused(event, now),
         }
     }
 
@@ -370,7 +367,7 @@ impl Tracker {
             SourceEvent::DeadlineElapsed(timer) => self.on_deadline_elapsed(timer, now),
             SourceEvent::UserIdle { idle_for } => self.on_user_idle(idle_for, now),
             SourceEvent::SessionLocked | SourceEvent::PrepareForSleep(true) => self.on_lock(now),
-            SourceEvent::Pause { .. } => self.on_pause(now),
+            SourceEvent::Pause { until } => self.on_pause(now, until),
             _ => Vec::new(),
         }
     }
@@ -379,7 +376,7 @@ impl Tracker {
         match event {
             SourceEvent::UserActive => self.on_user_active(now),
             SourceEvent::SessionLocked | SourceEvent::PrepareForSleep(true) => self.on_lock(now),
-            SourceEvent::Pause { .. } => self.on_pause(now),
+            SourceEvent::Pause { until } => self.on_pause(now, until),
             _ => Vec::new(),
         }
     }
@@ -393,7 +390,7 @@ impl Tracker {
         }
     }
 
-    /// §11.1's table has no row for `paused` at all; task 15.11 adds exactly the two rows
+    /// §11.1's table has no row for `paused` at all; Phase 17 adds exactly the two rows
     /// interval-tracking's own "resume ends an active pause" scenario requires: a manual
     /// `Resume` request and an unattended `PauseExpiry` deadline both end the pause, and both
     /// do it identically to `on_unlock` — always `unknown`, never a remembered prior window.
@@ -403,9 +400,8 @@ impl Tracker {
     /// event received while paused remains a no-op, matching Phase 5's original wildcard.
     fn on_event_paused(&mut self, event: SourceEvent, now: WallTs) -> Vec<Effect> {
         match event {
-            SourceEvent::Resume | SourceEvent::DeadlineElapsed(Timer::PauseExpiry) => {
-                self.on_unlock(now)
-            }
+            SourceEvent::Resume => self.on_unlock(now),
+            SourceEvent::DeadlineElapsed(Timer::PauseExpiry) => self.on_pause_expiry(now),
             _ => Vec::new(),
         }
     }
@@ -567,12 +563,30 @@ impl Tracker {
         effects
     }
 
-    /// active/afk + pause requested → paused.
-    fn on_pause(&mut self, now: WallTs) -> Vec<Effect> {
+    /// active/afk + pause requested → paused, retaining the wall target in memory for a later
+    /// automatic expiry.
+    fn on_pause(&mut self, now: WallTs, until: Option<WallTs>) -> Vec<Effect> {
         let mut effects = self.cancel_pending_timer();
         let open = sentinel_interval(IntervalState::Paused);
         effects.extend(self.open_or_transition(now, open));
-        self.state = TrackerState::Paused;
+        self.state = TrackerState::Paused { until };
+        effects
+    }
+
+    /// An automatic expiry closes at the retained wall target, not at the instant the reactor
+    /// happened to deliver the event. A manual resume continues through `on_unlock(now)` and
+    /// therefore closes at the actual resume instant.
+    fn on_pause_expiry(&mut self, now: WallTs) -> Vec<Effect> {
+        let at = match &self.state {
+            TrackerState::Paused {
+                until: Some(target),
+            } => *target,
+            TrackerState::Paused { until: None } => now,
+            _ => return Vec::new(),
+        };
+        let open = sentinel_interval(IntervalState::Unknown);
+        let effects = self.open_or_transition(at, open);
+        self.state = TrackerState::Unknown;
         effects
     }
 
@@ -1035,6 +1049,40 @@ mod tests {
             }],
             "an unattended pause expiry must resume tracking automatically, exactly like a \
              manual `resume` request"
+        );
+    }
+
+    #[test]
+    fn late_pause_expiry_closes_at_the_retained_wall_target() {
+        let clock = FakeClock::new(WallTs(8_000));
+        let mut tracker = Tracker::new();
+        send(
+            &mut tracker,
+            SourceEvent::ActiveWindow(Some(window("firefox", "t", None))),
+            &clock,
+        );
+        send(
+            &mut tracker,
+            SourceEvent::Pause {
+                until: Some(WallTs(8_600)),
+            },
+            &clock,
+        );
+
+        clock.advance(Duration::from_secs(900));
+        let effects = send(
+            &mut tracker,
+            SourceEvent::DeadlineElapsed(Timer::PauseExpiry),
+            &clock,
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::Transition {
+                at: WallTs(8_600),
+                open: sentinel_open(IntervalState::Unknown),
+            }],
+            "a late automatic expiry must close at its retained wall target, not delivery time"
         );
     }
 

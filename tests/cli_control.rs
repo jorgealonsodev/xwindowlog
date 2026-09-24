@@ -394,6 +394,18 @@ fn run_pause(scratch: &Scratch) -> Output {
         .expect("run the compiled xwindowlog pause command")
 }
 
+fn run_pause_for_minutes(scratch: &Scratch, minutes: u32) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+        .args(["pause", "--minutes", &minutes.to_string()])
+        .env("XDG_RUNTIME_DIR", scratch.runtime_dir())
+        .env("XDG_CONFIG_HOME", scratch.config_home())
+        .env("XDG_DATA_HOME", scratch.data_home())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the compiled xwindowlog pause --minutes command")
+}
+
 fn run_resume(scratch: &Scratch) -> Output {
     Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
         .arg("resume")
@@ -473,6 +485,33 @@ fn pause_cli_reaches_running_daemon_and_opens_a_paused_interval() {
     );
 
     wait_for_paused_interval(&scratch, Duration::from_secs(5));
+}
+
+#[test]
+fn pause_cli_minutes_reaches_running_daemon_and_expires_the_pause() {
+    let scratch = Scratch::new("minutes-expiry");
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let _daemon = spawn_daemon(&scratch, &xvfb);
+    wait_for_file(&scratch.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(&scratch, &wm, Duration::from_secs(10));
+
+    let output = run_pause_for_minutes(&scratch, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pause --minutes should succeed against a running daemon; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert_eq!(stdout, "xwindowlog: paused\n");
+    assert!(
+        stderr.is_empty(),
+        "successful pause --minutes should emit no stderr: {stderr:?}"
+    );
+
+    wait_for_resumed_interval(&scratch, Duration::from_secs(5));
 }
 
 #[test]

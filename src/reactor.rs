@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::Uid;
 
-use crate::clock::{Clock, MonoInstant};
+use crate::clock::{Clock, MonoInstant, WallTs};
 use crate::control::{self, Accepted, PauseState, CLIENT_DEADLINE};
 use crate::signals::SelfPipe;
 use crate::tracker::{SourceError, SourceEvent, Timer, WindowSource};
@@ -393,9 +393,13 @@ pub struct ReactorSource<X, L, C> {
     /// Whether the control protocol currently believes the daemon is paused, purely to answer
     /// `AlreadyPaused`/`NotPaused` synchronously per design §5 — the real pause/resume ->
     /// `tracker`/`store` wiring is task 15.11's job; this flag only tracks what this module
-    /// itself has already told a client, and is expected to move in lockstep with the
-    /// `PauseExpiry` deadline once Phase 15 arms/cancels it through [`Self::arm_timer`].
+    /// itself has already told a client. The wall target below is kept separately so the
+    /// `PauseExpiry` deadline can be recomputed after suspend.
     paused: bool,
+    /// The accepted pause's wall-clock target. It is deliberately process-local: interval
+    /// boundaries remain `WallTs` values written by the daemon, while this retained target is
+    /// compared against the wall clock whenever the reactor recomputes its monotonic wait.
+    pause_until: Option<WallTs>,
     /// RF-32 U1's gate: `true` from the moment `recover_x11` reports `OutageOpened`/`StillDown`
     /// until it reports `Restored`. While `true`, `next_event` does not call `service_x11`
     /// (and therefore does not call `X::recover`/`Reconnector::attempt`) at all — the *only*
@@ -433,6 +437,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
             wakeup_causes: Arc::new(Mutex::new(VecDeque::new())),
             pending: VecDeque::new(),
             paused: false,
+            pause_until: None,
             x11_down: false,
         }
     }
@@ -469,6 +474,62 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
         self.deadlines.cancel(timer);
     }
 
+    /// Recomputes the monotonic wait for the retained wall-clock pause target. Wall time is only
+    /// compared/subtracted here; the resulting duration is the sole value added to the monotonic
+    /// clock (RF-28). An expired target is queued ahead of any post-suspend event, while an
+    /// unrepresentable future deadline safely leaves the timer unarmed.
+    pub fn refresh_pause_deadline(&mut self, now_wall: WallTs, now_mono: MonoInstant) {
+        let Some(target) = self.pause_until else {
+            self.cancel_timer(Timer::PauseExpiry);
+            return;
+        };
+
+        if target.as_unix_secs() <= now_wall.as_unix_secs() {
+            self.pause_until = None;
+            self.cancel_timer(Timer::PauseExpiry);
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|event| *event == SourceEvent::DeadlineElapsed(Timer::PauseExpiry))
+            {
+                if let Some(event) = self.pending.remove(index) {
+                    self.pending.push_front(event);
+                }
+            } else {
+                self.pending
+                    .push_front(SourceEvent::DeadlineElapsed(Timer::PauseExpiry));
+            }
+            return;
+        }
+
+        // A checked subtraction is required even after the ordering comparison: the two i64
+        // wall-clock values can still have a difference outside the i64 range.
+        let Some(remaining_secs) = target
+            .as_unix_secs()
+            .checked_sub(now_wall.as_unix_secs())
+            .and_then(|seconds| u64::try_from(seconds).ok())
+        else {
+            self.cancel_timer(Timer::PauseExpiry);
+            return;
+        };
+        let Some(deadline) = now_mono.checked_add(Duration::from_secs(remaining_secs)) else {
+            self.cancel_timer(Timer::PauseExpiry);
+            return;
+        };
+
+        // A monotonic timer can fire early if wall time moved backwards after it was armed. Do
+        // not deliver that stale expiry; the wall target remains authoritative and is re-armed
+        // from the newly computed remaining duration instead.
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|event| *event == SourceEvent::DeadlineElapsed(Timer::PauseExpiry))
+        {
+            let _ = self.pending.remove(index);
+        }
+        self.arm_timer(Timer::PauseExpiry, deadline);
+    }
+
     /// Reaches the owned logind source for suspend-inhibitor coordination (Phase 15
     /// composition, task 15.10's RF-27 wiring): sequencing a `PrepareForSleep` reaction
     /// strictly after its own interval-closing effect is committed is `main.rs`'s job, not
@@ -485,6 +546,8 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     /// deadline once Phase 15 arms/cancels it"; this is that lockstep's other half.
     pub fn mark_resumed(&mut self) {
         self.paused = false;
+        self.pause_until = None;
+        self.cancel_timer(Timer::PauseExpiry);
     }
 
     /// Flushes and drains the X11 source only — split out of `next_event` so a mid-run error
@@ -539,10 +602,10 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> ReactorSource<X, L, C> {
     }
 
     /// Arms `Timer::ReconnectBackoff` for `retry_after` from now, the same
-    /// `clock.now_mono().checked_add(duration)` -> `arm_timer` mechanism `main.rs` already uses
-    /// for `Timer::PauseExpiry` (`src/main.rs:391-393`). An unrepresentable overflow (never
-    /// observed in practice — see `MonoInstant::checked_add`'s own doc) leaves the timer
-    /// unarmed rather than panicking or arming the wrong instant.
+    /// `clock.now_mono().checked_add(duration)` -> `arm_timer` mechanism used by
+    /// `refresh_pause_deadline`. An unrepresentable overflow (never observed in practice — see
+    /// `MonoInstant::checked_add`'s own doc) leaves the timer unarmed rather than panicking or
+    /// arming the wrong instant.
     fn arm_reconnect_backoff(&mut self, retry_after: Duration) {
         if let Some(at) = self.clock.now_mono().checked_add(retry_after) {
             self.arm_timer(Timer::ReconnectBackoff, at);
@@ -595,6 +658,7 @@ fn apply_accept_outcome(outcome: io::Result<Accepted>, clients: &mut Vec<Control
 fn service_clients(
     clients: &mut Vec<ControlClient>,
     paused: &mut bool,
+    pause_until: &mut Option<WallTs>,
     now_wall: crate::clock::WallTs,
     out: &mut VecDeque<SourceEvent>,
 ) {
@@ -606,6 +670,11 @@ fn service_clients(
         match control::try_read_request_line(&mut client.stream, &mut client.partial) {
             Ok(Some(line)) => {
                 if let Some(event) = decide(&line, paused, now_wall, &mut client.stream) {
+                    match &event {
+                        SourceEvent::Pause { until } => *pause_until = *until,
+                        SourceEvent::Resume => *pause_until = None,
+                        _ => {}
+                    }
                     out.push_back(event);
                 }
                 false
@@ -641,8 +710,11 @@ fn decide(
             let event = match (&envelope.req, &response) {
                 (Request::Pause { minutes }, Response::Ok { .. }) => {
                     *paused = true;
-                    let until = minutes.map(|m| {
-                        crate::clock::WallTs::new(now_wall.as_unix_secs() + i64::from(m) * 60)
+                    let until = minutes.and_then(|minutes| {
+                        i64::from(minutes)
+                            .checked_mul(60)
+                            .and_then(|seconds| now_wall.as_unix_secs().checked_add(seconds))
+                            .map(crate::clock::WallTs::new)
                     });
                     Some(SourceEvent::Pause { until })
                 }
@@ -674,6 +746,14 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
         deadline: Option<MonoInstant>,
     ) -> Result<Option<SourceEvent>, SourceError> {
         loop {
+            let pause_request_pending = self
+                .pending
+                .iter()
+                .any(|event| matches!(event, SourceEvent::Pause { .. }));
+            if !pause_request_pending {
+                self.refresh_pause_deadline(self.clock.now_wall(), self.clock.now_mono());
+            }
+
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));
             }
@@ -709,6 +789,7 @@ impl<X: BudgetedSource, L: BudgetedSource, C: Clock> WindowSource for ReactorSou
             service_clients(
                 &mut self.clients,
                 &mut self.paused,
+                &mut self.pause_until,
                 now_wall,
                 &mut self.pending,
             );
@@ -1425,6 +1506,91 @@ mod tests {
         let clock = FakeClock::new(WallTs(0));
         let reactor = ReactorSource::new(x11, logind, signals, listener, Uid::current(), clock);
         (reactor, x11_writer, logind_writer, socket_path)
+    }
+
+    fn pause_with_initial_ten_minute_deadline(
+        reactor: &mut ReactorSource<SyntheticSource, SyntheticSource, FakeClock>,
+        socket_path: &std::path::Path,
+    ) -> WallTs {
+        let mut client = UnixStream::connect(socket_path).expect("connect must succeed");
+        client
+            .write_all(b"{\"v\":1,\"cmd\":\"pause\",\"minutes\":10}\n")
+            .expect("write must succeed");
+
+        let event = reactor.next_event(None).expect("next_event must not error");
+        let target = match event {
+            Some(SourceEvent::Pause {
+                until: Some(target),
+            }) => target,
+            other => panic!("expected a ten-minute pause event, got {other:?}"),
+        };
+
+        let deadline = reactor
+            .clock
+            .now_mono()
+            .checked_add(Duration::from_secs(600))
+            .expect("test deadline must be representable");
+        reactor.arm_timer(Timer::PauseExpiry, deadline);
+        target
+    }
+
+    #[test]
+    fn wall_only_suspend_refreshes_pause_deadline_before_waiting_again() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer, mut logind_writer, socket_path) =
+            make_reactor_source("pause-wall-refresh");
+        let target = pause_with_initial_ten_minute_deadline(&mut reactor, &socket_path);
+        assert_eq!(target, WallTs(600));
+
+        // Suspend advances wall time but not monotonic time. The remaining wait is now five
+        // minutes, not the original ten.
+        reactor.clock.set_wall(WallTs(300));
+        reactor
+            .logind
+            .push_event(SourceEvent::PrepareForSleep(false));
+        logind_writer
+            .write_all(b"x")
+            .expect("write must wake the synthetic logind source");
+        assert_eq!(
+            reactor.next_event(None).expect("next_event must not error"),
+            Some(SourceEvent::PrepareForSleep(false))
+        );
+
+        // Advancing both fake clocks by the refreshed five-minute remainder must now deliver the
+        // expiry. Without the wall refresh, the stale ten-minute monotonic deadline would remain.
+        reactor.clock.advance(Duration::from_secs(300));
+        let immediate_deadline = MonoInstant(Instant::now());
+        assert_eq!(
+            reactor
+                .next_event(Some(immediate_deadline))
+                .expect("next_event must not error"),
+            Some(SourceEvent::DeadlineElapsed(Timer::PauseExpiry))
+        );
+    }
+
+    #[test]
+    fn expired_pause_target_preempts_the_post_suspend_event() {
+        let _signal_guard = crate::signals::SIGNAL_TEST_GUARD.lock().unwrap();
+        let (mut reactor, _x11_writer, mut logind_writer, socket_path) =
+            make_reactor_source("pause-expired-before-resume");
+        let target = pause_with_initial_ten_minute_deadline(&mut reactor, &socket_path);
+        reactor.clock.set_wall(target);
+        reactor
+            .logind
+            .push_event(SourceEvent::PrepareForSleep(false));
+        logind_writer
+            .write_all(b"x")
+            .expect("write must wake the synthetic logind source");
+
+        assert_eq!(
+            reactor.next_event(None).expect("next_event must not error"),
+            Some(SourceEvent::DeadlineElapsed(Timer::PauseExpiry)),
+            "an already-expired wall target must be emitted before the queued post-suspend event"
+        );
+        assert_eq!(
+            reactor.next_event(None).expect("next_event must not error"),
+            Some(SourceEvent::PrepareForSleep(false))
+        );
     }
 
     // --- 14.6: `ReactorSource` wakes exactly once for a synthetic X11 change, with no prior

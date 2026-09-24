@@ -118,7 +118,7 @@ fn main() -> ExitCode {
         Command::Today { json: true } => run_today_json(),
         Command::Status { json: false } => run_status(),
         Command::Status { json: true } => run_status_json(),
-        Command::Pause { minutes: None } => run_pause(),
+        Command::Pause { minutes } => run_pause(minutes),
         Command::Resume => run_resume(),
         _ => not_yet_implemented(),
     }
@@ -142,7 +142,7 @@ fn print_completions(shell: clap_complete::Shell) -> ExitCode {
     ExitStatus::Ok.into()
 }
 
-fn run_pause() -> ExitCode {
+fn run_pause(minutes: Option<u32>) -> ExitCode {
     let runtime_dir = match runtime_dir() {
         Ok(path) => path,
         Err(error) => {
@@ -152,7 +152,7 @@ fn run_pause() -> ExitCode {
     };
     let socket_path = control::socket_path(&runtime_dir);
 
-    match control::send_pause(&socket_path, None) {
+    match control::send_pause(&socket_path, minutes) {
         Ok(control::Response::Ok { state, .. }) => {
             println!("xwindowlog: {state}");
             ExitStatus::Ok.into()
@@ -807,24 +807,15 @@ fn run_event_loop(
         let now_wall = clock.now_wall();
         let now_mono = clock.now_mono();
 
-        // RF-49's `--minutes N` dual-clock expiry (design §2 D-5): the monotonic deadline is
-        // derived from a WallTs comparison, never a direct WallTs->MonoInstant conversion
-        // (RF-28's own prohibition — see clock.rs::MonoInstant::checked_add's doc). A manual
-        // `resume` already clears the reactor's own `paused` flag inside `decide`
-        // (reactor.rs, Phase 14); an unattended expiry has no other path back in, hence
-        // `mark_resumed`.
+        // RF-49's `--minutes N` dual-clock expiry (design §2 D-5) is refreshed from the retained
+        // wall target. The reactor compares WallTs values and uses only the resulting duration for
+        // its monotonic poll deadline (RF-28); it also preempts a post-suspend event when the wall
+        // target has already elapsed. A manual `resume` already clears the reactor's own `paused`
+        // flag inside `decide` (reactor.rs, Phase 14); an unattended expiry has no other path back
+        // in, hence `mark_resumed`.
         match &event {
-            SourceEvent::Pause {
-                until: Some(target),
-            } => {
-                let delta = target
-                    .as_unix_secs()
-                    .saturating_sub(now_wall.as_unix_secs())
-                    .max(0) as u64;
-                if let Some(deadline) = now_mono.checked_add(std::time::Duration::from_secs(delta))
-                {
-                    reactor.arm_timer(Timer::PauseExpiry, deadline);
-                }
+            SourceEvent::Pause { .. } | SourceEvent::PrepareForSleep(_) => {
+                reactor.refresh_pause_deadline(now_wall, now_mono)
             }
             SourceEvent::Resume => reactor.cancel_timer(Timer::PauseExpiry),
             SourceEvent::DeadlineElapsed(Timer::PauseExpiry) => reactor.mark_resumed(),
