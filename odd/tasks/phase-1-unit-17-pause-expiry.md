@@ -118,11 +118,18 @@ cargo fmt -- --check
 
 ## Progress
 
-- Status: implemented; delivery closure pending.
+- Status: implemented and reviewed; delivery closure pending.
 - Work-unit commit: `c2b2af2 fix(daemon): anchor pause expiry to wall time`.
 - Verification evidence: tracker tests (23 passed), reactor tests (31 passed),
   CLI control tests (3 passed), pipeline integration (2 passed), daemon E2E
   filter (1 passed), and all targets (308 passed). Clippy with `-D warnings`
   and format check passed; no environmental failures occurred.
-- Next step: complete the native risk assessment/review decision and deliver
-  this coherent expiry slice; begin the next Phase 17 command afterward.
+- Native review: lineage `review-55ca1d15fea3c060` approved and acknowledged;
+  no blockers. Two non-blocking follow-ups remain: a forward wall-clock
+  correction while blocked in `poll(2)` can wait for the stale monotonic
+  deadline, and automatic expiry can precede the pause interval opening for a
+  zero-minute pause.
+- Parent spot-check: `cargo test --test cli_control` passed with 3 tests after
+  review.
+- Next step: deliver this coherent expiry slice; begin the next Phase 17
+  command afterward.
