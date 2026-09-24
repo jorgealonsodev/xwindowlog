@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::Value;
 use xwindowlog::clock::WallTs;
 use xwindowlog::store::{IntervalState, IntervalStore, NewInterval, Store};
 
@@ -50,7 +51,7 @@ impl Drop for Scratch {
     }
 }
 
-fn seed_hidden_interval(scratch: &Scratch) {
+fn seed_hidden_interval(scratch: &Scratch) -> (i64, i64) {
     let data_dir = scratch.data_home().join("xwindowlog");
     std::fs::create_dir_all(&data_dir).expect("create data directory");
 
@@ -72,6 +73,7 @@ fn seed_hidden_interval(scratch: &Scratch) {
     store
         .close_only(WallTs::new(end))
         .expect("close hidden interval");
+    (start, end)
 }
 
 fn seed_local_midnight_crossing_interval(scratch: &Scratch) {
@@ -137,8 +139,12 @@ fn write_config(scratch: &Scratch, contents: &str) {
 }
 
 fn run_report(scratch: &Scratch, command: &str) -> Output {
+    run_report_args(scratch, &[command])
+}
+
+fn run_report_args(scratch: &Scratch, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
-        .arg(command)
+        .args(args)
         .env("XDG_DATA_HOME", scratch.data_home())
         .env("XDG_CONFIG_HOME", scratch.config_home())
         .env("XDG_RUNTIME_DIR", scratch.runtime_dir())
@@ -146,6 +152,31 @@ fn run_report(scratch: &Scratch, command: &str) -> Output {
         .env_remove("WAYLAND_DISPLAY")
         .output()
         .expect("run xwindowlog report")
+}
+
+fn parse_json_output(output: &Output) -> Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "JSON report should succeed; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("JSON report must write JSON only to stdout: {error}; stdout={stdout:?}")
+    })
+}
+
+fn assert_report_header(report: &Value, expected_report: &str) {
+    assert_eq!(
+        report.get("schema_version").and_then(Value::as_u64),
+        Some(1),
+        "report must contain numeric schema_version 1: {report}"
+    );
+    assert_eq!(
+        report.get("report").and_then(Value::as_str),
+        Some(expected_report),
+        "report discriminator must identify the report type: {report}"
+    );
 }
 
 #[test]
@@ -186,6 +217,47 @@ fn today_uses_the_local_calendar_day_boundary_for_utc_persisted_rows() {
     assert!(
         stdout.contains("00:00") && stdout.contains("editor-local-day"),
         "today must clip UTC-persisted data at local midnight, got {stdout:?}"
+    );
+}
+
+#[test]
+fn today_json_reports_versioned_persisted_intervals() {
+    let scratch = Scratch::new("json-persisted-only");
+    let (expected_start, expected_end) = seed_hidden_interval(&scratch);
+
+    let output = run_report_args(&scratch, &["today", "--json"]);
+    let report = parse_json_output(&output);
+    assert_report_header(&report, "today");
+
+    let intervals = report
+        .get("intervals")
+        .and_then(Value::as_array)
+        .expect("today JSON must contain an intervals array");
+    assert_eq!(intervals.len(), 1);
+    let interval = &intervals[0];
+    assert_eq!(
+        interval.get("start").and_then(Value::as_i64),
+        Some(expected_start)
+    );
+    assert_eq!(
+        interval.get("end").and_then(Value::as_i64),
+        Some(expected_end)
+    );
+    assert_eq!(
+        interval.get("duration_seconds").and_then(Value::as_i64),
+        Some(60)
+    );
+    assert_eq!(
+        interval.get("app_id").and_then(Value::as_str),
+        Some("keepassxc")
+    );
+    assert_eq!(
+        interval.get("title").and_then(Value::as_str),
+        Some("[hidden]")
+    );
+    assert_eq!(
+        interval.get("state").and_then(Value::as_str),
+        Some("active")
     );
 }
 
@@ -273,6 +345,81 @@ fn status_visibly_reports_a_persisted_paused_state() {
     assert!(
         !stdout.contains("editor"),
         "non-active status must not be rendered as an active app, got {stdout:?}"
+    );
+}
+
+#[test]
+fn status_json_hides_title_by_default_and_reports_active_state() {
+    let scratch = Scratch::new("status-json-title-default");
+    seed_open_interval(&scratch);
+
+    let output = run_report_args(&scratch, &["status", "--json"]);
+    let report = parse_json_output(&output);
+    let object = report
+        .as_object()
+        .expect("status JSON root must be an object");
+    assert_report_header(&report, "status");
+    assert_eq!(object.get("state").and_then(Value::as_str), Some("active"));
+    assert_eq!(object.get("app_id").and_then(Value::as_str), Some("editor"));
+    assert!(
+        object
+            .get("duration_seconds")
+            .and_then(Value::as_u64)
+            .is_some_and(|seconds| seconds > 0),
+        "active status JSON must report a positive duration: {report}"
+    );
+    assert!(
+        !object.contains_key("title"),
+        "status JSON must omit the title unless configured: {report}"
+    );
+}
+
+#[test]
+fn status_json_includes_title_when_configured() {
+    let scratch = Scratch::new("status-json-title-visible");
+    seed_open_interval(&scratch);
+    write_config(&scratch, "status_show_title = true\n");
+
+    let output = run_report_args(&scratch, &["status", "--json"]);
+    let report = parse_json_output(&output);
+    assert_report_header(&report, "status");
+    assert_eq!(
+        report.get("title").and_then(Value::as_str),
+        Some("Sensitive window title")
+    );
+}
+
+#[test]
+fn status_json_preserves_non_active_state_without_active_app() {
+    let scratch = Scratch::new("status-json-paused");
+    seed_open_interval_with_state(&scratch, IntervalState::Paused);
+
+    let output = run_report_args(&scratch, &["status", "--json"]);
+    let report = parse_json_output(&output);
+    assert_report_header(&report, "status");
+    assert_eq!(report.get("state").and_then(Value::as_str), Some("paused"));
+    assert!(
+        report.get("app_id").is_some_and(Value::is_null),
+        "non-active status must not render a persisted app as active: {report}"
+    );
+}
+
+#[test]
+fn status_json_reports_not_tracking_without_a_persisted_open_interval() {
+    let scratch = Scratch::new("status-json-not-tracking");
+    seed_hidden_interval(&scratch);
+
+    let output = run_report_args(&scratch, &["status", "--json"]);
+    let report = parse_json_output(&output);
+    assert_report_header(&report, "status");
+    assert_eq!(
+        report.get("state").and_then(Value::as_str),
+        Some("not_tracking")
+    );
+    assert!(report.get("app_id").is_some_and(Value::is_null));
+    assert_eq!(
+        report.get("duration_seconds").and_then(Value::as_u64),
+        Some(0)
     );
 }
 

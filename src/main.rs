@@ -15,6 +15,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Uid;
+use serde::Serialize;
 
 use time::{OffsetDateTime, Time, UtcOffset};
 use xwindowlog::clock::{duration_secs, Clock, SystemClock, WallTs};
@@ -114,7 +115,9 @@ fn main() -> ExitCode {
         Command::Daemon => run_daemon(),
         Command::Completions { shell } => print_completions(shell),
         Command::Today { json: false } => run_today(),
+        Command::Today { json: true } => run_today_json(),
         Command::Status { json: false } => run_status(),
+        Command::Status { json: true } => run_status_json(),
         _ => not_yet_implemented(),
     }
 }
@@ -145,6 +148,7 @@ enum ReportError {
     Store(StoreError),
     Time(String),
     Overflow(String),
+    Json(serde_json::Error),
 }
 
 impl ReportError {
@@ -155,6 +159,7 @@ impl ReportError {
             | ReportError::Time(_)
             | ReportError::Overflow(_) => ExitStatus::Environment,
             ReportError::MissingDatabase(_) => ExitStatus::State,
+            ReportError::Json(_) => ExitStatus::Failure,
             ReportError::Store(error) => match error.exit_code() {
                 2 => ExitStatus::State,
                 3 => ExitStatus::Environment,
@@ -177,12 +182,49 @@ impl ReportError {
             ReportError::Store(error) => format!("xwindowlog: {error}"),
             ReportError::Time(error) => format!("xwindowlog: could not resolve report time: {error}"),
             ReportError::Overflow(error) => format!("xwindowlog: report value overflowed: {error}"),
+            ReportError::Json(error) => format!("xwindowlog: could not serialize JSON report: {error}"),
         }
     }
 }
 
+#[derive(Copy, Clone)]
+enum ReportFormat {
+    PlainText,
+    Json,
+}
+
+const REPORT_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize)]
+struct TodayJsonReport {
+    schema_version: u8,
+    report: &'static str,
+    intervals: Vec<TodayJsonInterval>,
+}
+
+#[derive(Debug, Serialize)]
+struct TodayJsonInterval {
+    start: i64,
+    end: i64,
+    duration_seconds: u64,
+    app_id: String,
+    title: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusJsonReport {
+    schema_version: u8,
+    report: &'static str,
+    state: String,
+    app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    duration_seconds: u64,
+}
+
 fn run_today() -> ExitCode {
-    match try_run_today() {
+    match try_run_today(ReportFormat::PlainText) {
         Ok(()) => ExitStatus::Ok.into(),
         Err(error) => {
             eprintln!("{}", error.message());
@@ -191,12 +233,25 @@ fn run_today() -> ExitCode {
     }
 }
 
-fn try_run_today() -> Result<(), ReportError> {
+fn run_today_json() -> ExitCode {
+    match try_run_today(ReportFormat::Json) {
+        Ok(()) => ExitStatus::Ok.into(),
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_today(format: ReportFormat) -> Result<(), ReportError> {
     let now = SystemClock.now_wall();
     let offset = resolve_local_offset();
     let store = open_report_store()?;
     let intervals = query_today_intervals(&store, now, offset)?;
-    print_today(&intervals, offset)
+    match format {
+        ReportFormat::PlainText => print_today(&intervals, offset),
+        ReportFormat::Json => print_today_json(&intervals),
+    }
 }
 
 fn open_report_store() -> Result<Store, ReportError> {
@@ -276,7 +331,7 @@ fn print_today(intervals: &[DisplayInterval], offset: UtcOffset) -> Result<(), R
 }
 
 fn run_status() -> ExitCode {
-    match try_run_status() {
+    match try_run_status(ReportFormat::PlainText) {
         Ok(()) => ExitStatus::Ok.into(),
         Err(error) => {
             eprintln!("{}", error.message());
@@ -285,7 +340,17 @@ fn run_status() -> ExitCode {
     }
 }
 
-fn try_run_status() -> Result<(), ReportError> {
+fn run_status_json() -> ExitCode {
+    match try_run_status(ReportFormat::Json) {
+        Ok(()) => ExitStatus::Ok.into(),
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_status(format: ReportFormat) -> Result<(), ReportError> {
     let config = DaemonConfig::load_default().map_err(ReportError::Config)?;
     let now = SystemClock.now_wall();
     let offset = resolve_local_offset();
@@ -294,7 +359,14 @@ fn try_run_status() -> Result<(), ReportError> {
     // open row below only selects the persisted label/state to display.
     let intervals = query_today_intervals(&store, now, offset)?;
     let open = store.open_interval().map_err(ReportError::Store)?;
-    print_status_line(open.as_ref(), &intervals, config.status_show_title)
+    match format {
+        ReportFormat::PlainText => {
+            print_status_line(open.as_ref(), &intervals, config.status_show_title)
+        }
+        ReportFormat::Json => {
+            print_status_json(open.as_ref(), &intervals, config.status_show_title)
+        }
+    }
 }
 
 fn print_status_line(
@@ -304,18 +376,7 @@ fn print_status_line(
 ) -> Result<(), ReportError> {
     match open {
         Some(interval) if interval.state == "active" => {
-            let seconds = intervals
-                .iter()
-                .filter(|candidate| {
-                    candidate.state == "active" && candidate.app_id == interval.app_id
-                })
-                .try_fold(0_u64, |total, candidate| {
-                    total
-                        .checked_add(duration_secs(candidate.start, candidate.end))
-                        .ok_or(ReportError::Overflow(
-                            "active duration exceeded the report counter".to_string(),
-                        ))
-                })?;
+            let seconds = status_duration(interval, intervals)?;
             if show_title {
                 println!(
                     "xwindowlog: {} · {} · {} today",
@@ -332,16 +393,7 @@ fn print_status_line(
             }
         }
         Some(interval) => {
-            let seconds = intervals
-                .iter()
-                .filter(|candidate| candidate.state == interval.state)
-                .try_fold(0_u64, |total, candidate| {
-                    total
-                        .checked_add(duration_secs(candidate.start, candidate.end))
-                        .ok_or(ReportError::Overflow(
-                            "non-active duration exceeded the report counter".to_string(),
-                        ))
-                })?;
+            let seconds = status_duration(interval, intervals)?;
             println!(
                 "xwindowlog: {} · {} today",
                 interval.state,
@@ -350,6 +402,77 @@ fn print_status_line(
         }
         None => println!("xwindowlog: not tracking · 0m today"),
     }
+    Ok(())
+}
+
+fn status_duration(open: &OpenInterval, intervals: &[DisplayInterval]) -> Result<u64, ReportError> {
+    let mut total = 0_u64;
+    for candidate in intervals.iter().filter(|candidate| {
+        if open.state == "active" {
+            candidate.state == "active" && candidate.app_id == open.app_id
+        } else {
+            candidate.state == open.state
+        }
+    }) {
+        total = total
+            .checked_add(duration_secs(candidate.start, candidate.end))
+            .ok_or(ReportError::Overflow(if open.state == "active" {
+                "active duration exceeded the report counter".to_string()
+            } else {
+                "non-active duration exceeded the report counter".to_string()
+            }))?;
+    }
+    Ok(total)
+}
+
+fn print_today_json(intervals: &[DisplayInterval]) -> Result<(), ReportError> {
+    let intervals = intervals
+        .iter()
+        .map(|interval| TodayJsonInterval {
+            start: interval.start.as_unix_secs(),
+            end: interval.end.as_unix_secs(),
+            duration_seconds: duration_secs(interval.start, interval.end),
+            app_id: interval.app_id.clone(),
+            title: interval.title.clone(),
+            state: interval.state.clone(),
+        })
+        .collect();
+    print_json(&TodayJsonReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        report: "today",
+        intervals,
+    })
+}
+
+fn print_status_json(
+    open: Option<&OpenInterval>,
+    intervals: &[DisplayInterval],
+    show_title: bool,
+) -> Result<(), ReportError> {
+    let report = match open {
+        Some(interval) => StatusJsonReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            report: "status",
+            state: interval.state.clone(),
+            app_id: (interval.state == "active").then(|| interval.app_id.clone()),
+            title: show_title.then(|| interval.title.clone()),
+            duration_seconds: status_duration(interval, intervals)?,
+        },
+        None => StatusJsonReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            report: "status",
+            state: "not_tracking".to_string(),
+            app_id: None,
+            title: None,
+            duration_seconds: 0,
+        },
+    };
+    print_json(&report)
+}
+
+fn print_json<T: Serialize>(report: &T) -> Result<(), ReportError> {
+    let payload = serde_json::to_string(report).map_err(ReportError::Json)?;
+    println!("{payload}");
     Ok(())
 }
 
