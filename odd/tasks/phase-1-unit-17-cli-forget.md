@@ -130,15 +130,16 @@ Recorded results:
 
 ## Work-unit commit
 
-Pending until the coherent implementation commit is created: record the exact
-Conventional Commit subject and full commit hash here.
+`25c5b12d0288745295482bcedea710e7eab8a736 feat(cli): wire forget deletion
+command`
 
 ## Review-size risk
 
-The cohesive implementation/test/ledger diff is over the default 400-line
-review budget. This is recorded as a size exception because splitting the
-selector behavior, destructive routing, and its real-binary proof would leave
-an incomplete work unit; no unrelated files are included.
+The cohesive implementation/test/ledger commit contains 579 changed lines
+(571 additions and 8 deletions, including this 147-line ledger), over the
+default 400-line review budget. This is recorded as a size exception because
+splitting the selector behavior, destructive routing, and its real-binary proof
+would leave an incomplete work unit; no unrelated files are included.
 
 ## Unresolved issues
 
