@@ -138,6 +138,31 @@ unit do not approve or reuse that review transaction. The earlier test and
 check results above record what was actually verified at that historical
 point; they are not current acceptance criteria for fractional input.
 
+### Precision-preserving successor verification
+
+The separate bounded work unit `phase-1-unit-17-forget-precision.md` replaces
+that fraction-rejection behavior at the CLI boundary without changing Store
+semantics.
+
+- RED on `ff218b5`: `cargo test --test cli_control -- forget` compiled and ran;
+  `8 passed, 2 failed, 14 filtered out`. Both new fractional-range tests
+  observed status `Some(1)` instead of `Some(0)` against the old rejection.
+- GREEN: the same command completed with `10 passed, 14 filtered out`. For
+  `[1000.5, 1100.5)`, only `[1000,1001)` and `[1100,1101)` were deleted; the
+  adjacent `[900,1000)` and `[1101,1102)` rows survived. The pre-epoch
+  `[-0.5, 0.5)` scenario also deleted exactly its two overlapping rows.
+- `cargo test --lib store::` — `27 passed, 170 filtered out`.
+- `cargo test --all-targets` — `330 passed` across 11 suites.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`, and
+  `git diff --check` — passed.
+- Successor work-unit commit: `9d50a2bca85593d4c5bf46258a46352e29cffb0e`
+  (`fix(cli): preserve fractional forget precision`).
+- Its Engram task-ledger mirror is pending because Engram could not confirm
+  session registration; the local ledger is preserved.
+
+The successor work does not change the historical review result: transaction
+`review-0378350da479c28d` remains escalated and unapproved.
+
 ## Changed files
 
 - `src/main.rs` — dispatches `Command::Forget`, validates exclusive selectors
