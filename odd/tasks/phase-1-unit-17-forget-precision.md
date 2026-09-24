@@ -124,9 +124,21 @@ behavior; it does not retroactively approve or alter the old review result.
   real-binary tests, and the two associated task-ledger updates; no Store
   semantics or unrelated behavior are included.
 - Engram mirror topic: `odd/phase-1-unit-17-forget-precision/tasks`.
-- Engram mirror status: pending; the initial `mem_save` could not confirm
-  Engram session registration. The runtime supplied no authoritative session
-  ID, so the local ledger remains the current copy.
-- Unresolved issues: Engram mirror remains pending because the server could not
-  confirm session registration and no authoritative runtime session ID was
-  supplied. No functional issues remain after the required checks.
+- Engram mirror status: pending; the final `mem_save` could not confirm Engram
+  session registration. No authoritative runtime session ID was supplied, so
+  the local ledger remains the current copy.
+- Unresolved issues: Engram mirror remains pending because session registration
+  could not be confirmed for the final save. No functional issues remain after
+  the required checks.
+
+## Final review record
+
+- Native lineage `review-fc4bb730578af907`: approved and acknowledged; no
+  findings. Consumed revision:
+  `sha256:0314b368b8023b5ea77a21e07ea3868dd1414d092767fa7ebc182a7e14cd3c28`.
+- Parent spot-check: `cargo test --test cli_control -- forget` — 10 passed,
+  14 filtered.
+- Implementation commit: `9d50a2bca85593d4c5bf46258a46352e29cffb0e`.
+- Documentation verification commit: `323476ac7919807dfda3e111e0ee9295255f1031`.
+- Earlier lineage `review-0378350da479c28d` remains escalated and unapproved;
+  it was not reused.
