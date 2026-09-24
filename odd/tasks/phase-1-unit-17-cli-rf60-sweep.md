@@ -89,8 +89,8 @@ cargo fmt -- --check
 
 ## Progress
 
-- Status: behavior, tests, and this ledger landed in the work-unit commit;
-  only documentation closure of its exact hash remains.
+- Status: closed. The behavior, tests, and task ledger landed in the work-unit
+  commit; its exact hash is recorded below in the documentation closure entry.
 - Engram mirror: pending — `mem_save` could not confirm session registration;
   no authoritative session ID was available to provide, so the mirror was not
   confirmed.
