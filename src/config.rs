@@ -89,15 +89,11 @@ impl std::error::Error for ConfigError {
 
 /// The result of loading and validating `config.toml`, with every value already wired into the
 /// types that consume it (task 15.2). `status_show_title`/`retention_days` are read by Phase
-/// 16's `status` and Phase 17's `prune` respectively — not yet, hence the narrow allow below.
+/// 16's `status` and Phase 17's `prune` respectively.
 pub struct DaemonConfig {
     pub excluder: Excluder,
     pub tracker: Tracker,
     pub afk_threshold: Duration,
-    #[allow(
-        dead_code,
-        reason = "consumed by Phase 16's `status` subcommand, not yet implemented"
-    )]
     pub status_show_title: bool,
     #[allow(
         dead_code,

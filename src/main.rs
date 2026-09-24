@@ -16,7 +16,8 @@ use clap::{Parser, Subcommand};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Uid;
 
-use xwindowlog::clock::{Clock, SystemClock};
+use time::{OffsetDateTime, Time, UtcOffset};
+use xwindowlog::clock::{duration_secs, Clock, SystemClock, WallTs};
 use xwindowlog::control;
 use xwindowlog::exclude::Excluder;
 use xwindowlog::logind::{
@@ -24,7 +25,7 @@ use xwindowlog::logind::{
 };
 use xwindowlog::reactor::ReactorSource;
 use xwindowlog::signals::SelfPipe;
-use xwindowlog::store::{IntervalStore as _, Store, StoreError};
+use xwindowlog::store::{DisplayInterval, IntervalStore as _, OpenInterval, Store, StoreError};
 use xwindowlog::tracker::{SourceEvent, Timer, WindowSource as _};
 use xwindowlog::x11::{X11InitError, X11Source};
 
@@ -112,6 +113,8 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Daemon => run_daemon(),
         Command::Completions { shell } => print_completions(shell),
+        Command::Today { json: false } => run_today(),
+        Command::Status { json: false } => run_status(),
         _ => not_yet_implemented(),
     }
 }
@@ -132,6 +135,239 @@ fn print_completions(shell: clap_complete::Shell) -> ExitCode {
         &mut std::io::stdout(),
     );
     ExitStatus::Ok.into()
+}
+
+#[derive(Debug)]
+enum ReportError {
+    Config(ConfigError),
+    NoDataHome,
+    MissingDatabase(PathBuf),
+    Store(StoreError),
+    Time(String),
+    Overflow(String),
+}
+
+impl ReportError {
+    fn exit_status(&self) -> ExitStatus {
+        match self {
+            ReportError::Config(_)
+            | ReportError::NoDataHome
+            | ReportError::Time(_)
+            | ReportError::Overflow(_) => ExitStatus::Environment,
+            ReportError::MissingDatabase(_) => ExitStatus::State,
+            ReportError::Store(error) => match error.exit_code() {
+                2 => ExitStatus::State,
+                3 => ExitStatus::Environment,
+                _ => ExitStatus::Failure,
+            },
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            ReportError::Config(error) => format!("xwindowlog: {error}"),
+            ReportError::NoDataHome => {
+                "xwindowlog: could not determine XDG data home (no XDG_DATA_HOME or HOME)"
+                    .to_string()
+            }
+            ReportError::MissingDatabase(path) => format!(
+                "xwindowlog: database does not exist at {}; start the daemon before requesting a report",
+                path.display()
+            ),
+            ReportError::Store(error) => format!("xwindowlog: {error}"),
+            ReportError::Time(error) => format!("xwindowlog: could not resolve report time: {error}"),
+            ReportError::Overflow(error) => format!("xwindowlog: report value overflowed: {error}"),
+        }
+    }
+}
+
+fn run_today() -> ExitCode {
+    match try_run_today() {
+        Ok(()) => ExitStatus::Ok.into(),
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_today() -> Result<(), ReportError> {
+    let now = SystemClock.now_wall();
+    let offset = resolve_local_offset();
+    let store = open_report_store()?;
+    let intervals = query_today_intervals(&store, now, offset)?;
+    print_today(&intervals, offset)
+}
+
+fn open_report_store() -> Result<Store, ReportError> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or(ReportError::NoDataHome)?;
+    let db_path = data_home.join("xwindowlog").join("xwindowlog.db");
+    if !db_path.is_file() {
+        return Err(ReportError::MissingDatabase(db_path));
+    }
+    Store::open(&db_path).map_err(ReportError::Store)
+}
+
+fn resolve_local_offset() -> UtcOffset {
+    match UtcOffset::current_local_offset() {
+        Ok(offset) => offset,
+        Err(error) => {
+            eprintln!("xwindowlog: could not determine the local UTC offset ({error}); using UTC");
+            UtcOffset::UTC
+        }
+    }
+}
+
+struct DayBounds {
+    start: WallTs,
+    query_end: WallTs,
+}
+
+fn day_bounds(now: WallTs, offset: UtcOffset) -> Result<DayBounds, ReportError> {
+    let utc_now = OffsetDateTime::from_unix_timestamp(now.as_unix_secs())
+        .map_err(|error| ReportError::Time(error.to_string()))?;
+    let local_date = utc_now.to_offset(offset).date();
+    let next_date = local_date
+        .next_day()
+        .ok_or_else(|| ReportError::Time("local calendar date overflowed".to_string()))?;
+    let start = OffsetDateTime::new_in_offset(local_date, Time::MIDNIGHT, offset).unix_timestamp();
+    let end = OffsetDateTime::new_in_offset(next_date, Time::MIDNIGHT, offset).unix_timestamp();
+    let query_end = now.as_unix_secs().min(end);
+    Ok(DayBounds {
+        start: WallTs::new(start),
+        query_end: WallTs::new(query_end),
+    })
+}
+
+fn query_today_intervals(
+    store: &Store,
+    now: WallTs,
+    offset: UtcOffset,
+) -> Result<Vec<DisplayInterval>, ReportError> {
+    let bounds = day_bounds(now, offset)?;
+    let clipped = store
+        .clipped_intervals(bounds.start, bounds.query_end)
+        .map_err(ReportError::Store)?;
+    store
+        .lookup_display_values(&clipped)
+        .map_err(ReportError::Store)
+}
+
+fn print_today(intervals: &[DisplayInterval], offset: UtcOffset) -> Result<(), ReportError> {
+    if intervals.is_empty() {
+        println!("xwindowlog: no activity today");
+        return Ok(());
+    }
+    for interval in intervals {
+        let start = format_hhmm(interval.start, offset)?;
+        let end = format_hhmm(interval.end, offset)?;
+        println!(
+            "{start}–{end} · {} · {} · {} · {}",
+            interval.app_id,
+            interval.title,
+            interval.state,
+            format_duration(duration_secs(interval.start, interval.end))
+        );
+    }
+    Ok(())
+}
+
+fn run_status() -> ExitCode {
+    match try_run_status() {
+        Ok(()) => ExitStatus::Ok.into(),
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_status() -> Result<(), ReportError> {
+    let config = DaemonConfig::load_default().map_err(ReportError::Config)?;
+    let now = SystemClock.now_wall();
+    let offset = resolve_local_offset();
+    let store = open_report_store()?;
+    // Status deliberately consumes the same clipped read path as today. The
+    // open row below only selects the persisted label/state to display.
+    let intervals = query_today_intervals(&store, now, offset)?;
+    let open = store.open_interval().map_err(ReportError::Store)?;
+    print_status_line(open.as_ref(), &intervals, config.status_show_title)
+}
+
+fn print_status_line(
+    open: Option<&OpenInterval>,
+    intervals: &[DisplayInterval],
+    show_title: bool,
+) -> Result<(), ReportError> {
+    match open {
+        Some(interval) if interval.state == "active" => {
+            let seconds = intervals
+                .iter()
+                .filter(|candidate| {
+                    candidate.state == "active" && candidate.app_id == interval.app_id
+                })
+                .try_fold(0_u64, |total, candidate| {
+                    total
+                        .checked_add(duration_secs(candidate.start, candidate.end))
+                        .ok_or(ReportError::Overflow(
+                            "active duration exceeded the report counter".to_string(),
+                        ))
+                })?;
+            if show_title {
+                println!(
+                    "xwindowlog: {} · {} · {} today",
+                    interval.app_id,
+                    interval.title,
+                    format_duration(seconds)
+                );
+            } else {
+                println!(
+                    "xwindowlog: {} · {} today",
+                    interval.app_id,
+                    format_duration(seconds)
+                );
+            }
+        }
+        Some(interval) => {
+            let seconds = intervals
+                .iter()
+                .filter(|candidate| candidate.state == interval.state)
+                .try_fold(0_u64, |total, candidate| {
+                    total
+                        .checked_add(duration_secs(candidate.start, candidate.end))
+                        .ok_or(ReportError::Overflow(
+                            "non-active duration exceeded the report counter".to_string(),
+                        ))
+                })?;
+            println!(
+                "xwindowlog: {} · {} today",
+                interval.state,
+                format_duration(seconds)
+            );
+        }
+        None => println!("xwindowlog: not tracking · 0m today"),
+    }
+    Ok(())
+}
+
+fn format_hhmm(timestamp: WallTs, offset: UtcOffset) -> Result<String, ReportError> {
+    let utc = OffsetDateTime::from_unix_timestamp(timestamp.as_unix_secs())
+        .map_err(|error| ReportError::Time(error.to_string()))?;
+    let local = utc.to_offset(offset);
+    Ok(format!("{:02}:{:02}", local.hour(), local.minute()))
+}
+
+fn format_duration(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    if hours > 0 {
+        format!("{}h{}m", hours, minutes % 60)
+    } else {
+        format!("{}m", minutes)
+    }
 }
 
 /// The lock-file name inside `$XDG_RUNTIME_DIR` (design §2 D-2 fd table, daemon-lifecycle

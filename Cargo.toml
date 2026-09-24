@@ -61,7 +61,7 @@ regex = "1"
 
 # WallTs / MonoInstant (design.md D-3->clock.rs, rust-systems skill: separate
 # wall time from monotonic time in the type system).
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
 
 # Explicitly NOT a Phase 1 dependency (proposal *In Scope*, design.md §4):
 # no `rmcp`, no `tokio`. Both arrive with the MCP subprocess in a later phase.

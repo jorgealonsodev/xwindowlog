@@ -7,10 +7,11 @@
 //! the RF-66 clipping query, and `prune`/`forget` (design §4 File Changes,
 //! tasks.md Phase 4).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::clock::WallTs;
 
@@ -265,6 +266,32 @@ pub struct ClippedInterval {
     pub end: WallTs,
 }
 
+/// A clipped interval with its already-sanitized dictionary values resolved.
+/// The report layer consumes this read model; it never reaches around the
+/// store boundary to query SQLite directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayInterval {
+    pub id: i64,
+    pub app_id: String,
+    pub title: String,
+    pub pid: Option<i64>,
+    pub state: String,
+    pub start: WallTs,
+    pub end: WallTs,
+}
+
+/// The single interval left open by the daemon's persisted state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenInterval {
+    pub id: i64,
+    pub app_id: String,
+    pub title: String,
+    pub state: String,
+    pub start: WallTs,
+}
+
+pub type Dictionary = HashMap<i64, String>;
+
 impl Store {
     /// RF-66: every interval overlapping `[from, to)`, clipped to that
     /// range. An open interval (`"end" IS NULL`) clips against `to` as if it
@@ -304,6 +331,83 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Resolves the persisted app/title dictionaries for rows returned by
+    /// [`Store::clipped_intervals`]. The values are already sanitized before
+    /// they enter this database; this method only reads and joins them.
+    pub fn lookup_display_values(
+        &self,
+        intervals: &[ClippedInterval],
+    ) -> Result<Vec<DisplayInterval>, StoreError> {
+        let apps = self.dictionary("apps", "app_id")?;
+        let titles = self.dictionary("titles", "title")?;
+        intervals
+            .iter()
+            .map(|interval| {
+                let app_id = apps.get(&interval.app).ok_or_else(|| {
+                    StoreError::InvariantViolated(format!(
+                        "interval {} references missing app dictionary row {}",
+                        interval.id, interval.app
+                    ))
+                })?;
+                let title = titles.get(&interval.title).ok_or_else(|| {
+                    StoreError::InvariantViolated(format!(
+                        "interval {} references missing title dictionary row {}",
+                        interval.id, interval.title
+                    ))
+                })?;
+                Ok(DisplayInterval {
+                    id: interval.id,
+                    app_id: app_id.clone(),
+                    title: title.clone(),
+                    pid: interval.pid,
+                    state: interval.state.clone(),
+                    start: interval.start,
+                    end: interval.end,
+                })
+            })
+            .collect()
+    }
+
+    /// Reads the current state from the persisted store. Reports must use this
+    /// row rather than a live daemon/control-socket query.
+    pub fn open_interval(&self) -> Result<Option<OpenInterval>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT i.id, a.app_id, t.title, i.state, i.start \
+                 FROM intervals i \
+                 JOIN apps a ON a.id = i.app \
+                 JOIN titles t ON t.id = i.title \
+                 WHERE i.\"end\" IS NULL \
+                 ORDER BY i.start DESC, i.id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(OpenInterval {
+                        id: row.get(0)?,
+                        app_id: row.get(1)?,
+                        title: row.get(2)?,
+                        state: row.get(3)?,
+                        start: WallTs(row.get(4)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn dictionary(
+        &self,
+        table: &'static str,
+        column: &'static str,
+    ) -> Result<Dictionary, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT id, {column} FROM {table}"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Dictionary>>()?;
         Ok(rows)
     }
 }
