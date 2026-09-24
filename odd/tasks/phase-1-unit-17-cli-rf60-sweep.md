@@ -89,8 +89,8 @@ cargo fmt -- --check
 
 ## Progress
 
-- Status: the focused real-binary contract is green; all listed Cargo checks
-  passed. Commit and final delivery closure remain.
+- Status: behavior, tests, and this ledger landed in the work-unit commit;
+  only documentation closure of its exact hash remains.
 - Engram mirror: pending — `mem_save` could not confirm session registration;
   no authoritative session ID was available to provide, so the mirror was not
   confirmed.
@@ -113,9 +113,10 @@ cargo fmt -- --check
 - **Runtime harness:** the compiled binary is exercised by `cli_control` (26
   passed) and the two required daemon E2E scenarios (1 passed each); no
   separate manual runtime command was needed.
-- **Work-unit commit identity:** pending. The content-addressed behavior commit
-  cannot include its own hash, so the exact hash will be recorded in a
-  documentation-only closure commit after the behavior commit is created.
+- **Work-unit commit identity:** `8af56539d180c65f29ea7796dcfcf526a07788c9`
+  (`fix(cli): map usage errors to RF-60 failure`). This ledger update is a
+  documentation-only closure commit: Git determines a commit hash from its
+  content, so the behavior commit could not contain its own exact hash.
 - Rollback boundary: revert this ledger and the associated CLI usage test; if
   the RED proves a parser change is necessary, revert the `main.rs` parser
   error handling with them. No unrelated behavior depends on this slice.
