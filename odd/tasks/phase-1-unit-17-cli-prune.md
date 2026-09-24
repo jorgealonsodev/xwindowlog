@@ -115,8 +115,8 @@ cargo fmt -- --check
 
 ## Progress
 
-- Status: implemented; delivery closure pending.
-- Work-unit commit: pending until the coherent implementation commit is created.
+- Status: implemented and delivered.
+- Work-unit commit: `bfec3bb feat(cli): wire prune retention command`.
 - Changed files: `src/main.rs`, `tests/cli_control.rs`, and this ledger.
 - GREEN evidence: `cargo test --test cli_control -- prune` reported 7 passed,
   7 filtered out.
@@ -124,9 +124,17 @@ cargo fmt -- --check
   170 filtered out; `cargo test --all-targets` reported 320 passed across 11
   suites; `cargo clippy --all-targets -- -D warnings` reported no issues; and
   `cargo fmt -- --check` passed after formatting the implementation.
+- Outcome evidence: the existing store tests cover the typed exhausted-VACUUM
+  outcome and exact actionable diagnostic; the real-binary CLI tests cover the
+  success, invalid-input, missing-database, configured-zero, and vacuum-only
+  stream/exit paths without introducing a slow process-level lock fixture.
 - Important boundary: the implementation does not change `src/store.rs`, WAL
   checkpoint semantics, the daemon, `forget`, completions, man pages, the
   final help/exit sweep, systemd, or any remote/delivery operation.
-- Native risk assessment: pending until the implementation commit exists.
-- Next step: create the single coherent work-unit commit, then record its exact
-  identity and close this ledger without expanding scope.
+- Native risk assessment: medium executable CLI change; the committed diff is
+  537 lines including the 132-line task ledger, with the behavior/test slice
+  just over the 400-line review budget. The overage is a single cohesive
+  destructive-command boundary and is recorded as a size exception; no
+  separate behavior slice would leave a complete prune work unit.
+- Next step: none within this authorized work unit; do not expand into the
+  explicitly excluded follow-ups or remote operations.
