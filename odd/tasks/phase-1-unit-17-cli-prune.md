@@ -136,5 +136,11 @@ cargo fmt -- --check
   just over the 400-line review budget. The overage is a single cohesive
   destructive-command boundary and is recorded as a size exception; no
   separate behavior slice would leave a complete prune work unit.
+- Native review: lineage `review-8679b934f8ace8d2` approved and acknowledged;
+  no correction was required. One non-blocking suggestion remains:
+  `src/main.rs:238` lacks a real-binary exhausted-VACUUM fixture, while the
+  existing store tests cover the typed outcome and exact diagnostic.
+- Parent spot-check: `cargo test --test cli_control -- prune` reported 7
+  passed and 7 filtered out after review acknowledgement.
 - Next step: none within this authorized work unit; do not expand into the
   explicitly excluded follow-ups or remote operations.
