@@ -22,8 +22,10 @@ merge, or open a PR.
 - Two `gentle-ai-explore` attempts failed before child tool calls. A first
   writer launch was aborted while the conversation was interrupted; a later
   bounded writer completed Unit 1, and independent verification found and
-  cleared a formatting blocker. Use the available package roles for later
-  bounded tasks and report any runtime fallback.
+  cleared a formatting blocker. Native four-lens review was approved and
+  acknowledged; all advisory findings were explicitly non-blocking.
+- Current work-unit commit: `d7396566d3a557ddbe4159a34cc4c77e647fd119`
+  (`feat(cli): generate man page at build time`).
 
 ## Rules
 
@@ -88,9 +90,9 @@ merge, or open a PR.
 ## Progress and evidence
 
 | Unit | Status | RED/GREEN, checks, evidence, commit |
-|---|---|---|
-| 1. Completions/man page | verified; commit/review pending | Existing real-binary completions passed; added build-time man-page generation. RED: `cargo test --test completions` (3 passed, man-page assertion failed because `XWINDOWLOG_MANPAGE` was unset). GREEN: 4 passed. Shell syntax smoke checks passed for bash/zsh/fish; all three shells were installed. Independent checks: `cargo build`, `cargo fmt -- --check`, and `git diff --check` passed. Changed: `Cargo.toml`, `build.rs`, `tests/completions.rs`; `Cargo.lock` unchanged. Follow-up risk: build.rs mirrors CLI definition. |
-| 2. Help/exit map | pending | |
+| --- | --- | --- |
+| 1. Completions/man page | done | Existing real-binary completions passed; added build-time man-page generation. RED: `cargo test --test completions` (3 passed, man-page assertion failed because `XWINDOWLOG_MANPAGE` was unset). GREEN and rerun: 4 passed. Shell syntax smoke checks passed for bash/zsh/fish; all three shells were installed. Independent checks: `cargo build`, `cargo fmt -- --check`, `git diff --check` passed. `gentle_review` lineage `review-9aa95f687657d800` approved and acknowledged; no blockers. Advisory only: build.rs mirrors CLI definition; syntax-skip branch is retained for systems without each shell. `gentle_review assess` on the committed range returned high risk (`process_boundary`, Cargo shell process); because native review closed, its plan accepted writer self-verification without a separate verifier. Work-unit commit: `d7396566d3a557ddbe4159a34cc4c77e647fd119`. |
+| 2. Help/exit map | in progress | Reconcile all subcommand help and RF-60 mapping before adding any behavior. |
 | 3. VACUUM truncation reporting | pending | |
 | 4. Systemd packaging | pending | |
 | 5. Runtime network-FD check | pending | |
