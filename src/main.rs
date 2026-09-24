@@ -119,6 +119,7 @@ fn main() -> ExitCode {
         Command::Status { json: false } => run_status(),
         Command::Status { json: true } => run_status_json(),
         Command::Pause { minutes: None } => run_pause(),
+        Command::Resume => run_resume(),
         _ => not_yet_implemented(),
     }
 }
@@ -152,6 +153,42 @@ fn run_pause() -> ExitCode {
     let socket_path = control::socket_path(&runtime_dir);
 
     match control::send_pause(&socket_path, None) {
+        Ok(control::Response::Ok { state, .. }) => {
+            println!("xwindowlog: {state}");
+            ExitStatus::Ok.into()
+        }
+        Ok(control::Response::Err {
+            error: response_error,
+            message,
+            ..
+        }) => {
+            eprintln!("xwindowlog: {message}");
+            let status = match response_error {
+                control::ErrCode::AlreadyPaused | control::ErrCode::NotPaused => ExitStatus::State,
+                control::ErrCode::UnsupportedVersion
+                | control::ErrCode::Malformed
+                | control::ErrCode::Internal => ExitStatus::Failure,
+            };
+            status.into()
+        }
+        Err(error) => {
+            eprintln!("xwindowlog: daemon is not running: {error}");
+            ExitStatus::Environment.into()
+        }
+    }
+}
+
+fn run_resume() -> ExitCode {
+    let runtime_dir = match runtime_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{}", error.message());
+            return error.exit_status().into();
+        }
+    };
+    let socket_path = control::socket_path(&runtime_dir);
+
+    match control::send_resume(&socket_path) {
         Ok(control::Response::Ok { state, .. }) => {
             println!("xwindowlog: {state}");
             ExitStatus::Ok.into()

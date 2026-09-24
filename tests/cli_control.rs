@@ -1,4 +1,4 @@
-//! Real-binary coverage for the Phase 17 `pause` CLI control path.
+//! Real-binary coverage for the Phase 17 `pause`/`resume` CLI control paths.
 //!
 //! The test runs a compiled daemon against an isolated Xvfb and asks the
 //! compiled CLI to pause it. SQLite is queried read-only afterwards so the
@@ -349,6 +349,20 @@ fn active_interval_is_closed(db_path: &Path) -> rusqlite::Result<bool> {
     Ok(end.is_some())
 }
 
+fn paused_interval_is_closed(db_path: &Path) -> rusqlite::Result<bool> {
+    let connection = rusqlite::Connection::open(db_path)?;
+    let end: Option<i64> = connection.query_row(
+        "SELECT intervals.\"end\" \
+         FROM intervals \
+         WHERE intervals.state = 'paused' \
+         ORDER BY intervals.start DESC, intervals.id DESC \
+         LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(end.is_some())
+}
+
 fn activate_window_until_observed(scratch: &Scratch, wm: &FakeWm, timeout: Duration) -> Window {
     let window = wm.prepare_window();
     let deadline = Instant::now() + timeout;
@@ -380,6 +394,18 @@ fn run_pause(scratch: &Scratch) -> Output {
         .expect("run the compiled xwindowlog pause command")
 }
 
+fn run_resume(scratch: &Scratch) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+        .arg("resume")
+        .env("XDG_RUNTIME_DIR", scratch.runtime_dir())
+        .env("XDG_CONFIG_HOME", scratch.config_home())
+        .env("XDG_DATA_HOME", scratch.data_home())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the compiled xwindowlog resume command")
+}
+
 fn wait_for_paused_interval(scratch: &Scratch, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -396,6 +422,27 @@ fn wait_for_paused_interval(scratch: &Scratch, timeout: Duration) {
         assert!(
             Instant::now() < deadline,
             "the daemon did not record an open paused interval within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_resumed_interval(scratch: &Scratch, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(row) = most_recent_interval(&scratch.database_path()) {
+            if row.state == "unknown" && row.end.is_none() {
+                assert!(
+                    paused_interval_is_closed(&scratch.database_path())
+                        .expect("read paused interval state"),
+                    "resume must close the open paused interval before opening unknown"
+                );
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not record an open unknown interval within {timeout:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -426,4 +473,40 @@ fn pause_cli_reaches_running_daemon_and_opens_a_paused_interval() {
     );
 
     wait_for_paused_interval(&scratch, Duration::from_secs(5));
+}
+
+#[test]
+fn resume_cli_reaches_running_daemon_and_closes_a_paused_interval() {
+    let scratch = Scratch::new("resume-dispatch");
+    let xvfb = spawn_xvfb();
+    let wm = FakeWm::connect(xvfb.display());
+    wm.declare_ewmh_supported();
+
+    let _daemon = spawn_daemon(&scratch, &xvfb);
+    wait_for_file(&scratch.lock_path(), Duration::from_secs(5));
+    activate_window_until_observed(&scratch, &wm, Duration::from_secs(10));
+
+    let pause_output = run_pause(&scratch);
+    assert!(
+        pause_output.status.success(),
+        "pause setup should succeed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&pause_output.stdout),
+        String::from_utf8_lossy(&pause_output.stderr)
+    );
+    wait_for_paused_interval(&scratch, Duration::from_secs(5));
+
+    let output = run_resume(&scratch);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "resume should succeed against a paused running daemon; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert_eq!(stdout, "xwindowlog: active\n");
+    assert!(
+        stderr.is_empty(),
+        "successful resume should keep diagnostics off stdout and emit no stderr: {stderr:?}"
+    );
+
+    wait_for_resumed_interval(&scratch, Duration::from_secs(5));
 }
