@@ -38,12 +38,26 @@ Out of scope: `status --json`/`today --json` (tasks 16.7–16.8), project persis
 ## Tasks
 
 - [x] U16.1 RED — `cargo test --test cli_status_today` compiled the real-binary assertion and failed against the placeholder with `stderr="xwindowlog: this subcommand's behavior lands in Phase 16/17\\n"` (1 failed).
+      Evidence: `cargo test --test cli_status_today` → 1 failed against the placeholder; stderr was the Phase 16/17 placeholder message.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.2 GREEN — `cargo test --test cli_status_today` passed (1 test). Plain `today` now opens the existing database, resolves one local offset with UTC fallback, queries `Store::clipped_intervals`, and renders persisted dictionary values.
+      Evidence: `cargo test --test cli_status_today` → 1 passed; `today` used persisted intervals and one resolved local offset with UTC fallback.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.3 RED — the added real-binary title test compiled; `cargo test --test cli_status_today` observed 1 passed (`today`) and 1 failed because `status` still emitted the Phase 16/17 placeholder (exit failure, empty stdout).
+      Evidence: `cargo test --test cli_status_today` → 1 passed and 1 failed; `status` still emitted the placeholder with empty stdout.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.4 GREEN — `cargo test --test cli_status_today` passed (2 tests). `status` now reads `status_show_title` through the existing config loader, selects the persisted open row, and never queries X11 or the control socket.
+      Evidence: `cargo test --test cli_status_today` → 2 passed; `status` reads configuration and persisted state without X11 or control-socket access.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.5 RED — `cargo test --test cli_status_today` observed 2 passed and 2 failed: the active fixture produced only `"xwindowlog: editor\\n"` instead of the app/time/`today` shape, and the paused fixture also rendered `editor` without `paused`.
+      Evidence: `cargo test --test cli_status_today` → 2 passed and 2 failed; active output lacked duration/today and paused output lacked `paused`.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.6 GREEN — `cargo test --test cli_status_today` passed (4 tests). The formatter emits one `xwindowlog: app · duration today` line, optionally includes the persisted title, and renders persisted `paused`/other non-active states instead of an app name.
+      Evidence: `cargo test --test cli_status_today` → 4 passed; formatter emitted the app/duration/today shape and visible non-active states.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 - [x] U16.9 REFACTOR — `cargo test --test cli_status_today` passed (5 tests), including a source-level guard proving exactly one report-layer `clipped_intervals` call site and two consumers of `query_today_intervals`.
+      Evidence: `cargo test --test cli_status_today` → 5 passed; source guard confirmed one report-layer `clipped_intervals` call site and two `query_today_intervals` consumers.
+      Commit: `ac5d003` (`feat(cli): add status and today reports`)
 
 Mutation evidence for the store-only/shared-query claims:
 
@@ -78,7 +92,7 @@ cargo fmt -- --check
 - Verification evidence: focused CLI test is GREEN with six real-binary/store-only tests plus the shared-query guard; both targeted mutations failed as expected and were reverted.
 - Required checks (final run): `cargo test --test cli_status_today` — 7 passed; `cargo test --lib store::tests::clipped_intervals` — 3 passed, 190 filtered; `cargo build` — passed; `cargo clippy --all-targets -- -D warnings` — passed; `cargo test --all-targets` — 297 passed across 10 suites; `cargo fmt -- --check` — passed.
 - Formatting note: the first format check exposed only formatting in the new code; `cargo fmt` was run, and the final format check passed.
-- Work-unit commit: `feat(cli): add status and today reports` (final hash is reported in delivery).
+- Work-unit commit: `ac5d0038f15aa419186f34f9a70204d67d55d962` — `feat(cli): add status and today reports`.
 
 ## Next step
 
