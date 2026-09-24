@@ -48,7 +48,6 @@ signal-hook = "0.3"
 # CLI surface (PRD.md §13 main.rs subcommands).
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
 
 # Config and wire protocol (design.md §5 control.rs Request/Response/Envelope;
 # contrib/config.example.toml).
@@ -65,6 +64,12 @@ time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
 
 # Explicitly NOT a Phase 1 dependency (proposal *In Scope*, design.md §4):
 # no `rmcp`, no `tokio`. Both arrive with the MCP subprocess in a later phase.
+
+[build-dependencies]
+# The build script mirrors the CLI definition so clap_mangen can render the manual at build time.
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 
 [dev-dependencies]
 # Compile-fail proof for RF-28: no `From` conversion exists between `WallTs`
