@@ -38,7 +38,11 @@ Applicable checks are structural, listed under Acceptance criteria.
 
 ## Tasks
 - [x] T1 — Translate lines 1–143: title, §1 Summary .. §10 User stories
+      Evidence: Current prose-only scan of lines 1–143 after removing inline code literals found 0 accented-character matches and 0 Spanish-identifier matches; the current ledger records 13 headings in the span.
+      Commit: `f5cdc80` (translation); current evidence wording is recorded in `75ff044`.
 - [x] T2 — Translate lines 144–313: §11.1 Capture .. §11.3 Storage
+      Evidence: Current raw scan found four accented `ó` characters, all inside preserved RF-48 regex/code literals; the prose-only scan after removing inline code literals found 0 accented-character matches and 0 Spanish-identifier matches across 5 headings.
+      Commit: `f5cdc80` (translation); current evidence wording is recorded in `75ff044`.
 - [x] T3 — Translate lines 314–447: interval clipping, §11.4 MCP, §11.5 CLI,
       §11.6 Service, §12 NFRs, token budget
 - [x] T4 — Translate lines 448–598: §13 Architecture, §14 Privacy and threat
@@ -48,6 +52,8 @@ Applicable checks are structural, listed under Acceptance criteria.
 - [x] T6 — Apply D-1: RF-15 tool names to English `snake_case` with English
       descriptions; mark D-1 resolved in §20 with the decision and its date
 - [x] T7 — Verify: heading count, identifier inventory, no Spanish residue
+      Evidence: Current structural checks found 56 headings with nesting identical to `f5cdc80^`, complete RF-1..RF-66/RNF-1..RNF-13 inventories with no missing or dangling references, and D-1 resolved.
+      Commit: `7bc22e6` (current ledger evidence); wording correction is recorded in `75ff044`.
 
 ## Acceptance criteria
 - `PRD.md` contains no Spanish prose.
