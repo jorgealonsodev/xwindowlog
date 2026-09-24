@@ -29,7 +29,7 @@ use xwindowlog::reactor::ReactorSource;
 use xwindowlog::signals::SelfPipe;
 use xwindowlog::store::{
     vacuum_exhausted_message, DeletionOutcome, DisplayInterval, IntervalStore as _, OpenInterval,
-    Store, StoreError, VacuumOutcome, VACUUM_EXHAUSTED_EXIT_CODE,
+    Store, StoreError, VacuumOutcome,
 };
 use xwindowlog::tracker::{SourceEvent, Timer, WindowSource as _};
 use xwindowlog::x11::{X11InitError, X11Source};
@@ -96,9 +96,8 @@ enum Command {
     Completions { shell: clap_complete::Shell },
 }
 
-/// RF-60's exit-code contract: `0` success, `1` generic failure, `2` state error (a second
-/// instance, an already-paused daemon, ...), `3` environment error (unreachable X11, an
-/// unusable config, a corrupted database).
+/// RF-60's exit-code contract: `0` success, `1` generic failure, `2` state error, and `3`
+/// environment error. Keep command/situation assignments in `rf60_exit_status` below.
 #[repr(u8)]
 enum ExitStatus {
     Ok = 0,
@@ -107,10 +106,98 @@ enum ExitStatus {
     Environment = 3,
 }
 
+#[derive(Clone, Copy)]
+enum ExitCommand {
+    TopLevel,
+    Daemon,
+    Status,
+    Today,
+    Pause,
+    Resume,
+    Prune,
+    Forget,
+    Completions,
+}
+
+enum ExitSituation<'a> {
+    Success,
+    Usage,
+    Startup(&'a StartupError),
+    Control(&'a control::ErrCode),
+    DaemonUnavailable,
+    Report(&'a ReportError),
+    VacuumExhausted,
+}
+
 impl From<ExitStatus> for ExitCode {
     fn from(status: ExitStatus) -> Self {
         ExitCode::from(status as u8)
     }
+}
+
+/// The single RF-60 situation-to-status mapping. Domain errors stay descriptive; this table
+/// assigns their process status in the context of the command that produced them.
+fn rf60_exit_status(command: ExitCommand, situation: ExitSituation<'_>) -> ExitStatus {
+    use ExitCommand::{Daemon, Forget, Pause, Prune, Resume, Status, Today, TopLevel};
+    use ExitSituation::{
+        Control, DaemonUnavailable, Report, Startup, Success, Usage, VacuumExhausted,
+    };
+
+    match (command, situation) {
+        (_, Success) => ExitStatus::Ok,
+        (TopLevel, Usage) => ExitStatus::Failure,
+        (Daemon, Startup(StartupError::AlreadyRunning)) => ExitStatus::State,
+        (Daemon, Startup(_)) | (Pause, Startup(_)) | (Resume, Startup(_)) => {
+            ExitStatus::Environment
+        }
+        (
+            Pause | Resume,
+            Control(control::ErrCode::AlreadyPaused | control::ErrCode::NotPaused),
+        ) => ExitStatus::State,
+        (
+            Pause | Resume,
+            Control(
+                control::ErrCode::UnsupportedVersion
+                | control::ErrCode::Malformed
+                | control::ErrCode::Internal,
+            ),
+        ) => ExitStatus::Failure,
+        (Pause | Resume, DaemonUnavailable) => ExitStatus::Environment,
+        (
+            Status | Today | Prune | Forget,
+            Report(
+                ReportError::Config(_)
+                | ReportError::NoDataHome
+                | ReportError::Time(_)
+                | ReportError::Overflow(_),
+            ),
+        ) => ExitStatus::Environment,
+        (Status | Today | Prune | Forget, Report(ReportError::MissingDatabase(_))) => {
+            ExitStatus::State
+        }
+        (
+            Status | Today | Prune | Forget,
+            Report(ReportError::Store(StoreError::InvariantViolated(_))),
+        ) => ExitStatus::Environment,
+        (
+            Status | Today | Prune | Forget,
+            Report(ReportError::Store(StoreError::NewerSchema { .. })),
+        ) => ExitStatus::State,
+        (
+            Status | Today | Prune | Forget,
+            Report(
+                ReportError::Store(StoreError::Sqlite(_) | StoreError::Io(_))
+                | ReportError::Usage(_)
+                | ReportError::Json(_),
+            ),
+        ) => ExitStatus::Failure,
+        (Prune | Forget, VacuumExhausted) => ExitStatus::State,
+        _ => ExitStatus::Failure,
+    }
+}
+
+fn rf60_exit_code(command: ExitCommand, situation: ExitSituation<'_>) -> ExitCode {
+    rf60_exit_status(command, situation).into()
 }
 
 fn main() -> ExitCode {
@@ -248,14 +335,14 @@ fn run_prune(older_than: Option<String>, vacuum_only: bool) -> ExitCode {
             println!("xwindowlog: retention pruning is disabled (retention_days = 0)");
             ExitStatus::Ok.into()
         }
-        Ok(PruneResult::Pruned(outcome)) => report_deletion_outcome(outcome),
+        Ok(PruneResult::Pruned(outcome)) => report_deletion_outcome(ExitCommand::Prune, outcome),
         Ok(PruneResult::VacuumOnly(VacuumOutcome::Vacuumed)) => {
             println!("xwindowlog: database vacuumed");
             ExitStatus::Ok.into()
         }
         Ok(PruneResult::VacuumOnly(VacuumOutcome::Exhausted)) => {
             eprintln!("{}", vacuum_exhausted_message(0));
-            vacuum_exhausted_exit_code()
+            rf60_exit_code(ExitCommand::Prune, ExitSituation::VacuumExhausted)
         }
         Err(error) => {
             eprintln!("{}", error.message());
@@ -365,7 +452,7 @@ fn run_forget(
 ) -> ExitCode {
     match try_run_forget(from.as_deref(), to.as_deref(), window, yes) {
         Ok(ForgetResult::Cancelled) => ExitStatus::Ok.into(),
-        Ok(ForgetResult::Deleted(outcome)) => report_deletion_outcome(outcome),
+        Ok(ForgetResult::Deleted(outcome)) => report_deletion_outcome(ExitCommand::Forget, outcome),
         Err(error) => {
             eprintln!("{}", error.message());
             error.exit_status().into()
@@ -470,7 +557,7 @@ fn confirm_forget(selector: ForgetSelector) -> bool {
     confirmed
 }
 
-fn report_deletion_outcome(outcome: DeletionOutcome) -> ExitCode {
+fn report_deletion_outcome(command: ExitCommand, outcome: DeletionOutcome) -> ExitCode {
     match outcome.vacuum {
         VacuumOutcome::Vacuumed => {
             println!(
@@ -481,16 +568,8 @@ fn report_deletion_outcome(outcome: DeletionOutcome) -> ExitCode {
         }
         VacuumOutcome::Exhausted => {
             eprintln!("{}", vacuum_exhausted_message(outcome.deleted_intervals));
-            vacuum_exhausted_exit_code()
+            rf60_exit_code(command, ExitSituation::VacuumExhausted)
         }
-    }
-}
-
-fn vacuum_exhausted_exit_code() -> ExitCode {
-    match VACUUM_EXHAUSTED_EXIT_CODE {
-        2 => ExitStatus::State.into(),
-        3 => ExitStatus::Environment.into(),
-        _ => ExitStatus::Failure.into(),
     }
 }
 

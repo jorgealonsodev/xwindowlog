@@ -1335,6 +1335,39 @@ fn cli_usage_errors_exit_one() {
 }
 
 #[test]
+fn each_phase_one_subcommand_displays_its_own_help() {
+    for subcommand in [
+        "daemon",
+        "status",
+        "today",
+        "pause",
+        "resume",
+        "prune",
+        "forget",
+        "completions",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
+            .args([subcommand, "--help"])
+            .output()
+            .expect("run the compiled xwindowlog subcommand help");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_usage = format!("Usage: xwindowlog {subcommand}");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{subcommand} --help should succeed; stdout={stdout:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&expected_usage),
+            "{subcommand} --help should describe its own usage {expected_usage:?}, got {stdout:?}"
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn cli_help_and_version_exit_zero_on_stdout() {
     for argument in ["--help", "--version"] {
         let output = Command::new(env!("CARGO_BIN_EXE_xwindowlog"))
