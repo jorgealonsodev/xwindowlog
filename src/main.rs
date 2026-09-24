@@ -118,6 +118,7 @@ fn main() -> ExitCode {
         Command::Today { json: true } => run_today_json(),
         Command::Status { json: false } => run_status(),
         Command::Status { json: true } => run_status_json(),
+        Command::Pause { minutes: None } => run_pause(),
         _ => not_yet_implemented(),
     }
 }
@@ -138,6 +139,42 @@ fn print_completions(shell: clap_complete::Shell) -> ExitCode {
         &mut std::io::stdout(),
     );
     ExitStatus::Ok.into()
+}
+
+fn run_pause() -> ExitCode {
+    let runtime_dir = match runtime_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{}", error.message());
+            return error.exit_status().into();
+        }
+    };
+    let socket_path = control::socket_path(&runtime_dir);
+
+    match control::send_pause(&socket_path, None) {
+        Ok(control::Response::Ok { state, .. }) => {
+            println!("xwindowlog: {state}");
+            ExitStatus::Ok.into()
+        }
+        Ok(control::Response::Err {
+            error: response_error,
+            message,
+            ..
+        }) => {
+            eprintln!("xwindowlog: {message}");
+            let status = match response_error {
+                control::ErrCode::AlreadyPaused | control::ErrCode::NotPaused => ExitStatus::State,
+                control::ErrCode::UnsupportedVersion
+                | control::ErrCode::Malformed
+                | control::ErrCode::Internal => ExitStatus::Failure,
+            };
+            status.into()
+        }
+        Err(error) => {
+            eprintln!("xwindowlog: daemon is not running: {error}");
+            ExitStatus::Environment.into()
+        }
+    }
 }
 
 #[derive(Debug)]
