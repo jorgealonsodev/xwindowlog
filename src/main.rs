@@ -404,13 +404,18 @@ fn parse_forget_selector(
 }
 
 fn parse_forget_timestamp(name: &str, raw: &str) -> Result<WallTs, ReportError> {
-    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
-        .map(|timestamp| WallTs::new(timestamp.unix_timestamp()))
+    let timestamp = OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
         .map_err(|error| {
             ReportError::Usage(format!(
                 "invalid {name} timestamp '{raw}': expected an RFC3339/ISO 8601 timestamp ({error})"
             ))
-        })
+        })?;
+    if timestamp.nanosecond() != 0 {
+        return Err(ReportError::Usage(format!(
+            "invalid {name} timestamp '{raw}': use whole-second precision"
+        )));
+    }
+    Ok(WallTs::new(timestamp.unix_timestamp()))
 }
 
 fn confirm_forget(selector: ForgetSelector) -> bool {

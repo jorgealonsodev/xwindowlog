@@ -48,8 +48,9 @@ vacuum exhaustion without duplicating SQL or changing Store semantics.
       vacuum-exhausted behavior.
 - [x] Require exactly one selector: paired `--from` and `--to`, or
       `--window <id>`; reject mixed, incomplete, or absent selectors.
-- [x] Parse full RFC3339/ISO timestamps into `WallTs`; reject malformed,
-      equal, and reversed ranges before opening or mutating the database.
+- [x] Parse whole-second RFC3339/ISO timestamps into `WallTs`; reject
+      non-zero fractions, malformed, equal, and reversed ranges before store
+      access or mutation.
 - [x] Require confirmation for both selector forms unless `--yes` is present;
       cancellation must perform no destructive Store call.
 - [x] Cover range and window deletion, selector validation, confirmation,
@@ -117,6 +118,16 @@ Recorded results:
 - `cargo test --all-targets` — `328 passed` across 11 suites.
 - `cargo clippy --all-targets -- -D warnings` — no issues found.
 - `cargo fmt -- --check` — passed with no diff.
+
+### Native-review correction — R3-fractional-forget-boundary
+
+`--from` and `--to` reject non-zero fractional nanoseconds with a usage
+diagnostic before store access; whole-second timestamps remain supported. The
+real-binary regression was RED against the pre-fix binary (status `Some(0)`,
+expected `Some(1)`), then GREEN:
+`cargo test --test cli_control -- forget` — `9 passed, 14 filtered out`; seeded
+target and survivor rows remain. `cargo fmt -- --check` and `git diff --check`
+passed.
 
 ## Changed files
 

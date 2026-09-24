@@ -1120,6 +1120,30 @@ fn forget_cli_rejects_malformed_equal_and_reversed_ranges_before_opening_databas
 }
 
 #[test]
+fn forget_cli_rejects_fractional_seconds_without_mutating_database() {
+    let scratch = Scratch::new("forget-fractional-seconds");
+    seed_forget_database(&scratch);
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1970-01-01T00:16:40.500Z",
+            "--to",
+            "1970-01-01T00:18:20.500Z",
+            "--yes",
+        ],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("whole-second"));
+    let db_path = scratch.database_path();
+    assert_eq!(interval_count_for_app(&db_path, "forget-target"), 1);
+    assert_eq!(interval_count_for_app(&db_path, "forget-survivor"), 1);
+}
+
+#[test]
 fn forget_cli_range_requires_confirmation_and_negative_input_does_not_mutate() {
     let scratch = Scratch::new("forget-negative");
     seed_forget_database(&scratch);
