@@ -103,5 +103,8 @@ cargo fmt -- --check
   passed, `cargo test --all-targets` (304 passed),
   `cargo clippy --all-targets -- -D warnings` passed, and
   `cargo fmt -- --check` passed.
-- Next step: complete native review and delivery of this coherent resume
-  slice; begin pause expiry as a separate work unit afterward.
+- Native risk assessment: medium executable change; `review_due=false` with
+  reason `under_budget` for the committed-only slice from `f43e47a`.
+- Parent spot-check: `cargo test --test cli_control` passed after assessment.
+- Next step: deliver this coherent resume slice; begin pause expiry as a
+  separate work unit afterward.
