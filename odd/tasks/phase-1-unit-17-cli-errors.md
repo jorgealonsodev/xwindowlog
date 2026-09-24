@@ -132,5 +132,8 @@ cargo fmt -- --check
 - `src/main.rs` required no code change: the existing RF-60 state mappings,
   no-daemon diagnostic, and exit-code 3 environment policy were verified by
   the real-binary tests.
+- Native risk assessment: medium executable change, 284 changed lines, and
+  `review_due=false` with reason `under_budget` for the committed-only slice
+  from `23b10cd`; the reviewed boundary advanced without a review transaction.
 - Next step: none within this authorized work unit; do not expand into the
   explicitly excluded follow-ups or remote operations.
