@@ -15,6 +15,8 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+use xwindowlog::clock::{Clock, SystemClock, WallTs};
+use xwindowlog::store::{IntervalState, IntervalStore, NewInterval, Store};
 
 const DISPLAY_BASE: u32 = 413;
 static NEXT_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
@@ -55,6 +57,12 @@ impl Scratch {
 
     fn database_path(&self) -> PathBuf {
         self.data_home().join("xwindowlog").join("xwindowlog.db")
+    }
+
+    fn write_config(&self, contents: &str) {
+        let config_dir = self.config_home().join("xwindowlog");
+        std::fs::create_dir_all(&config_dir).expect("create xwindowlog config directory");
+        std::fs::write(config_dir.join("config.toml"), contents).expect("write xwindowlog config");
     }
 }
 
@@ -418,6 +426,95 @@ fn run_resume(scratch: &Scratch) -> Output {
         .expect("run the compiled xwindowlog resume command")
 }
 
+fn run_prune(scratch: &Scratch, older_than: Option<&str>, vacuum_only: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xwindowlog"));
+    command
+        .arg("prune")
+        .env("XDG_RUNTIME_DIR", scratch.runtime_dir())
+        .env("XDG_CONFIG_HOME", scratch.config_home())
+        .env("XDG_DATA_HOME", scratch.data_home())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    if let Some(older_than) = older_than {
+        command.args(["--older-than", older_than]);
+    }
+    if vacuum_only {
+        command.arg("--vacuum-only");
+    }
+    command
+        .output()
+        .expect("run the compiled xwindowlog prune command")
+}
+
+fn interval(app: &str, title: &str) -> NewInterval {
+    NewInterval {
+        app: app.to_string(),
+        title: title.to_string(),
+        pid: None,
+        state: IntervalState::Active,
+    }
+}
+
+fn seed_prune_database(scratch: &Scratch, old_age_days: i64) {
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    let now = SystemClock.now_wall().as_unix_secs();
+    let old_age = old_age_days
+        .checked_mul(SECONDS_PER_DAY)
+        .expect("test fixture age must fit in seconds");
+    let old_start = now
+        .checked_sub(old_age)
+        .expect("test fixture timestamp must fit in i64");
+    let old_end = old_start
+        .checked_add(60 * 60)
+        .expect("test fixture timestamp must fit in i64");
+    let recent_start = now
+        .checked_sub(SECONDS_PER_DAY)
+        .expect("test fixture timestamp must fit in i64");
+    let recent_end = now
+        .checked_sub(12 * 60 * 60)
+        .expect("test fixture timestamp must fit in i64");
+
+    let mut store = Store::open(&scratch.database_path()).expect("open prune fixture database");
+    store
+        .open_only(WallTs::new(old_start), interval("old-app", "old title"))
+        .expect("open old fixture interval");
+    store
+        .close_only(WallTs::new(old_end))
+        .expect("close old fixture interval");
+    store
+        .open_only(
+            WallTs::new(recent_start),
+            interval("recent-app", "recent title"),
+        )
+        .expect("open recent fixture interval");
+    store
+        .transition(WallTs::new(recent_end), interval("open-app", "open title"))
+        .expect("open live fixture interval");
+}
+
+fn interval_count_for_app(db_path: &Path, app: &str) -> i64 {
+    let connection = rusqlite::Connection::open(db_path).expect("open prune fixture for reading");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM intervals JOIN apps ON apps.id = intervals.app WHERE apps.app_id = ?1",
+            [app],
+            |row| row.get(0),
+        )
+        .expect("count fixture intervals")
+}
+
+fn open_interval_count(db_path: &Path) -> i64 {
+    let connection = rusqlite::Connection::open(db_path).expect("open prune fixture for reading");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM intervals WHERE \"end\" IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count open fixture intervals")
+}
+
 fn wait_for_paused_interval(scratch: &Scratch, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -651,4 +748,167 @@ fn resume_cli_without_daemon_reports_environment_error() {
         String::from_utf8_lossy(&output.stderr),
         "xwindowlog: daemon is not running: No such file or directory (os error 2)\n"
     );
+}
+
+#[test]
+fn prune_cli_explicit_retention_deletes_old_closed_intervals_and_preserves_open() {
+    let scratch = Scratch::new("prune-explicit");
+    seed_prune_database(&scratch, 200);
+
+    let output = run_prune(&scratch, Some("180d"), false);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful prune should not emit diagnostics: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "old-app"),
+        0
+    );
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "recent-app"),
+        1
+    );
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "open-app"),
+        1
+    );
+    assert_eq!(open_interval_count(&scratch.database_path()), 1);
+}
+
+#[test]
+fn prune_cli_uses_configured_retention_when_flag_is_omitted() {
+    let scratch = Scratch::new("prune-configured");
+    scratch.write_config("retention_days = 180\n");
+    seed_prune_database(&scratch, 200);
+
+    let output = run_prune(&scratch, None, false);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "old-app"),
+        0
+    );
+    assert_eq!(open_interval_count(&scratch.database_path()), 1);
+}
+
+#[test]
+fn prune_cli_uses_default_retention_when_config_and_flag_are_omitted() {
+    let scratch = Scratch::new("prune-default");
+    seed_prune_database(&scratch, 400);
+
+    let output = run_prune(&scratch, None, false);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "old-app"),
+        0
+    );
+    assert_eq!(open_interval_count(&scratch.database_path()), 1);
+}
+
+#[test]
+fn prune_cli_configured_zero_retention_disables_deletion() {
+    let scratch = Scratch::new("prune-disabled");
+    scratch.write_config("retention_days = 0\n");
+    seed_prune_database(&scratch, 400);
+
+    let output = run_prune(&scratch, None, false);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: retention pruning is disabled (retention_days = 0)\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "old-app"),
+        1
+    );
+    assert_eq!(open_interval_count(&scratch.database_path()), 1);
+}
+
+#[test]
+fn prune_cli_vacuum_only_does_not_delete_intervals_and_accepts_zero_duration() {
+    let scratch = Scratch::new("prune-vacuum-only");
+    seed_prune_database(&scratch, 400);
+
+    let output = run_prune(&scratch, Some("0d"), true);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "old-app"),
+        1
+    );
+    assert_eq!(open_interval_count(&scratch.database_path()), 1);
+}
+
+#[test]
+fn prune_cli_rejects_invalid_duration_before_mutating_the_database() {
+    for (label, duration, diagnostic) in [
+        (
+            "zero",
+            "0d",
+            "xwindowlog: invalid retention duration '0d': expected a positive number of days such as 180d\n",
+        ),
+        (
+            "missing-unit",
+            "180",
+            "xwindowlog: invalid retention duration '180': expected a positive number of days such as 180d\n",
+        ),
+        (
+            "overflow",
+            "18446744073709551615d",
+            "xwindowlog: invalid retention duration '18446744073709551615d': duration is too large\n",
+        ),
+    ] {
+        let scratch = Scratch::new(&format!("prune-invalid-{label}"));
+        seed_prune_database(&scratch, 400);
+
+        let output = run_prune(&scratch, Some(duration), false);
+
+        assert_eq!(output.status.code(), Some(1), "duration={duration:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "invalid duration must not write primary output: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), diagnostic);
+        assert_eq!(interval_count_for_app(&scratch.database_path(), "old-app"), 1);
+        assert_eq!(open_interval_count(&scratch.database_path()), 1);
+    }
+}
+
+#[test]
+fn prune_cli_missing_database_reports_state_error_on_stderr() {
+    let scratch = Scratch::new("prune-no-database");
+
+    let output = run_prune(&scratch, Some("180d"), false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("xwindowlog: database does not exist at"));
+    assert!(stderr.contains("start the daemon before requesting a report\n"));
 }

@@ -26,7 +26,10 @@ use xwindowlog::logind::{
 };
 use xwindowlog::reactor::ReactorSource;
 use xwindowlog::signals::SelfPipe;
-use xwindowlog::store::{DisplayInterval, IntervalStore as _, OpenInterval, Store, StoreError};
+use xwindowlog::store::{
+    vacuum_exhausted_message, DeletionOutcome, DisplayInterval, IntervalStore as _, OpenInterval,
+    Store, StoreError, VacuumOutcome, VACUUM_EXHAUSTED_EXIT_CODE,
+};
 use xwindowlog::tracker::{SourceEvent, Timer, WindowSource as _};
 use xwindowlog::x11::{X11InitError, X11Source};
 
@@ -120,6 +123,10 @@ fn main() -> ExitCode {
         Command::Status { json: true } => run_status_json(),
         Command::Pause { minutes } => run_pause(minutes),
         Command::Resume => run_resume(),
+        Command::Prune {
+            older_than,
+            vacuum_only,
+        } => run_prune(older_than, vacuum_only),
         _ => not_yet_implemented(),
     }
 }
@@ -214,6 +221,140 @@ fn run_resume() -> ExitCode {
     }
 }
 
+enum PruneResult {
+    Disabled,
+    Pruned(DeletionOutcome),
+    VacuumOnly(VacuumOutcome),
+}
+
+fn run_prune(older_than: Option<String>, vacuum_only: bool) -> ExitCode {
+    match try_run_prune(older_than.as_deref(), vacuum_only) {
+        Ok(PruneResult::Disabled) => {
+            println!("xwindowlog: retention pruning is disabled (retention_days = 0)");
+            ExitStatus::Ok.into()
+        }
+        Ok(PruneResult::Pruned(outcome)) => report_deletion_outcome(outcome),
+        Ok(PruneResult::VacuumOnly(VacuumOutcome::Vacuumed)) => {
+            println!("xwindowlog: database vacuumed");
+            ExitStatus::Ok.into()
+        }
+        Ok(PruneResult::VacuumOnly(VacuumOutcome::Exhausted)) => {
+            eprintln!("{}", vacuum_exhausted_message(0));
+            vacuum_exhausted_exit_code()
+        }
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_prune(older_than: Option<&str>, vacuum_only: bool) -> Result<PruneResult, ReportError> {
+    // Parse explicit input before opening the database. Invalid user input must not reach any
+    // destructive store operation, even if the database already exists.
+    let explicit_seconds = older_than
+        .map(|raw| parse_retention_duration(raw, vacuum_only))
+        .transpose()?;
+
+    if vacuum_only {
+        let mut store = open_report_store()?;
+        return store
+            .vacuum_only()
+            .map(PruneResult::VacuumOnly)
+            .map_err(ReportError::Store);
+    }
+
+    let config = DaemonConfig::load_default().map_err(ReportError::Config)?;
+    let retention_seconds = match explicit_seconds {
+        Some(seconds) => Some(seconds),
+        None if config.retention_days == 0 => None,
+        None => Some(configured_retention_seconds(config.retention_days)?),
+    };
+
+    // Keep the configured zero-retention behavior a safe no-op. Opening the existing store still
+    // validates the data-home/database path and preserves the normal missing-database contract.
+    let retention_seconds = match retention_seconds {
+        Some(seconds) => seconds,
+        None => {
+            let _store = open_report_store()?;
+            return Ok(PruneResult::Disabled);
+        }
+    };
+
+    let now = SystemClock.now_wall();
+    let cutoff = WallTs::new(
+        now.as_unix_secs()
+            .checked_sub(retention_seconds)
+            .ok_or_else(|| ReportError::Overflow("retention cutoff overflowed".to_string()))?,
+    );
+    let mut store = open_report_store()?;
+    store
+        .prune(cutoff)
+        .map(PruneResult::Pruned)
+        .map_err(ReportError::Store)
+}
+
+fn parse_retention_duration(raw: &str, allow_zero: bool) -> Result<i64, ReportError> {
+    let days_text = raw
+        .strip_suffix('d')
+        .ok_or_else(|| invalid_retention_duration(raw))?;
+    let days = days_text
+        .parse::<u64>()
+        .map_err(|_| invalid_retention_duration(raw))?;
+    if days == 0 && !allow_zero {
+        return Err(invalid_retention_duration(raw));
+    }
+
+    let seconds = days
+        .checked_mul(86_400)
+        .ok_or_else(|| too_large_retention_duration(raw))?;
+    i64::try_from(seconds).map_err(|_| too_large_retention_duration(raw))
+}
+
+fn configured_retention_seconds(days: u32) -> Result<i64, ReportError> {
+    let seconds = u64::from(days).checked_mul(86_400).ok_or_else(|| {
+        ReportError::Overflow("configured retention duration overflowed".to_string())
+    })?;
+    i64::try_from(seconds)
+        .map_err(|_| ReportError::Overflow("configured retention duration overflowed".to_string()))
+}
+
+fn invalid_retention_duration(raw: &str) -> ReportError {
+    ReportError::Usage(format!(
+        "invalid retention duration '{raw}': expected a positive number of days such as 180d"
+    ))
+}
+
+fn too_large_retention_duration(raw: &str) -> ReportError {
+    ReportError::Usage(format!(
+        "invalid retention duration '{raw}': duration is too large"
+    ))
+}
+
+fn report_deletion_outcome(outcome: DeletionOutcome) -> ExitCode {
+    match outcome.vacuum {
+        VacuumOutcome::Vacuumed => {
+            println!(
+                "xwindowlog: deleted {} intervals; database vacuumed",
+                outcome.deleted_intervals
+            );
+            ExitStatus::Ok.into()
+        }
+        VacuumOutcome::Exhausted => {
+            eprintln!("{}", vacuum_exhausted_message(outcome.deleted_intervals));
+            vacuum_exhausted_exit_code()
+        }
+    }
+}
+
+fn vacuum_exhausted_exit_code() -> ExitCode {
+    match VACUUM_EXHAUSTED_EXIT_CODE {
+        2 => ExitStatus::State.into(),
+        3 => ExitStatus::Environment.into(),
+        _ => ExitStatus::Failure.into(),
+    }
+}
+
 #[derive(Debug)]
 enum ReportError {
     Config(ConfigError),
@@ -222,6 +363,7 @@ enum ReportError {
     Store(StoreError),
     Time(String),
     Overflow(String),
+    Usage(String),
     Json(serde_json::Error),
 }
 
@@ -232,6 +374,7 @@ impl ReportError {
             | ReportError::NoDataHome
             | ReportError::Time(_)
             | ReportError::Overflow(_) => ExitStatus::Environment,
+            ReportError::Usage(_) => ExitStatus::Failure,
             ReportError::MissingDatabase(_) => ExitStatus::State,
             ReportError::Json(_) => ExitStatus::Failure,
             ReportError::Store(error) => match error.exit_code() {
@@ -256,6 +399,7 @@ impl ReportError {
             ReportError::Store(error) => format!("xwindowlog: {error}"),
             ReportError::Time(error) => format!("xwindowlog: could not resolve report time: {error}"),
             ReportError::Overflow(error) => format!("xwindowlog: report value overflowed: {error}"),
+            ReportError::Usage(error) => format!("xwindowlog: {error}"),
             ReportError::Json(error) => format!("xwindowlog: could not serialize JSON report: {error}"),
         }
     }
