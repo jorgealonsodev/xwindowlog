@@ -59,7 +59,11 @@ vacuum exhaustion without duplicating SQL or changing Store semantics.
       output streams/status, affirmative execution, cancellation, and
       preservation of non-selected rows with real-binary tests using existing
       Store/test helpers.
-- [x] Leave Store behavior for open-interval deletion unchanged.
+- [x] Leave Store behavior for open-interval deletion unchanged. Evidence:
+      work-unit commit `25c5b12d0288745295482bcedea710e7eab8a736` changes only
+      `src/main.rs`, `tests/cli_control.rs`, and this ledger; it does not
+      modify `src/store.rs`. The Store regression suite passed afterward
+      (`cargo test --lib store::`: 27 passed, 170 filtered out).
 
 ## Verification commands
 
