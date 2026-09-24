@@ -4,6 +4,7 @@
 //! compiled CLI to pause it. SQLite is queried read-only afterwards so the
 //! observed state must have been written by the daemon, not by the CLI.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -446,6 +447,37 @@ fn run_prune(scratch: &Scratch, older_than: Option<&str>, vacuum_only: bool) -> 
         .expect("run the compiled xwindowlog prune command")
 }
 
+fn run_forget(scratch: &Scratch, args: &[&str], input: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xwindowlog"));
+    command
+        .arg("forget")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", scratch.runtime_dir())
+        .env("XDG_CONFIG_HOME", scratch.config_home())
+        .env("XDG_DATA_HOME", scratch.data_home())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command
+        .spawn()
+        .expect("run the compiled xwindowlog forget command");
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("open forget command stdin");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("write forget command confirmation");
+    }
+    child
+        .wait_with_output()
+        .expect("wait for the compiled xwindowlog forget command")
+}
+
 fn interval(app: &str, title: &str) -> NewInterval {
     NewInterval {
         app: app.to_string(),
@@ -491,6 +523,44 @@ fn seed_prune_database(scratch: &Scratch, old_age_days: i64) {
     store
         .transition(WallTs::new(recent_end), interval("open-app", "open title"))
         .expect("open live fixture interval");
+}
+
+fn seed_forget_database(scratch: &Scratch) {
+    let mut store = Store::open(&scratch.database_path()).expect("open forget fixture database");
+    store
+        .open_only(
+            WallTs::new(1_000),
+            interval("forget-target", "forget target"),
+        )
+        .expect("open forget target interval");
+    store
+        .close_only(WallTs::new(1_100))
+        .expect("close forget target interval");
+    store
+        .open_only(
+            WallTs::new(2_000),
+            interval("forget-survivor", "forget survivor"),
+        )
+        .expect("open forget survivor interval");
+    store
+        .close_only(WallTs::new(2_100))
+        .expect("close forget survivor interval");
+}
+
+fn interval_id_for_app(db_path: &Path, app: &str) -> i64 {
+    let connection = rusqlite::Connection::open(db_path).expect("open forget fixture for reading");
+    connection
+        .query_row(
+            "SELECT intervals.id \
+             FROM intervals \
+             JOIN apps ON apps.id = intervals.app \
+             WHERE apps.app_id = ?1 \
+             ORDER BY intervals.id \
+             LIMIT 1",
+            [app],
+            |row| row.get(0),
+        )
+        .expect("find forget fixture interval id")
 }
 
 fn interval_count_for_app(db_path: &Path, app: &str) -> i64 {
@@ -911,4 +981,243 @@ fn prune_cli_missing_database_reports_state_error_on_stderr() {
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("xwindowlog: database does not exist at"));
     assert!(stderr.contains("start the daemon before requesting a report\n"));
+}
+
+#[test]
+fn forget_cli_range_with_yes_deletes_matching_intervals_and_preserves_others() {
+    let scratch = Scratch::new("forget-range");
+    seed_forget_database(&scratch);
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1970-01-01T00:16:40Z",
+            "--to",
+            "1970-01-01T00:18:20Z",
+            "--yes",
+        ],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        0
+    );
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-survivor"),
+        1
+    );
+}
+
+#[test]
+fn forget_cli_window_with_yes_deletes_only_the_selected_interval() {
+    let scratch = Scratch::new("forget-window");
+    seed_forget_database(&scratch);
+    let target_id = interval_id_for_app(&scratch.database_path(), "forget-target");
+
+    let output = run_forget(
+        &scratch,
+        &["--window", &target_id.to_string(), "--yes"],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        0
+    );
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-survivor"),
+        1
+    );
+}
+
+#[test]
+fn forget_cli_rejects_missing_incomplete_and_mixed_selectors_before_opening_database() {
+    for (label, args) in [
+        ("missing", vec![]),
+        ("from-only", vec!["--from", "1970-01-01T00:16:40Z"]),
+        ("to-only", vec!["--to", "1970-01-01T00:18:20Z"]),
+        (
+            "mixed",
+            vec![
+                "--from",
+                "1970-01-01T00:16:40Z",
+                "--to",
+                "1970-01-01T00:18:20Z",
+                "--window",
+                "1",
+            ],
+        ),
+    ] {
+        let scratch = Scratch::new(&format!("forget-selector-{label}"));
+        let output = run_forget(&scratch, &args, None);
+        assert_eq!(output.status.code(), Some(1), "selector case={label}");
+        assert!(
+            output.stdout.is_empty(),
+            "selector diagnostics must not write to stdout: case={label}, stdout={:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("exactly one selector"),
+            "selector case={label} should report exclusivity: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn forget_cli_rejects_malformed_equal_and_reversed_ranges_before_opening_database() {
+    for (label, args, expected) in [
+        (
+            "malformed",
+            vec!["--from", "not-a-timestamp", "--to", "1970-01-01T00:18:20Z"],
+            "invalid --from timestamp",
+        ),
+        (
+            "equal",
+            vec![
+                "--from",
+                "1970-01-01T00:18:20Z",
+                "--to",
+                "1970-01-01T00:18:20Z",
+            ],
+            "must be before --to",
+        ),
+        (
+            "reversed",
+            vec![
+                "--from",
+                "1970-01-01T00:18:20Z",
+                "--to",
+                "1970-01-01T00:16:40Z",
+            ],
+            "must be before --to",
+        ),
+    ] {
+        let scratch = Scratch::new(&format!("forget-range-{label}"));
+        let output = run_forget(&scratch, &args, None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "range case={label}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            stderr.contains(expected),
+            "range case={label} should report {expected:?}: stderr={stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn forget_cli_range_requires_confirmation_and_negative_input_does_not_mutate() {
+    let scratch = Scratch::new("forget-negative");
+    seed_forget_database(&scratch);
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1970-01-01T00:16:40Z",
+            "--to",
+            "1970-01-01T00:18:20Z",
+        ],
+        Some("no\n"),
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("confirm permanent deletion"));
+    assert!(stderr.contains("cancelled"));
+    assert!(!stderr.contains("forget target"));
+    assert!(!stderr.contains("forget survivor"));
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        1
+    );
+}
+
+#[test]
+fn forget_cli_window_requires_confirmation_and_negative_input_does_not_mutate() {
+    let scratch = Scratch::new("forget-window-negative");
+    seed_forget_database(&scratch);
+    let target_id = interval_id_for_app(&scratch.database_path(), "forget-target");
+
+    let output = run_forget(&scratch, &["--window", &target_id.to_string()], Some("n\n"));
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("confirm permanent deletion"));
+    assert!(stderr.contains("cancelled"));
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        1
+    );
+}
+
+#[test]
+fn forget_cli_eof_cancels_without_mutating_the_database() {
+    let scratch = Scratch::new("forget-eof");
+    seed_forget_database(&scratch);
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1970-01-01T00:16:40Z",
+            "--to",
+            "1970-01-01T00:18:20Z",
+        ],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("confirm permanent deletion"));
+    assert!(stderr.contains("cancelled"));
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        1
+    );
+}
+
+#[test]
+fn forget_cli_accepts_case_insensitive_affirmative_confirmation() {
+    let scratch = Scratch::new("forget-confirm");
+    seed_forget_database(&scratch);
+
+    let output = run_forget(
+        &scratch,
+        &[
+            "--from",
+            "1970-01-01T00:16:40Z",
+            "--to",
+            "1970-01-01T00:18:20Z",
+        ],
+        Some("YeS\n"),
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "xwindowlog: deleted 1 intervals; database vacuumed\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("confirm"));
+    assert_eq!(
+        interval_count_for_app(&scratch.database_path(), "forget-target"),
+        0
+    );
 }

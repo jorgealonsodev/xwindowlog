@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -127,15 +128,13 @@ fn main() -> ExitCode {
             older_than,
             vacuum_only,
         } => run_prune(older_than, vacuum_only),
-        _ => not_yet_implemented(),
+        Command::Forget {
+            from,
+            to,
+            window,
+            yes,
+        } => run_forget(from, to, window, yes),
     }
-}
-
-/// Phase 16/17's subcommands are dispatched here but their behavior is out of Phase 15's scope
-/// (task 15.1: "argument parsing and dispatch only").
-fn not_yet_implemented() -> ExitCode {
-    eprintln!("xwindowlog: this subcommand's behavior lands in Phase 16/17");
-    ExitStatus::Failure.into()
 }
 
 fn print_completions(shell: clap_complete::Shell) -> ExitCode {
@@ -329,6 +328,114 @@ fn too_large_retention_duration(raw: &str) -> ReportError {
     ReportError::Usage(format!(
         "invalid retention duration '{raw}': duration is too large"
     ))
+}
+
+#[derive(Copy, Clone)]
+enum ForgetSelector {
+    Range { from: WallTs, to: WallTs },
+    Window { id: i64 },
+}
+
+enum ForgetResult {
+    Cancelled,
+    Deleted(DeletionOutcome),
+}
+
+fn run_forget(
+    from: Option<String>,
+    to: Option<String>,
+    window: Option<i64>,
+    yes: bool,
+) -> ExitCode {
+    match try_run_forget(from.as_deref(), to.as_deref(), window, yes) {
+        Ok(ForgetResult::Cancelled) => ExitStatus::Ok.into(),
+        Ok(ForgetResult::Deleted(outcome)) => report_deletion_outcome(outcome),
+        Err(error) => {
+            eprintln!("{}", error.message());
+            error.exit_status().into()
+        }
+    }
+}
+
+fn try_run_forget(
+    from: Option<&str>,
+    to: Option<&str>,
+    window: Option<i64>,
+    yes: bool,
+) -> Result<ForgetResult, ReportError> {
+    let selector = parse_forget_selector(from, to, window)?;
+
+    if !yes && !confirm_forget(selector) {
+        return Ok(ForgetResult::Cancelled);
+    }
+
+    let mut store = open_report_store()?;
+    let outcome = match selector {
+        ForgetSelector::Range { from, to } => {
+            store.forget_range(from, to).map_err(ReportError::Store)?
+        }
+        ForgetSelector::Window { id } => store.forget_window(id).map_err(ReportError::Store)?,
+    };
+    Ok(ForgetResult::Deleted(outcome))
+}
+
+fn parse_forget_selector(
+    from: Option<&str>,
+    to: Option<&str>,
+    window: Option<i64>,
+) -> Result<ForgetSelector, ReportError> {
+    match (from, to, window) {
+        (Some(from), Some(to), None) => {
+            let from = parse_forget_timestamp("--from", from)?;
+            let to = parse_forget_timestamp("--to", to)?;
+            if from >= to {
+                return Err(ReportError::Usage(
+                    "invalid forget range: --from must be before --to".to_string(),
+                ));
+            }
+            Ok(ForgetSelector::Range { from, to })
+        }
+        (None, None, Some(id)) => Ok(ForgetSelector::Window { id }),
+        _ => Err(ReportError::Usage(
+            "forget requires exactly one selector: provide both --from and --to, or --window <id>"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_forget_timestamp(name: &str, raw: &str) -> Result<WallTs, ReportError> {
+    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .map(|timestamp| WallTs::new(timestamp.unix_timestamp()))
+        .map_err(|error| {
+            ReportError::Usage(format!(
+                "invalid {name} timestamp '{raw}': expected an RFC3339/ISO 8601 timestamp ({error})"
+            ))
+        })
+}
+
+fn confirm_forget(selector: ForgetSelector) -> bool {
+    match selector {
+        ForgetSelector::Range { .. } => {
+            eprint!("xwindowlog: confirm permanent deletion of the selected range? [y/N] ");
+        }
+        ForgetSelector::Window { .. } => {
+            eprint!("xwindowlog: confirm permanent deletion of the selected interval? [y/N] ");
+        }
+    }
+    let _ = std::io::stderr().flush();
+
+    let mut response = String::new();
+    let confirmed = std::io::stdin()
+        .read_line(&mut response)
+        .map(|_| {
+            let answer = response.trim();
+            answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    if !confirmed {
+        eprintln!("xwindowlog: deletion cancelled");
+    }
+    confirmed
 }
 
 fn report_deletion_outcome(outcome: DeletionOutcome) -> ExitCode {
