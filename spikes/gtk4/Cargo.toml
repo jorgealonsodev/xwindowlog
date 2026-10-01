@@ -1,0 +1,8 @@
+[package]
+name = "xwindowlog-gtk4-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", default-features = false }

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+ui=/usr/lib/xwindowlog-gtk4-spike/xwindowlog-gtk4-spike
+cli=
+if [ -x /usr/bin/xwindowlog ]; then
+    cli=/usr/bin/xwindowlog
+elif [ -n "${HOME:-}" ]; then
+    case "$HOME" in
+        /*)
+            if [ -x "$HOME/.cargo/bin/xwindowlog" ]; then
+                cli=$HOME/.cargo/bin/xwindowlog
+            fi
+            ;;
+    esac
+fi
+
+if [ -n "$cli" ]; then
+    exec "$ui" --cli "$cli" "$@"
+fi
+exec "$ui" "$@"

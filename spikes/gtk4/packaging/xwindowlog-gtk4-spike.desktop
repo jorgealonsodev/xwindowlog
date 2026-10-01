@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=xwindowlog GTK4 Prototype
+Name[es]=Prototipo de xwindowlog GTK4
+Comment=GTK4 UI feasibility prototype; manual interaction and accessibility are unverified
+Exec=/usr/bin/xwindowlog-gtk4-spike
+Icon=applications-utilities
+Type=Application
+Terminal=false
+Categories=Utility;
